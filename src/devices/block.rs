@@ -31,12 +31,6 @@ impl<BS: BlockStorage> VirtioDevice for Block<BS> {
     fn read_config(&self, offset: usize, data: &mut [u8]) {
         read_config(&(self.disk.size() / 512).to_le_bytes(), offset, data);
     }
-    fn reset(&mut self) -> Result<()> {
-        self.disk.flush()
-    }
-    fn flush(&self) -> Result<()> {
-        self.disk.flush()
-    }
     fn notify(&mut self, _queue: usize, queues: &mut Queues, mem: &GuestMemoryMmap) -> Result<()> {
         let count = queues.available(0, mem)?;
         for _ in 0..count {
@@ -47,6 +41,12 @@ impl<BS: BlockStorage> VirtioDevice for Block<BS> {
             queues.complete(0, mem, chain.head, used)?;
         }
         Ok(())
+    }
+    fn reset(&mut self) -> Result<()> {
+        self.disk.flush()
+    }
+    fn flush(&self) -> Result<()> {
+        self.disk.flush()
     }
 }
 
@@ -78,8 +78,8 @@ impl<BS: BlockStorage> Block<BS> {
         );
         let mut h = [0; 16];
         mem.read_slice(&mut h, header.addr())?;
-        let kind = u32::from_le_bytes(h[..4].try_into().unwrap());
-        let sector = u64::from_le_bytes(h[8..].try_into().unwrap());
+        let kind = u32::from_le_bytes(h[..4].try_into()?);
+        let sector = u64::from_le_bytes(h[8..].try_into()?);
         let data = &desc[1..desc.len() - 1];
         let total = data
             .iter()
