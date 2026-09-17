@@ -89,13 +89,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`VmConfig` 配置 `memory_mib`、`vcpu_count` 和 `virtio_mem`；旧结构体字面量可加上 `..VmConfig::default()`。后端由调用方创建并交给泛型入口：
+`VmConfig` 配置 `memory_mib` 和 `vcpu_count`。后端由调用方创建并交给泛型入口：
 
 ```rust,ignore
 pub fn run<BS: BlockStorage, ND: NetDevice, SI: SerialIo>(
     self,
     blocks: BTreeMap<String, BS>,
     net: Option<ND>,
+    memory: Option<VirtioMem>,
     serial: SI,
 ) -> anyhow::Result<()>;
 ```
@@ -111,7 +112,7 @@ fn run(serial: impl SerialIo) -> Result<(), Box<dyn std::error::Error>> {
         ("sda".into(), Disk::open(Path::new("system.qcow2"), true)?),
         ("sdb".into(), Disk::open(Path::new("data.qcow2"), false)?),
     ]);
-    Vmm::new(VmConfig::default()).run(blocks, None::<Vmnet>, serial)?;
+    Vmm::new(VmConfig::default()).run(blocks, None::<Vmnet>, None, serial)?;
     Ok(())
 }
 ```
@@ -120,19 +121,19 @@ fn run(serial: impl SerialIo) -> Result<(), Box<dyn std::error::Error>> {
 
 同一 map 可用 `Box<dyn BlockStorage>` 混合不同存储实现；已提供 `Box<T>` 的 trait 转发。`BlockStorage` 本身保持原有接口。`Vmm` 接管后端所有权，退出时尝试刷新全部磁盘；即使一块盘刷新失败也继续处理其余磁盘。
 
-`net::NetDevice` 提供 `mac_address`、`mtu`、`max_frame_len` 和非阻塞 `send` / `recv`，传输完整以太网帧，不含 FCS 或 virtio 头。`send` 返回 `false` 表示未消费该帧、稍后重试；`recv` 返回 `None` 表示没有数据。trait 不涉及 DHCP、IP、路由或 NAT；这些服务由具体后端决定。实现不需要 `Send` / `Sync`，也可以使用 `Box<dyn NetDevice>`。
+`net::NetDevice` 提供 `mac_address`、必填关联常量 `MTU: u16`、`max_frame_len` 和非阻塞 `send` / `recv`，传输完整以太网帧，不含 FCS 或 virtio 头。`send` 返回 `false` 表示未消费该帧、稍后重试；`recv` 返回 `None` 表示没有数据。trait 不涉及 DHCP、IP、路由或 NAT；这些服务由具体后端决定。实现不需要 `Send` / `Sync`，可用 `Box<T>` 包装具体后端，关联常量会转发给 `T`。
 
 `serial::SerialIo: std::io::Write` 是必传的串口后端。`recv(&mut [u8])` 非阻塞读取发往客户机的数据，返回长度不得超过缓冲区；`0`（含 EOF）、`WouldBlock` 和 `Interrupted` 表示暂无输入。每轮只读取 UART FIFO 剩余容量，满时不读取。`should_stop()` 默认返回 `false`，每轮独立检查，FIFO 满时也能停止。所有调用在 VMM 线程执行，无需 `Send` / `Sync`，支持 `Box<dyn SerialIo>`。
 
 客户机输出使用同步 `write_all` / `flush`，没有额外输出队列。输入的其他错误及输出错误会终止运行，并尝试刷新全部磁盘。库不解释 `0x1d` 等控制字节；终端 raw mode、stdin/stdout、Ctrl-]、信号和恢复由 `demo/src/terminal.rs` 的 `Terminal` 实现负责。自定义后端需要退出时通过 `should_stop()` 表达。
 
-内核和 initramfs 仍由库提供；调用程序需附加相同的 Hypervisor entitlement 本地签名。`run` 已改为必须传入三个后端参数，不再隐式创建终端。
+内核和 initramfs 仍由库提供；调用程序需附加相同的 Hypervisor entitlement 本地签名。`run` 已改为必须传入四个参数（磁盘、网络、内存设备、串口），不再隐式创建终端。
 
 ## 多核与动态内存
 
 ```sh
 ./dist/w-vmm run --vcpus 4 --memory-mib 512 \
-  --virtio-mem-size-mib 1024 --virtio-mem-requested-mib 256 \
+  --virtio-mem-size-mib 1024 \
   --control-socket /tmp/w-vmm.sock
 # 在另一个本地终端：
 ./dist/w-vmm memory-set --socket /tmp/w-vmm.sock --requested-mib 768
@@ -146,20 +147,17 @@ fn run(serial: impl SerialIo) -> Result<(), Box<dyn std::error::Error>> {
 库可在 `run` 前取得控制句柄，然后移交给其他线程：
 
 ```rust,no_run
-use w_vmm::{VmConfig, Vmm, VirtioMemConfig};
-let vm = Vmm::new(VmConfig {
-    vcpu_count: 4,
-    virtio_mem: Some(VirtioMemConfig { region_size_mib: 1024, requested_size_mib: 256 }),
-    ..VmConfig::default()
-});
-let memory = vm.memory_control().unwrap();
-memory.set_requested_mib(512)?;
-println!("{:?}", memory.status());
-// 将 memory.clone() 交给控制线程，再调用 vm.run(blocks, net, serial)。
+use w_vmm::{VmConfig, Vmm, VirtioMem};
+let memory = VirtioMem::new(1024)?;
+let control = memory.control();
+control.set_requested_mib(512)?;
+let vm = Vmm::new(VmConfig { vcpu_count: 4, ..VmConfig::default() });
+println!("{:?}", control.status());
+// 将 control.clone() 交给控制线程，再调用 vm.run(blocks, net, Some(memory), serial)。
 # Ok::<(), anyhow::Error>(())
 ```
 
-调节成功表示目标已接受，客户机异步完成扩缩容。`status()` 包含 `region_size_mib`、`requested_size_mib`、`plugged_size_mib`、`driver_ready` 和 `Created / Running / Stopped` 生命周期。启动前允许调节；退出或放弃未启动的 Vmm 后拒绝调节，句柄保留最终状态。
+调节成功表示目标已接受，客户机异步完成扩缩容。`status()` 包含 `region_size_mib`、`requested_size_mib`、`plugged_size_mib`、`driver_ready` 和 `Created / Running / Stopped` 生命周期。启动前允许调节；退出或丢弃未运行的 VirtioMem 后拒绝调节，句柄保留最终状态。
 
 驱动必须协商 `VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE`。未插入块不映射到 HVF，也不在设备 DMA 内存视图中。变更映射时暂停所有 vCPU，保护有效队列和待处理缓冲区；失败则回滚，回滚失败终止 VM。普通设备 reset 保留已插入内存及数据，`UNPLUG_ALL` 才移除全部块。
 
@@ -307,8 +305,7 @@ sudo env "PATH=$PATH" python3 scripts/smoke-net.py \
 - `src/platform/macos_arm64/hvf.rs`：最小 FFI、VM 映射、原生 GIC 和绑定创建线程的 RAII vCPU。VM 内存由 vm-memory 持有，先销毁 vCPU 和映射，再释放 RAM。
 - `src/devices/mmio.rs`：共享 modern virtio-mmio、功能协商、队列配置、描述符校验、复位及中断确认。
 - `src/platform/macos_arm64/cpus.rs`：每核独立线程、PSCI 启停、全核暂停及统一退出。
-- `src/memory.rs`：可跨线程克隆的内存控制句柄与生命周期。
-- `src/devices/memory.rs`：virtio-mem 请求与按 2 MiB 块事务映射、回滚、回收。
+- `src/devices/memory.rs`：公开 `VirtioMem`、可跨线程克隆的控制句柄与生命周期；virtio-mem 请求与按 2 MiB 块事务映射、回滚、回收。
 - `demo/src/control.rs`：可选本地 Unix socket JSON 服务与客户端。
 - `src/devices/block.rs`：磁盘请求与配置，单个 128 项 split virtqueue，IN/OUT/FLUSH/GET_ID，单请求上限 1 MiB。
 - `src/devices/net.rs`：网络请求与配置，RX/TX 各 128 项队列，完整帧收发与发送背压。
@@ -316,7 +313,7 @@ sudo env "PATH=$PATH" python3 scripts/smoke-net.py \
 - `src/storage.rs`：imago 原生同步 qcow2、同 inode 文件锁、范围校验、内部缓存 flush 与宿主 sync/fsync。
 - `src/serial.rs`：`SerialIo` trait、Box 转发和 FIFO 输入轮询。
 - `demo/src/terminal.rs`：原始终端、非阻塞输入、Ctrl-] 与信号恢复，CLI 和网络示例共用。
-- `src/lib.rs`：`VmConfig` / `Vmm::new(...).run(blocks, net, serial)`，委托 `platform::run`。
+- `src/lib.rs`：`VmConfig` / `Vmm::new(...).run(blocks, net, memory, serial)`，委托 `platform::run`。
 - `demo/src/main.rs`：CLI、错误输出，通过路径依赖调用根库。
 
 设备 MMIO：GIC distributor `0x08000000`，16550 `0x09000000`（SPI 33），virtio 设备从 `0x0a000000` 开始，每个占 `0x1000`，中断从 SPI 34 递增。先按名称排列磁盘，再放置可选网卡和 virtio-mem，每个设备使用独立 MMIO 和中断。GIC redistributor 位于 `0x10000000`，RAM 位于 `0x40000000`。实际可用 SPI 范围、定时器 INTID 和 redistributor 空间大小查询 HVF；设备超出范围时启动报错。

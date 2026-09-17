@@ -50,7 +50,7 @@ def main():
             raise AssertionError(status)
         def rss():
             return int(subprocess.check_output(['ps', '-o', 'rss=', '-p', str(vm.p.pid)]))
-        with VM('memory-4', ['--vcpus', '4', '--disk', str(disk), '--virtio-mem-size-mib', '1024', '--virtio-mem-requested-mib', '128', '--control-socket', sock], binary=binary) as vm:
+        with VM('memory-4', ['--vcpus', '4', '--disk', str(disk), '--virtio-mem-size-mib', '1024', '--control-socket', sock], binary=binary) as vm:
             vm.ready()
             vm.command('mount /dev/vda /data', 'MOUNT_OK')
             resize(128)

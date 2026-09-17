@@ -1,8 +1,5 @@
 //! Thin HVF binding, authored against Apple's SDK. See THIRD_PARTY.md for libkrun reference.
-use crate::{
-    boot,
-    devices::memory::{Mapper, Memory},
-};
+use crate::{boot, devices::memory::Mapper};
 use anyhow::{Result, ensure};
 use std::{ffi::c_void, marker::PhantomData, rc::Rc};
 use vm_memory::{Address, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion};
@@ -107,7 +104,8 @@ pub fn kick(id: u64) {
 
 // !Send and !Sync: HVF VM/vCPU operations have owning-thread requirements.
 pub struct Vm {
-    pub mem: Memory<Mapping>,
+    base: GuestMemoryMmap,
+    pub view: GuestMemoryMmap,
     mapped: bool,
     _thread: PhantomData<Rc<()>>,
 }
@@ -121,11 +119,12 @@ impl Vm {
             )?;
         }
         let mut vm = Self {
-            mem: Memory::new(mem, Mapping),
+            view: mem.clone(),
+            base: mem,
             mapped: false,
             _thread: PhantomData,
         };
-        let region = vm.mem.view.iter().next().unwrap();
+        let region = vm.base.iter().next().unwrap();
         let ptr = region.as_ptr();
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
         ensure!(
@@ -148,7 +147,7 @@ impl Vm {
     }
 
     pub fn memory(&self) -> &GuestMemoryMmap {
-        &self.mem.view
+        &self.view
     }
 
     pub fn gic(&self) -> Result<(u64, [u32; 2])> {
@@ -185,20 +184,8 @@ impl Vm {
 impl Drop for Vm {
     fn drop(&mut self) {
         unsafe {
-            for region in self
-                .mem
-                .view
-                .iter()
-                .skip(1)
-                .chain(self.mem.retained.iter().map(AsRef::as_ref))
-            {
-                hv_vm_unmap(region.start_addr().raw_value(), region.len() as usize);
-            }
             if self.mapped {
-                hv_vm_unmap(
-                    boot::RAM,
-                    self.mem.view.iter().next().unwrap().len() as usize,
-                );
+                hv_vm_unmap(boot::RAM, self.base.iter().next().unwrap().len() as usize);
             }
             hv_vm_destroy();
         }

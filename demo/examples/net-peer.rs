@@ -31,9 +31,7 @@ impl NetDevice for Peer {
     fn mac_address(&self) -> [u8; 6] {
         [2, 0, 0, 0, 0, 1]
     }
-    fn mtu(&self) -> u16 {
-        1500
-    }
+    const MTU: u16 = 1500;
     fn max_frame_len(&self) -> usize {
         1514
     }
@@ -115,21 +113,19 @@ fn main() -> Result<()> {
             .map(|s| s.parse())
             .transpose()?
             .unwrap_or(1),
-        virtio_mem: std::env::var("W_VMM_MEMORY_SOCKET")
-            .ok()
-            .map(|_| w_vmm::VirtioMemConfig {
-                region_size_mib: 1024,
-                requested_size_mib: 256,
-            }),
         ..VmConfig::default()
     };
     eprintln!("w-vmm: {} vCPU, 512 MiB; Ctrl-] exits", config.vcpu_count);
     let vmm = Vmm::new(config);
+    let memory = std::env::var("W_VMM_MEMORY_SOCKET")
+        .ok()
+        .map(|_| w_vmm::VirtioMem::new(1024))
+        .transpose()?;
     let _control = std::env::var("W_VMM_MEMORY_SOCKET")
         .ok()
         .map(|path| {
-            w_vmm_demo::control::Server::bind(Path::new(&path), vmm.memory_control().unwrap())
+            w_vmm_demo::control::Server::bind(Path::new(&path), memory.as_ref().unwrap().control())
         })
         .transpose()?;
-    vmm.run(blocks, Some(Peer::default()), terminal)
+    vmm.run(blocks, Some(Peer::default()), memory, terminal)
 }

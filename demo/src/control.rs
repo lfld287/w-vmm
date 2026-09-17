@@ -139,20 +139,14 @@ pub fn request(path: &Path, request: Request) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use w_vmm::{VirtioMemConfig, VmConfig, Vmm};
+    use w_vmm::VirtioMem;
     #[test]
     fn socket_control_conflict_disconnect_cleanup() {
         let dir = std::env::temp_dir().join(format!("w-vmm-control-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("control.sock");
-        let vm = Vmm::new(VmConfig {
-            virtio_mem: Some(VirtioMemConfig {
-                region_size_mib: 128,
-                requested_size_mib: 0,
-            }),
-            ..VmConfig::default()
-        });
-        let control = vm.memory_control().unwrap();
+        let memory = VirtioMem::new(128).unwrap();
+        let control = memory.control();
         let server = Server::bind(&path, control.clone()).unwrap();
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -174,7 +168,7 @@ mod tests {
             serde_json::from_slice::<Value>(&line(&mut long).unwrap()).unwrap()["ok"],
             false
         );
-        drop(vm);
+        drop(memory);
         assert_eq!(
             request(&path, Request::MemorySet { requested_mib: 0 }).unwrap()["ok"],
             false

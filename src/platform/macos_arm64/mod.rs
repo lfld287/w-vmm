@@ -3,8 +3,8 @@ mod cpus;
 mod hvf;
 use super::VmRuntime;
 use crate::{
-    MemoryControl, MemoryLifecycle, VmConfig, boot,
-    devices::{Device, block::Block, memory::Mem, mmio::Mmio, net::Net},
+    VirtioMem, VmConfig, boot,
+    devices::{Device, block::Block, mmio::Mmio, net::Net},
     net::NetDevice,
     serial::{SerialIo, poll_input},
     storage::BlockStorage,
@@ -17,9 +17,9 @@ pub(super) struct Backend;
 impl VmRuntime for Backend {
     fn run<BS: BlockStorage, ND: NetDevice, SI: SerialIo>(
         config: &VmConfig,
-        control: Option<MemoryControl>,
         blocks: BTreeMap<String, BS>,
         net: Option<ND>,
+        mut memory: Option<VirtioMem>,
         serial: SI,
     ) -> Result<()> {
         let layout = boot::Layout::new(config.memory_mib, boot::KERNEL, boot::INITRD.len())?;
@@ -27,11 +27,12 @@ impl VmRuntime for Backend {
             (1..=hvf::max_vcpus()?).contains(&config.vcpu_count),
             "vCPU count outside HVF supported range"
         );
-        if let Some(c) = &config.virtio_mem {
-            c.validate(config.memory_mib)?;
+        if let Some(d) = &mut memory {
+            d.attach(config.memory_mib)?;
         }
+        let has_memory = memory.is_some();
         let regions = boot::virtio_regions(
-            blocks.len() + usize::from(net.is_some()) + usize::from(control.is_some()),
+            blocks.len() + usize::from(net.is_some()) + usize::from(has_memory),
         )?;
         let mut devices: Vec<Mmio<Device<BS, ND>>> = blocks
             .into_iter()
@@ -40,11 +41,8 @@ impl VmRuntime for Backend {
         if let Some(net) = net {
             devices.push(Mmio::new(Device::Net(Net::new(net)?)));
         }
-        if let Some(c) = &control {
-            devices.push(Mmio::new(Device::Mem(Mem::new(
-                config.memory_mib,
-                c.clone(),
-            ))));
+        if let Some(memory) = memory {
+            devices.push(Mmio::new(Device::Mem(memory)));
         }
         // All failures from VM setup onward still attempt every backend flush.
         let mut vm_slot = None;
@@ -60,13 +58,15 @@ impl VmRuntime for Backend {
                 redist,
                 timers,
                 config.vcpu_count,
-                control.is_some(),
+                has_memory,
             )?;
             boot::load(vm.memory(), &layout, &dtb)?;
             let (tx, rx) = mpsc::channel();
             let cpus = cpus::Cpus::create(config.vcpu_count, tx)?;
-            if let Some(c) = &control {
-                c.lock().lifecycle = MemoryLifecycle::Running;
+            for device in &devices {
+                if let Device::Mem(d) = &device.device {
+                    d.start();
+                }
             }
             cpus.start(layout.entry, layout.dtb);
             let mut serial = Serial::new(Irq, serial);
@@ -81,7 +81,7 @@ impl VmRuntime for Backend {
                 for device in &mut devices {
                     device.poll(vm.memory())?;
                 }
-                if control.is_some() {
+                if has_memory {
                     let last = devices.len() - 1;
                     let active = devices[last].active();
                     if let Device::Mem(d) = &mut devices[last].device
@@ -100,7 +100,12 @@ impl VmRuntime for Backend {
                             .collect::<Vec<_>>();
                         let device = &mut devices[last];
                         if let Device::Mem(d) = &mut device.device {
-                            d.process(&mut device.queues, &mut vm.mem, &pinned)?;
+                            d.process(
+                                &mut device.queues,
+                                &mut hvf::Mapping,
+                                &mut vm.view,
+                                &pinned,
+                            )?;
                         }
                     }
                 }
@@ -155,6 +160,7 @@ impl VmRuntime for Backend {
             }
             Ok(())
         })();
+        // The closure has joined all vCPUs, including on startup/runtime errors.
         let mut flushed = Ok(());
         for device in &devices {
             if let Err(e) = device.flush() {
@@ -164,7 +170,16 @@ impl VmRuntime for Backend {
                 }
             }
         }
+        if vm_slot.is_some() {
+            for device in &devices {
+                if let Device::Mem(d) = &device.device {
+                    d.stop(&mut hvf::Mapping);
+                }
+            }
+        }
+        // HVF destruction must precede release of device-owned rollback allocations.
         drop(vm_slot);
+        drop(devices);
         result.and(flushed)
     }
 }

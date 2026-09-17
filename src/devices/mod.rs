@@ -12,7 +12,7 @@ use vm_memory::GuestMemoryMmap;
 pub enum Device<BS: BlockStorage, ND: NetDevice> {
     Block(block::Block<BS>),
     Net(net::Net<ND>),
-    Mem(memory::Mem),
+    Mem(memory::VirtioMem),
 }
 
 impl<BS: BlockStorage, ND: NetDevice> VirtioDevice for Device<BS, ND> {

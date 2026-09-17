@@ -2,7 +2,7 @@ use anyhow::{Result, ensure};
 use clap::{Parser, Subcommand};
 use std::{collections::BTreeMap, path::Path};
 use w_vmm::{
-    VirtioMemConfig, VmConfig, Vmm,
+    VirtioMem, VmConfig, Vmm,
     net::{NetDevice, macos::Vmnet},
     storage::Disk,
 };
@@ -40,8 +40,6 @@ enum Command {
         vcpus: u32,
         #[arg(long)]
         virtio_mem_size_mib: Option<u64>,
-        #[arg(long, requires = "virtio_mem_size_mib")]
-        virtio_mem_requested_mib: Option<u64>,
         #[arg(long, requires = "virtio_mem_size_mib")]
         control_socket: Option<std::path::PathBuf>,
         /// Open all supplied disks read-only.
@@ -81,7 +79,6 @@ fn run(command: Command) -> Result<()> {
         memory_mib,
         vcpus,
         virtio_mem_size_mib,
-        virtio_mem_requested_mib,
         control_socket,
         read_only,
         net,
@@ -98,24 +95,21 @@ fn run(command: Command) -> Result<()> {
         let mac = net.mac_address().map(|b| format!("{b:02x}")).join(":");
         eprintln!(
             "w-vmm: vmnet MAC {mac}, MTU {}; IPv4 {:?}",
-            net.mtu(),
+            Vmnet::MTU,
             net.ipv4()
         );
     }
     let vmm = Vmm::new(VmConfig {
         memory_mib,
         vcpu_count: vcpus,
-        virtio_mem: virtio_mem_size_mib.map(|region_size_mib| VirtioMemConfig {
-            region_size_mib,
-            requested_size_mib: virtio_mem_requested_mib.unwrap_or(0),
-        }),
     });
+    let memory = virtio_mem_size_mib.map(VirtioMem::new).transpose()?;
     let _control = control_socket
-        .map(|path| Server::bind(&path, vmm.memory_control().unwrap()))
+        .map(|path| Server::bind(&path, memory.as_ref().unwrap().control()))
         .transpose()?;
     let terminal = Terminal::new()?;
     eprintln!("w-vmm: {vcpus} vCPU, {memory_mib} MiB; Ctrl-] exits");
-    vmm.run(disks, network, terminal)
+    vmm.run(disks, network, memory, terminal)
 }
 
 fn control_command(socket: &Path, req: Request) -> Result<()> {

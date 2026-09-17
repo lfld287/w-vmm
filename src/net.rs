@@ -8,7 +8,7 @@ pub mod macos;
 /// All methods are called on the VMM thread. Implementations need not be Send/Sync.
 pub trait NetDevice {
     fn mac_address(&self) -> [u8; 6];
-    fn mtu(&self) -> u16;
+    const MTU: u16;
     /// Maximum complete frame length; receive buffers are at least this large.
     fn max_frame_len(&self) -> usize;
     /// True accepts the whole frame; false accepts nothing and requests a retry.
@@ -21,9 +21,7 @@ impl<T: NetDevice + ?Sized> NetDevice for Box<T> {
     fn mac_address(&self) -> [u8; 6] {
         (**self).mac_address()
     }
-    fn mtu(&self) -> u16 {
-        (**self).mtu()
-    }
+    const MTU: u16 = T::MTU;
     fn max_frame_len(&self) -> usize {
         (**self).max_frame_len()
     }

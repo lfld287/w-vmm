@@ -18,9 +18,7 @@ impl<ND: NetDevice> Net<ND> {
     pub fn new(backend: ND) -> Result<Self> {
         let max = backend.max_frame_len();
         ensure!(
-            backend.mtu() >= 68
-                && max >= backend.mtu() as usize + 14
-                && max <= u16::MAX as usize + 18,
+            ND::MTU >= 68 && max >= ND::MTU as usize + 14 && max <= u16::MAX as usize + 18,
             "invalid network MTU/frame capacity"
         );
         let mac = backend.mac_address();
@@ -30,7 +28,7 @@ impl<ND: NetDevice> Net<ND> {
         );
         let mut config = [0; 12];
         config[..6].copy_from_slice(&mac);
-        config[10..12].copy_from_slice(&backend.mtu().to_le_bytes());
+        config[10..12].copy_from_slice(&ND::MTU.to_le_bytes());
         Ok(Self {
             backend,
             config,
@@ -179,9 +177,7 @@ mod tests {
         fn mac_address(&self) -> [u8; 6] {
             [2, 0, 0, 0, 0, 1]
         }
-        fn mtu(&self) -> u16 {
-            1500
-        }
+        const MTU: u16 = 1500;
         fn max_frame_len(&self) -> usize {
             1514
         }
@@ -203,6 +199,33 @@ mod tests {
             buffer[..frame.len()].copy_from_slice(&frame);
             Ok(Some(frame.len()))
         }
+    }
+    #[test]
+    fn associated_mtu_and_frame_capacity() {
+        struct Backend<const MTU: u16>(usize);
+        impl<const MTU: u16> NetDevice for Backend<MTU> {
+            const MTU: u16 = MTU;
+            fn mac_address(&self) -> [u8; 6] {
+                [2, 0, 0, 0, 0, 1]
+            }
+            fn max_frame_len(&self) -> usize {
+                self.0
+            }
+            fn send(&mut self, _: &[u8]) -> Result<bool> {
+                unreachable!()
+            }
+            fn recv(&mut self, _: &mut [u8]) -> Result<Option<usize>> {
+                unreachable!()
+            }
+        }
+        let d = Net::new(Box::new(Backend::<9000>(9014))).unwrap();
+        let mut mtu = [0; 2];
+        d.read_config(10, &mut mtu);
+        assert_eq!(u16::from_le_bytes(mtu), 9000);
+        assert_eq!(<Box<Backend<9000>> as NetDevice>::MTU, 9000);
+        assert!(Net::new(Backend::<9000>(9013)).is_err());
+        assert!(Net::new(Backend::<67>(1514)).is_err());
+        assert!(Net::new(Backend::<1500>(u16::MAX as usize + 19)).is_err());
     }
     type TestNet = Mmio<Net<Rc<RefCell<Fake>>>>;
     fn setup() -> (TestNet, GuestMemoryMmap, Rc<RefCell<Fake>>) {

@@ -38,7 +38,7 @@ sudo ./w-vmm run --net --disk sda=data.qcow2
 
 ```sh
 ./w-vmm run --vcpus 4 --memory-mib 512 --virtio-mem-size-mib 1024 \
-  --virtio-mem-requested-mib 256 --control-socket /tmp/w-vmm.sock
+  --control-socket /tmp/w-vmm.sock
 # 另一个本地终端
 ./w-vmm memory-set --socket /tmp/w-vmm.sock --requested-mib 768
 ./w-vmm memory-status --socket /tmp/w-vmm.sock

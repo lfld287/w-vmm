@@ -87,7 +87,6 @@ unsafe fn string(dict: Xpc, key: *const c_char) -> Result<Option<String>> {
 
 struct Parameters {
     mac: [u8; 6],
-    mtu: u16,
     max_frame: usize,
     ipv4: SharedIpv4,
 }
@@ -109,13 +108,13 @@ unsafe fn parameters(dict: Xpc) -> Result<Parameters> {
         let mtu = u16::try_from(xpc_dictionary_get_uint64(dict, vmnet_mtu_key))?;
         let max_frame =
             usize::try_from(xpc_dictionary_get_uint64(dict, vmnet_max_packet_size_key))?;
+        ensure!(mtu == Vmnet::MTU, "vmnet returned unexpected MTU {mtu}");
         ensure!(
             mtu >= 68 && max_frame >= mtu as usize + 14 && max_frame <= u16::MAX as usize + 18,
             "invalid vmnet frame capacity"
         );
         Ok(Parameters {
             mac,
-            mtu,
             max_frame,
             ipv4: SharedIpv4 {
                 gateway: string(dict, vmnet_start_address_key)?,
@@ -132,7 +131,6 @@ pub struct Vmnet {
     interface: Option<NonNull<c_void>>,
     queue: DispatchRetained<DispatchQueue>,
     mac: [u8; 6],
-    mtu: u16,
     max_frame: usize,
     ipv4: SharedIpv4,
 }
@@ -151,7 +149,7 @@ impl Vmnet {
             let desc = xpc_dictionary_create(std::ptr::null(), std::ptr::null(), 0);
             ensure!(!desc.is_null(), "create vmnet description");
             xpc_dictionary_set_uint64(desc, vmnet_operation_mode_key, 1001);
-            xpc_dictionary_set_uint64(desc, vmnet_mtu_key, 1500);
+            xpc_dictionary_set_uint64(desc, vmnet_mtu_key, Self::MTU as u64);
             let interface = vmnet_start_interface(desc, &queue, &callback);
             xpc_release(desc);
             NonNull::new(interface)
@@ -162,7 +160,6 @@ impl Vmnet {
             interface: Some(interface),
             queue,
             mac: [0; 6],
-            mtu: 0,
             max_frame: 0,
             ipv4: SharedIpv4::default(),
         };
@@ -171,7 +168,6 @@ impl Vmnet {
             .context("waiting for vmnet start")?
             .context("create vmnet shared interface (requires root or an Apple-approved networking entitlement)")?;
         backend.mac = params.mac;
-        backend.mtu = params.mtu;
         backend.max_frame = params.max_frame;
         backend.ipv4 = params.ipv4;
         Ok(backend)
@@ -212,9 +208,7 @@ impl NetDevice for Vmnet {
     fn mac_address(&self) -> [u8; 6] {
         self.mac
     }
-    fn mtu(&self) -> u16 {
-        self.mtu
-    }
+    const MTU: u16 = 1500;
     fn max_frame_len(&self) -> usize {
         self.max_frame
     }
@@ -297,7 +291,7 @@ mod tests {
     #[ignore = "requires root or an approved vmnet entitlement"]
     fn shared_interface_lifecycle() {
         let mut net = Vmnet::shared().unwrap();
-        assert_eq!(net.mtu(), 1500);
+        assert_eq!(Vmnet::MTU, 1500);
         assert_ne!(net.mac_address(), [0; 6]);
         net.close().unwrap();
         net.close().unwrap();
