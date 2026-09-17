@@ -11,20 +11,29 @@ pub trait VirtioDevice {
     fn required_features(&self) -> u64 {
         0
     }
+
     fn generation(&self) -> u32 {
         0
     }
+
     fn device_id(&self) -> u32;
+
     fn features(&self) -> u64;
+
     fn queue_count(&self) -> usize;
+
     fn read_config(&self, offset: usize, data: &mut [u8]);
+
     fn notify(&mut self, queue: usize, queues: &mut Queues, mem: &GuestMemoryMmap) -> Result<()>;
+
     fn poll(&mut self, _queues: &mut Queues, _mem: &GuestMemoryMmap) -> Result<()> {
         Ok(())
     }
+
     fn reset(&mut self) -> Result<()> {
         Ok(())
     }
+
     fn flush(&self) -> Result<()> {
         Ok(())
     }
@@ -359,28 +368,35 @@ pub(crate) mod tests {
         notifications: usize,
         resets: usize,
     }
+
     impl VirtioDevice for Fake {
         fn device_id(&self) -> u32 {
             42
         }
+
         fn features(&self) -> u64 {
             0
         }
+
         fn queue_count(&self) -> usize {
             2
         }
+
         fn read_config(&self, offset: usize, data: &mut [u8]) {
             read_config(&[0x12, 0x34, 0x56], offset, data);
         }
+
         fn notify(&mut self, _: usize, _: &mut Queues, _: &GuestMemoryMmap) -> Result<()> {
             self.notifications += 1;
             Ok(())
         }
+
         fn reset(&mut self) -> Result<()> {
             self.resets += 1;
             Ok(())
         }
     }
+
     fn setup() -> (Mmio<Fake>, GuestMemoryMmap) {
         (
             Mmio::new(Fake {

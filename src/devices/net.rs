@@ -132,15 +132,19 @@ impl<ND: NetDevice> VirtioDevice for Net<ND> {
     fn device_id(&self) -> u32 {
         1
     }
+
     fn features(&self) -> u64 {
         (1 << VIRTIO_NET_F_MAC) | (1 << VIRTIO_NET_F_MTU)
     }
+
     fn queue_count(&self) -> usize {
         2
     }
+
     fn read_config(&self, offset: usize, data: &mut [u8]) {
         read_config(&self.config, offset, data);
     }
+
     fn notify(&mut self, queue: usize, queues: &mut Queues, mem: &GuestMemoryMmap) -> Result<()> {
         match queue {
             0 => self.receive(queues, mem),
@@ -148,10 +152,12 @@ impl<ND: NetDevice> VirtioDevice for Net<ND> {
             _ => unreachable!(),
         }
     }
+
     fn poll(&mut self, queues: &mut Queues, mem: &GuestMemoryMmap) -> Result<()> {
         self.transmit(queues, mem)?;
         self.receive(queues, mem)
     }
+
     fn reset(&mut self) -> Result<()> {
         self.pending_tx = None;
         Ok(())
@@ -173,14 +179,18 @@ mod tests {
         blocked: bool,
         fail: bool,
     }
+
     impl NetDevice for Rc<RefCell<Fake>> {
         fn mac_address(&self) -> [u8; 6] {
             [2, 0, 0, 0, 0, 1]
         }
+
         const MTU: u16 = 1500;
+
         fn max_frame_len(&self) -> usize {
             1514
         }
+
         fn send(&mut self, frame: &[u8]) -> Result<bool> {
             let mut backend = self.borrow_mut();
             ensure!(!backend.fail, "injected send failure");
@@ -190,6 +200,7 @@ mod tests {
             backend.sent.push(frame.to_vec());
             Ok(true)
         }
+
         fn recv(&mut self, buffer: &mut [u8]) -> Result<Option<usize>> {
             let mut backend = self.borrow_mut();
             ensure!(!backend.fail, "injected receive failure");
@@ -200,20 +211,26 @@ mod tests {
             Ok(Some(frame.len()))
         }
     }
+
     #[test]
     fn associated_mtu_and_frame_capacity() {
         struct Backend<const MTU: u16>(usize);
+
         impl<const MTU: u16> NetDevice for Backend<MTU> {
             const MTU: u16 = MTU;
+
             fn mac_address(&self) -> [u8; 6] {
                 [2, 0, 0, 0, 0, 1]
             }
+
             fn max_frame_len(&self) -> usize {
                 self.0
             }
+
             fn send(&mut self, _: &[u8]) -> Result<bool> {
                 unreachable!()
             }
+
             fn recv(&mut self, _: &mut [u8]) -> Result<Option<usize>> {
                 unreachable!()
             }
@@ -227,7 +244,9 @@ mod tests {
         assert!(Net::new(Backend::<67>(1514)).is_err());
         assert!(Net::new(Backend::<1500>(u16::MAX as usize + 19)).is_err());
     }
+
     type TestNet = Mmio<Net<Rc<RefCell<Fake>>>>;
+
     fn setup() -> (TestNet, GuestMemoryMmap, Rc<RefCell<Fake>>) {
         let backend = Rc::new(RefCell::new(Fake::default()));
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
@@ -235,6 +254,7 @@ mod tests {
         initialize(&mut net, &mem);
         (net, mem, backend)
     }
+
     fn post(net: &TestNet, mem: &GuestMemoryMmap, queue: usize, desc: &[Descriptor]) {
         let q = &net.queues.rings[queue];
         for (i, d) in desc.iter().enumerate() {
@@ -253,6 +273,7 @@ mod tests {
         )
         .unwrap();
     }
+
     fn tx(net: &TestNet, mem: &GuestMemoryMmap) -> Vec<u8> {
         let frame = vec![0x5a; 64];
         let mut packet = vec![0; HEADER];
@@ -270,6 +291,7 @@ mod tests {
         );
         frame
     }
+
     fn used(mem: &GuestMemoryMmap, queue: usize) -> (u16, u32) {
         let base = 0x3000 + queue as u64 * 0x3000;
         (

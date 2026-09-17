@@ -56,20 +56,25 @@ impl Vmm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     struct Serial;
+
     impl std::io::Write for Serial {
         fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
             unreachable!()
         }
+
         fn flush(&mut self) -> std::io::Result<()> {
             unreachable!()
         }
     }
+
     impl SerialIo for Serial {
         fn recv(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
             unreachable!()
         }
     }
+
     #[test]
     fn startup_failure_stops_memory_device() {
         let memory = VirtioMem::new(128).unwrap();

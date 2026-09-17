@@ -19,12 +19,14 @@ fn validate_target(target: u64, capacity: u64) -> Result<()> {
     );
     Ok(())
 }
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryLifecycle {
     Created,
     Running,
     Stopped,
 }
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryStatus {
     pub region_size_mib: u64,
@@ -33,8 +35,10 @@ pub struct MemoryStatus {
     pub driver_ready: bool,
     pub lifecycle: MemoryLifecycle,
 }
+
 #[derive(Debug, Clone)]
 pub struct MemoryControl(Arc<Mutex<MemoryStatus>>);
+
 impl MemoryControl {
     fn new(region_size_mib: u64) -> Self {
         Self(Arc::new(Mutex::new(MemoryStatus {
@@ -45,9 +49,11 @@ impl MemoryControl {
             lifecycle: MemoryLifecycle::Created,
         })))
     }
+
     fn lock(&self) -> MutexGuard<'_, MemoryStatus> {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
+
     /// Accept a desired extra-memory size. The guest may not reach it immediately.
     pub fn set_requested_mib(&self, requested: u64) -> Result<()> {
         let mut state = self.lock();
@@ -59,6 +65,7 @@ impl MemoryControl {
         state.requested_size_mib = requested;
         Ok(())
     }
+
     pub fn status(&self) -> MemoryStatus {
         self.lock().clone()
     }
@@ -66,6 +73,7 @@ impl MemoryControl {
 
 pub(crate) trait Mapper {
     fn map(&mut self, region: &GuestRegionMmap) -> Result<()>;
+
     fn unmap(&mut self, region: &GuestRegionMmap) -> Result<()>;
 }
 
@@ -81,16 +89,20 @@ pub struct VirtioMem {
     // A failed rollback may leave mappings alive until the platform VM is destroyed.
     retained: Vec<Arc<GuestRegionMmap>>,
 }
+
 impl VirtioMem {
     fn plugged(&self, addr: u64) -> bool {
         self.blocks.contains_key(&addr)
     }
+
     fn count(&self) -> u64 {
         self.blocks.len() as u64
     }
+
     fn addresses(&self) -> Vec<u64> {
         self.blocks.keys().copied().collect()
     }
+
     /// Called only with every vCPU quiescent and device processing suspended.
     /// false means failure with successful rollback; Err is fatal rollback failure.
     fn change<M: Mapper>(
@@ -148,6 +160,7 @@ impl VirtioMem {
         Ok(true)
     }
 }
+
 impl VirtioMem {
     pub fn new(region_size_mib: u64) -> Result<Self> {
         ensure!(
@@ -169,9 +182,11 @@ impl VirtioMem {
             retained: Vec::new(),
         })
     }
+
     pub fn control(&self) -> MemoryControl {
         self.control.clone()
     }
+
     pub(crate) fn attach(&mut self, base_mib: u64) -> Result<()> {
         ensure!(
             base_mib
@@ -183,9 +198,11 @@ impl VirtioMem {
         self.requested = self.control.status().requested_size_mib << 20;
         Ok(())
     }
+
     pub(crate) fn start(&self) {
         self.control.lock().lifecycle = MemoryLifecycle::Running;
     }
+
     /// vCPUs must be joined first. Keep allocations until after VM destruction,
     /// including those whose mapping state became uncertain during rollback.
     pub(crate) fn stop<M: Mapper>(&self, mapper: &mut M) {
@@ -202,6 +219,7 @@ impl VirtioMem {
             }
         }
     }
+
     pub(crate) fn sync_target(&mut self, ready: bool) -> bool {
         let mut status = self.control.lock();
         status.driver_ready = ready;
@@ -213,6 +231,7 @@ impl VirtioMem {
         self.generation = self.generation.wrapping_add(1);
         true
     }
+
     fn request<M: Mapper>(
         &mut self,
         req: &[u8; 24],
@@ -280,6 +299,7 @@ impl VirtioMem {
         status.plugged_size_mib = self.plugged >> 20;
         Ok((0, 0))
     }
+
     pub(crate) fn process<M: Mapper>(
         &mut self,
         queues: &mut Queues,
@@ -340,22 +360,28 @@ impl VirtioMem {
         Ok(())
     }
 }
+
 impl VirtioDevice for VirtioMem {
     fn required_features(&self) -> u64 {
         2
     }
+
     fn generation(&self) -> u32 {
         self.generation
     }
+
     fn device_id(&self) -> u32 {
         24
     }
+
     fn features(&self) -> u64 {
         2
     }
+
     fn queue_count(&self) -> usize {
         1
     }
+
     fn read_config(&self, offset: usize, data: &mut [u8]) {
         let mut config = [0; 56];
         for (offset, value) in [
@@ -370,9 +396,11 @@ impl VirtioDevice for VirtioMem {
         }
         mmio::read_config(&config, offset, data);
     }
+
     fn notify(&mut self, _: usize, _: &mut Queues, _: &GuestMemoryMmap) -> Result<()> {
         Ok(())
     }
+
     fn reset(&mut self) -> Result<()> {
         self.control.lock().driver_ready = false;
         Ok(())
@@ -393,12 +421,14 @@ mod tests {
     use crate::devices::mmio::{Mmio, tests::initialize};
     use std::collections::BTreeSet;
     use vm_memory::{GuestMemoryBackend, GuestMemoryRegion};
+
     #[derive(Default)]
     struct Fake {
         mapped: BTreeSet<u64>,
         calls: usize,
         fail: Vec<usize>,
     }
+
     impl Mapper for Fake {
         fn map(&mut self, r: &GuestRegionMmap) -> Result<()> {
             self.calls += 1;
@@ -406,6 +436,7 @@ mod tests {
             assert!(self.mapped.insert(r.start_addr().0));
             Ok(())
         }
+
         fn unmap(&mut self, r: &GuestRegionMmap) -> Result<()> {
             self.calls += 1;
             ensure!(!self.fail.contains(&self.calls), "injected unmap failure");
@@ -413,6 +444,7 @@ mod tests {
             Ok(())
         }
     }
+
     #[test]
     fn capacity_and_lifecycle() {
         for size in [0, 1, 129, 16512, u64::MAX] {
@@ -456,6 +488,7 @@ mod tests {
         drop(unused);
         assert_eq!(c.status().lifecycle, MemoryLifecycle::Stopped);
     }
+
     #[test]
     fn rollback_allocations_live_through_vm_teardown() {
         let (mut d, mut view, mut mapper) = setup();
@@ -479,6 +512,7 @@ mod tests {
         drop(d);
         assert!(allocations.iter().all(|r| r.upgrade().is_none()));
     }
+
     fn setup() -> (VirtioMem, GuestMemoryMmap, Fake) {
         let mut d = VirtioMem::new(128).unwrap();
         d.control().set_requested_mib(128).unwrap();
@@ -489,6 +523,7 @@ mod tests {
             Fake::default(),
         )
     }
+
     fn req(kind: u16, addr: u64, count: u16) -> [u8; 24] {
         let mut bytes = [0; 24];
         bytes[..2].copy_from_slice(&kind.to_le_bytes());
@@ -496,6 +531,7 @@ mod tests {
         bytes[16..18].copy_from_slice(&count.to_le_bytes());
         bytes
     }
+
     #[test]
     fn requests_state_target_reset_and_holes() {
         let (mut d, mut view, mut mapper) = setup();
@@ -576,6 +612,7 @@ mod tests {
         assert!(mapper.mapped.is_empty());
         assert_eq!(d.control.status().plugged_size_mib, 0);
     }
+
     #[test]
     fn invalid_requests() {
         let (mut d, mut view, mut mapper) = setup();
@@ -596,6 +633,7 @@ mod tests {
             );
         }
     }
+
     #[test]
     fn transactional_map_and_unmap_failure() {
         let (mut d, mut view, mut mapper) = setup();
@@ -630,6 +668,7 @@ mod tests {
         );
         assert_eq!(d.retained.len(), 2);
     }
+
     #[test]
     fn negotiation_generation_and_queue_response() {
         let (d, mut view, mut mapper) = setup();

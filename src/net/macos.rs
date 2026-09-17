@@ -13,7 +13,9 @@ use std::{
 const SUCCESS: u32 = 1000;
 const BUFFER_EXHAUSTED: u32 = 1007;
 const TIMEOUT: Duration = Duration::from_secs(10);
+
 type Xpc = *mut c_void;
+
 type Interface = *mut c_void;
 
 #[repr(C)]
@@ -33,25 +35,33 @@ unsafe extern "C" {
     static vmnet_start_address_key: *const c_char;
     static vmnet_end_address_key: *const c_char;
     static vmnet_subnet_mask_key: *const c_char;
+
     fn vmnet_start_interface(
         desc: Xpc,
         queue: &DispatchQueue,
         handler: &Block<dyn Fn(u32, Xpc)>,
     ) -> Interface;
+
     fn vmnet_stop_interface(
         interface: Interface,
         queue: &DispatchQueue,
         handler: &Block<dyn Fn(u32)>,
     ) -> u32;
+
     fn vmnet_read(interface: Interface, packets: *mut Packet, count: *mut i32) -> u32;
+
     fn vmnet_write(interface: Interface, packets: *mut Packet, count: *mut i32) -> u32;
 }
 
 unsafe extern "C" {
     fn xpc_dictionary_create(keys: *const *const c_char, values: *const Xpc, count: usize) -> Xpc;
+
     fn xpc_dictionary_set_uint64(dict: Xpc, key: *const c_char, value: u64);
+
     fn xpc_dictionary_get_uint64(dict: Xpc, key: *const c_char) -> u64;
+
     fn xpc_dictionary_get_string(dict: Xpc, key: *const c_char) -> *const c_char;
+
     fn xpc_release(object: Xpc);
 }
 
@@ -208,10 +218,13 @@ impl NetDevice for Vmnet {
     fn mac_address(&self) -> [u8; 6] {
         self.mac
     }
+
     const MTU: u16 = 1500;
+
     fn max_frame_len(&self) -> usize {
         self.max_frame
     }
+
     fn send(&mut self, frame: &[u8]) -> Result<bool> {
         ensure!(
             (14..=self.max_frame).contains(&frame.len()),
@@ -237,6 +250,7 @@ impl NetDevice for Vmnet {
         ensure!((0..=1).contains(&count), "invalid vmnet TX count");
         Ok(count == 1)
     }
+
     fn recv(&mut self, buffer: &mut [u8]) -> Result<Option<usize>> {
         ensure!(buffer.len() >= self.max_frame, "vmnet RX buffer too small");
         let mut iov = libc::iovec {
@@ -277,6 +291,7 @@ impl Drop for Vmnet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn mac_parsing() {
         assert_eq!(
@@ -287,6 +302,7 @@ mod tests {
             assert!(parse_mac(invalid).is_err());
         }
     }
+
     #[test]
     #[ignore = "requires root or an approved vmnet entitlement"]
     fn shared_interface_lifecycle() {

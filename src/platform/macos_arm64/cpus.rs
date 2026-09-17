@@ -14,17 +14,20 @@ pub struct Access {
     pub value: u64,
     pub reply: mpsc::SyncSender<u64>,
 }
+
 pub enum Event {
     Access(Access),
     Failed(anyhow::Error),
     Shutdown,
 }
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Power {
     Off,
     Pending(u64, u64),
     On,
 }
+
 struct State {
     stop: bool,
     paused: bool,
@@ -33,10 +36,12 @@ struct State {
     running: Vec<bool>,
     ids: Vec<Option<u64>>,
 }
+
 pub struct Shared {
     state: Mutex<State>,
     changed: Condvar,
 }
+
 impl Shared {
     fn new(count: u32) -> Self {
         Self {
@@ -51,17 +56,20 @@ impl Shared {
             changed: Condvar::new(),
         }
     }
+
     fn kick(state: &State) {
         for id in state.ids.iter().flatten() {
             hvf::kick(*id);
         }
     }
+
     pub fn stop(&self) {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         s.stop = true;
         Self::kick(&s);
         self.changed.notify_all();
     }
+
     fn on(&self, target: u64, entry: u64, context: u64) -> i64 {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let Some(power) = usize::try_from(target)
@@ -83,6 +91,7 @@ impl Shared {
             }
         }
     }
+
     fn affinity(&self, target: u64, level: u64) -> i64 {
         if level > 3 {
             return -2;
@@ -105,6 +114,7 @@ impl Shared {
             -2
         }
     }
+
     pub fn pause(&self) -> Result<Pause<'_>> {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         s.paused = true;
@@ -120,7 +130,9 @@ impl Shared {
         Ok(Pause(self))
     }
 }
+
 pub struct Pause<'a>(&'a Shared);
+
 impl Drop for Pause<'_> {
     fn drop(&mut self) {
         let mut s = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -128,10 +140,12 @@ impl Drop for Pause<'_> {
         self.0.changed.notify_all();
     }
 }
+
 pub struct Cpus {
     pub shared: Arc<Shared>,
     threads: Vec<JoinHandle<()>>,
 }
+
 impl Cpus {
     pub fn create(count: u32, events: mpsc::Sender<Event>) -> Result<Self> {
         let mut cpus = Self {
@@ -195,12 +209,14 @@ impl Cpus {
         }
         Ok(cpus)
     }
+
     pub fn start(&self, entry: u64, dtb: u64) {
         let mut s = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         s.power[0] = Power::Pending(entry, dtb);
         s.started = true;
         self.shared.changed.notify_all();
     }
+
     pub fn stopping(&self) -> bool {
         self.shared
             .state
@@ -209,6 +225,7 @@ impl Cpus {
             .stop
     }
 }
+
 impl Drop for Cpus {
     fn drop(&mut self) {
         self.shared.stop();
@@ -221,6 +238,7 @@ impl Drop for Cpus {
         }
     }
 }
+
 fn worker(
     cpu: &hvf::Vcpu,
     index: usize,
@@ -352,6 +370,7 @@ fn worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn psci_states_and_affinity() {
         let s = Shared::new(4);
@@ -373,6 +392,7 @@ mod tests {
         assert_eq!(s.affinity(3, 1), 0);
         assert_eq!(s.affinity(0x100, 1), -2);
     }
+
     #[test]
     fn pause_includes_offline_and_mmio_waiters_and_stop_cancels() {
         let s = Arc::new(Shared::new(4));
@@ -397,6 +417,7 @@ mod tests {
         s.stop();
         assert!(s.pause().is_err());
     }
+
     #[test]
     fn partial_startup_is_cancellable() {
         let s = Arc::new(Shared::new(4));

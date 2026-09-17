@@ -17,6 +17,7 @@ impl<BS: BlockStorage> VirtioDevice for Block<BS> {
     fn device_id(&self) -> u32 {
         2
     }
+
     fn features(&self) -> u64 {
         (1 << VIRTIO_BLK_F_FLUSH)
             | if self.disk.read_only() {
@@ -25,12 +26,15 @@ impl<BS: BlockStorage> VirtioDevice for Block<BS> {
                 0
             }
     }
+
     fn queue_count(&self) -> usize {
         1
     }
+
     fn read_config(&self, offset: usize, data: &mut [u8]) {
         read_config(&(self.disk.size() / 512).to_le_bytes(), offset, data);
     }
+
     fn notify(&mut self, _queue: usize, queues: &mut Queues, mem: &GuestMemoryMmap) -> Result<()> {
         let count = queues.available(0, mem)?;
         for _ in 0..count {
@@ -42,9 +46,11 @@ impl<BS: BlockStorage> VirtioDevice for Block<BS> {
         }
         Ok(())
     }
+
     fn reset(&mut self) -> Result<()> {
         self.disk.flush()
     }
+
     fn flush(&self) -> Result<()> {
         self.disk.flush()
     }

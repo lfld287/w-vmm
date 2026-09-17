@@ -13,7 +13,9 @@ use anyhow::{Result, bail, ensure};
 use std::{collections::BTreeMap, sync::mpsc, time::Duration};
 use vm_memory::{GuestAddress, GuestMemoryMmap};
 use vm_superio::{Serial, Trigger};
+
 pub(super) struct Backend;
+
 impl VmRuntime for Backend {
     fn run<BS: BlockStorage, ND: NetDevice, SI: SerialIo>(
         config: &VmConfig,
@@ -183,9 +185,12 @@ impl VmRuntime for Backend {
         result.and(flushed)
     }
 }
+
 struct Irq;
+
 impl Trigger for Irq {
     type E = std::io::Error;
+
     fn trigger(&self) -> std::io::Result<()> {
         Ok(())
     }

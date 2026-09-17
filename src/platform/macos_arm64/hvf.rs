@@ -199,7 +199,9 @@ pub fn max_vcpus() -> Result<u32> {
     }
     Ok(count)
 }
+
 pub struct Mapping;
+
 impl Mapper for Mapping {
     fn map(&mut self, region: &vm_memory::GuestRegionMmap) -> Result<()> {
         unsafe {
@@ -214,6 +216,7 @@ impl Mapper for Mapping {
             )
         }
     }
+
     fn unmap(&mut self, region: &vm_memory::GuestRegionMmap) -> Result<()> {
         unsafe {
             check(
@@ -223,12 +226,14 @@ impl Mapper for Mapping {
         }
     }
 }
+
 // Created and destroyed on its worker thread. Cpus is joined before Vm drops.
 pub struct Vcpu {
     pub id: u64,
     exit: *const Exit,
     _thread: PhantomData<Rc<()>>,
 }
+
 impl Vcpu {
     pub fn new(mpidr: u64) -> Result<Self> {
         let mut id = 0;
@@ -249,6 +254,7 @@ impl Vcpu {
         }
         Ok(v)
     }
+
     pub fn boot(&self, entry: u64, context: u64) -> Result<()> {
         // CPU_ON re-enters at EL1 with translation and caches disabled.
         unsafe {

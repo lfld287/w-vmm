@@ -68,8 +68,10 @@ mod tests {
     use std::{cell::Cell, collections::VecDeque, rc::Rc};
 
     struct Irq;
+
     impl Trigger for Irq {
         type E = io::Error;
+
         fn trigger(&self) -> io::Result<()> {
             Ok(())
         }
@@ -87,6 +89,7 @@ mod tests {
         invalid_length: bool,
         stop_on_recv: bool,
     }
+
     impl Write for Memory {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
             if let Some(kind) = self.write_error {
@@ -95,10 +98,12 @@ mod tests {
             self.output.extend_from_slice(bytes);
             Ok(bytes.len())
         }
+
         fn flush(&mut self) -> io::Result<()> {
             self.flush_error.map_or(Ok(()), |kind| Err(kind.into()))
         }
     }
+
     impl SerialIo for Memory {
         fn recv(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
             self.capacities.push(buffer.len());
@@ -117,6 +122,7 @@ mod tests {
             }
             Ok(count)
         }
+
         fn should_stop(&self) -> bool {
             self.stop.get()
         }

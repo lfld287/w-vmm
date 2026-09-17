@@ -21,16 +21,19 @@ use std::{
 use w_vmm::MemoryControl;
 const LIMIT: usize = 4096;
 const TIMEOUT: Duration = Duration::from_millis(500);
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Request {
     MemoryStatus,
     MemorySet { requested_mib: u64 },
 }
+
 fn status(control: &MemoryControl) -> Value {
     let s = control.status();
     json!({"region_size_mib": s.region_size_mib, "requested_size_mib": s.requested_size_mib, "plugged_size_mib": s.plugged_size_mib, "driver_ready": s.driver_ready, "lifecycle": format!("{:?}", s.lifecycle)})
 }
+
 fn line(stream: &mut UnixStream) -> Result<Vec<u8>> {
     // Absolute deadline also bounds clients that drip one byte before each timeout.
     let end = std::time::Instant::now() + TIMEOUT;
@@ -61,6 +64,7 @@ fn line(stream: &mut UnixStream) -> Result<Vec<u8>> {
         data.push(byte[0]);
     }
 }
+
 fn serve(mut stream: UnixStream, control: &MemoryControl) -> Result<()> {
     stream
         .set_write_timeout(Some(TIMEOUT))
@@ -76,12 +80,14 @@ fn serve(mut stream: UnixStream, control: &MemoryControl) -> Result<()> {
     writeln!(stream, "{response}")?;
     Ok(())
 }
+
 pub struct Server {
     path: PathBuf,
     identity: (u64, u64),
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
+
 impl Server {
     pub fn bind(path: &Path, control: MemoryControl) -> Result<Self> {
         // bind atomically refuses any existing file, symlink or socket.
@@ -116,6 +122,7 @@ impl Server {
         Ok(server)
     }
 }
+
 impl Drop for Server {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
@@ -127,6 +134,7 @@ impl Drop for Server {
         }
     }
 }
+
 pub fn request(path: &Path, request: Request) -> Result<Value> {
     let mut stream = UnixStream::connect(path).context("connect control socket")?;
     stream
@@ -140,6 +148,7 @@ pub fn request(path: &Path, request: Request) -> Result<Value> {
 mod tests {
     use super::*;
     use w_vmm::VirtioMem;
+
     #[test]
     fn socket_control_conflict_disconnect_cleanup() {
         let dir = std::env::temp_dir().join(format!("w-vmm-control-{}", std::process::id()));

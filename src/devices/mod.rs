@@ -22,12 +22,14 @@ impl<BS: BlockStorage, ND: NetDevice> VirtioDevice for Device<BS, ND> {
             _ => 0,
         }
     }
+
     fn generation(&self) -> u32 {
         match self {
             Self::Mem(d) => d.generation(),
             _ => 0,
         }
     }
+
     fn device_id(&self) -> u32 {
         match self {
             Self::Block(d) => d.device_id(),
@@ -35,6 +37,7 @@ impl<BS: BlockStorage, ND: NetDevice> VirtioDevice for Device<BS, ND> {
             Self::Mem(d) => d.device_id(),
         }
     }
+
     fn features(&self) -> u64 {
         match self {
             Self::Block(d) => d.features(),
@@ -42,6 +45,7 @@ impl<BS: BlockStorage, ND: NetDevice> VirtioDevice for Device<BS, ND> {
             Self::Mem(d) => d.features(),
         }
     }
+
     fn queue_count(&self) -> usize {
         match self {
             Self::Block(d) => d.queue_count(),
@@ -49,6 +53,7 @@ impl<BS: BlockStorage, ND: NetDevice> VirtioDevice for Device<BS, ND> {
             Self::Mem(d) => d.queue_count(),
         }
     }
+
     fn read_config(&self, offset: usize, data: &mut [u8]) {
         match self {
             Self::Block(d) => d.read_config(offset, data),
@@ -56,6 +61,7 @@ impl<BS: BlockStorage, ND: NetDevice> VirtioDevice for Device<BS, ND> {
             Self::Mem(d) => d.read_config(offset, data),
         }
     }
+
     fn notify(&mut self, queue: usize, queues: &mut Queues, mem: &GuestMemoryMmap) -> Result<()> {
         match self {
             Self::Block(d) => d.notify(queue, queues, mem),
@@ -63,6 +69,7 @@ impl<BS: BlockStorage, ND: NetDevice> VirtioDevice for Device<BS, ND> {
             Self::Mem(d) => d.notify(queue, queues, mem),
         }
     }
+
     fn poll(&mut self, queues: &mut Queues, mem: &GuestMemoryMmap) -> Result<()> {
         match self {
             Self::Block(d) => d.poll(queues, mem),
@@ -70,6 +77,7 @@ impl<BS: BlockStorage, ND: NetDevice> VirtioDevice for Device<BS, ND> {
             Self::Mem(d) => d.poll(queues, mem),
         }
     }
+
     fn reset(&mut self) -> Result<()> {
         match self {
             Self::Block(d) => d.reset(),
@@ -77,6 +85,7 @@ impl<BS: BlockStorage, ND: NetDevice> VirtioDevice for Device<BS, ND> {
             Self::Mem(d) => d.reset(),
         }
     }
+
     fn flush(&self) -> Result<()> {
         match self {
             Self::Block(d) => d.flush(),

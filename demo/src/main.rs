@@ -133,6 +133,7 @@ fn main() -> std::process::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn named_disks_and_legacy_path() {
         let disks = disk_paths(vec!["sdb=b.qcow2".into(), "sda=a.qcow2".into()]).unwrap();

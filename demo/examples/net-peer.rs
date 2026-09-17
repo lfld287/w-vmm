@@ -11,6 +11,7 @@ use w_vmm_demo::terminal::Terminal;
 
 const PEER_MAC: [u8; 6] = [2, 0, 0, 0, 0, 2];
 const PEER_IP: [u8; 4] = [192, 0, 2, 1];
+
 #[derive(Default)]
 struct Peer {
     replies: VecDeque<Vec<u8>>,
@@ -31,10 +32,13 @@ impl NetDevice for Peer {
     fn mac_address(&self) -> [u8; 6] {
         [2, 0, 0, 0, 0, 1]
     }
+
     const MTU: u16 = 1500;
+
     fn max_frame_len(&self) -> usize {
         1514
     }
+
     fn send(&mut self, frame: &[u8]) -> Result<bool> {
         if self.replies.len() == 128 {
             return Ok(false);
@@ -86,6 +90,7 @@ impl NetDevice for Peer {
         self.replies.push_back(reply);
         Ok(true)
     }
+
     fn recv(&mut self, buffer: &mut [u8]) -> Result<Option<usize>> {
         let Some(frame) = self.replies.pop_front() else {
             return Ok(None);
