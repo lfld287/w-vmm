@@ -3,13 +3,9 @@ use signal_hook::{
     SigId,
     consts::{SIGHUP, SIGINT, SIGTERM},
 };
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    thread::JoinHandle,
-    time::Duration,
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
 };
 
 pub struct Terminal {
@@ -89,38 +85,6 @@ impl Drop for Terminal {
         }
         for id in self.signals.drain(..) {
             signal_hook::low_level::unregister(id);
-        }
-    }
-}
-
-// Wake blocked HVF runs so stdin and host signals remain responsive. Join before destroying vCPU.
-pub struct Kicker {
-    done: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl Kicker {
-    pub fn new(id: u64) -> Self {
-        let done = Arc::new(AtomicBool::new(false));
-        let flag = done.clone();
-        let thread = std::thread::spawn(move || {
-            while !flag.load(Ordering::Acquire) {
-                std::thread::sleep(Duration::from_millis(10));
-                crate::hvf::kick(id);
-            }
-        });
-        Self {
-            done,
-            thread: Some(thread),
-        }
-    }
-}
-
-impl Drop for Kicker {
-    fn drop(&mut self) {
-        self.done.store(true, Ordering::Release);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
         }
     }
 }

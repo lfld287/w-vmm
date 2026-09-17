@@ -14,7 +14,7 @@ Copyright 2021 Red Hat, Inc.
 SPDX-License-Identifier: Apache-2.0
 ```
 
-`src/hvf.rs` 的最小 FFI 声明按本机 Apple SDK 的 Hypervisor 头文件重新编写，没有复制 libkrun 自动生成的 bindings 或完整封装。寄存器编号和 syndrome 位定义来自 ARM64/HVF ABI；VM/vCPU 生命周期采用本项目的 RAII 封装。Apple SDK 头文件未随项目重新分发。
+`src/platform/macos_arm64/hvf.rs` 的最小 FFI 声明按本机 Apple SDK 的 Hypervisor 头文件重新编写，没有复制 libkrun 自动生成的 bindings 或完整封装。寄存器编号和 syndrome 位定义来自 ARM64/HVF ABI；VM/vCPU 生命周期采用本项目的 RAII 封装。Apple SDK 头文件未随项目重新分发。
 
 ## Rust 组件
 

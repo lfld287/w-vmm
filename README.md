@@ -108,11 +108,13 @@ python3 scripts/smoke.py --binary dist/w-vmm
 - `Cargo.toml`：根 library 包和 workspace 入口，共用 `Cargo.lock`、`target/` 及 release profile。
 - `demo/Cargo.toml`：不可发布的 `w-vmm-demo` 包，声明 `w-vmm` 二进制及 CLI 依赖。
 - `src/boot.rs`：校验 ARM64 Image、RAM/内核/initramfs/FDT 布局，linux-loader 加载及 vm-fdt 设备树。
-- `src/hvf.rs`：最小 FFI、VM 映射、原生 GIC 和绑定创建线程的 RAII vCPU。VM 内存由 vm-memory 持有，先销毁 vCPU 和映射，再释放 RAM。
+- `src/platform/mod.rs`：`VmRuntime` trait 与按构建目标的运行时选择（`Runtime` 别名、`run()` 分派）。
+- `src/platform/macos_arm64/mod.rs`：`VmRuntime` 的 macOS/arm64 实现——HVF 运行循环、vCPU 唤醒（Kicker）与串口中断接线；`#[cfg]` 门控，仅 Apple Silicon 编译。
+- `src/platform/macos_arm64/hvf.rs`：最小 FFI、VM 映射、原生 GIC 和绑定创建线程的 RAII vCPU。VM 内存由 vm-memory 持有，先销毁 vCPU 和映射，再释放 RAM。
 - `src/devices/block.rs`：modern virtio-mmio，单个 128 项 split virtqueue，同步顺序处理 IN/OUT/FLUSH/GET_ID，单请求上限 1 MiB。
 - `src/storage.rs`：imago 原生同步 qcow2、同 inode 文件锁、范围校验、内部缓存 flush 与宿主 sync/fsync。
-- `src/terminal.rs`：原始终端、非阻塞输入、信号恢复与周期性唤醒 HVF。
-- `src/lib.rs`：`VmConfig` / `Vmm::new(...).run()`、串口和退出分派。
+- `src/terminal.rs`：原始终端、非阻塞输入与信号恢复。
+- `src/lib.rs`：`VmConfig` / `Vmm::new(...).run()`，委托 `platform::run`。
 - `demo/src/main.rs`：CLI、错误输出，通过路径依赖调用根库。
 
 设备 MMIO：GIC distributor `0x08000000`，16550 `0x09000000`（SPI 33），virtio-blk `0x0a000000`（SPI 34），GIC redistributor `0x10000000`，RAM `0x40000000`。定时器 INTID 和 redistributor 空间大小查询 HVF，避免假定宿主参数。
