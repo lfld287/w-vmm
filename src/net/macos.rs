@@ -215,11 +215,11 @@ impl Vmnet {
 }
 
 impl NetDevice for Vmnet {
+    const MTU: u16 = 1500;
+
     fn mac_address(&self) -> [u8; 6] {
         self.mac
     }
-
-    const MTU: u16 = 1500;
 
     fn max_frame_len(&self) -> usize {
         self.max_frame

@@ -181,11 +181,11 @@ mod tests {
     }
 
     impl NetDevice for Rc<RefCell<Fake>> {
+        const MTU: u16 = 1500;
+
         fn mac_address(&self) -> [u8; 6] {
             [2, 0, 0, 0, 0, 1]
         }
-
-        const MTU: u16 = 1500;
 
         fn max_frame_len(&self) -> usize {
             1514

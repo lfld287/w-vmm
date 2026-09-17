@@ -34,17 +34,17 @@ impl Terminal {
             if libc::isatty(0) == 1 {
                 let mut old = std::mem::zeroed();
                 if libc::tcgetattr(0, &mut old) != 0 {
-                    return Err(std::io::Error::last_os_error()).context("get terminal mode");
+                    return Err(io::Error::last_os_error()).context("get terminal mode");
                 }
                 t.saved = Some(old);
                 let mut raw = old;
                 libc::cfmakeraw(&mut raw);
                 if libc::tcsetattr(0, libc::TCSANOW, &raw) != 0 {
-                    return Err(std::io::Error::last_os_error()).context("set terminal raw mode");
+                    return Err(io::Error::last_os_error()).context("set terminal raw mode");
                 }
             }
             if flags >= 0 && libc::fcntl(0, libc::F_SETFL, flags | libc::O_NONBLOCK) != 0 {
-                return Err(std::io::Error::last_os_error()).context("set stdin nonblocking");
+                return Err(io::Error::last_os_error()).context("set stdin nonblocking");
             }
         }
         Ok(t)

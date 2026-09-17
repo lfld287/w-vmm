@@ -7,10 +7,10 @@ pub mod macos;
 /// Nonblocking, complete Ethernet frames, excluding FCS and virtio headers.
 /// All methods are called on the VMM thread. Implementations need not be Send/Sync.
 pub trait NetDevice {
-    fn mac_address(&self) -> [u8; 6];
-
     const MTU: u16;
-
+    
+    fn mac_address(&self) -> [u8; 6];
+    
     /// Maximum complete frame length; receive buffers are at least this large.
     fn max_frame_len(&self) -> usize;
 
@@ -22,11 +22,11 @@ pub trait NetDevice {
 }
 
 impl<T: NetDevice + ?Sized> NetDevice for Box<T> {
+    const MTU: u16 = T::MTU;
+
     fn mac_address(&self) -> [u8; 6] {
         (**self).mac_address()
     }
-
-    const MTU: u16 = T::MTU;
 
     fn max_frame_len(&self) -> usize {
         (**self).max_frame_len()

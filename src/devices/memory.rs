@@ -239,9 +239,9 @@ impl VirtioMem {
         view: &mut GuestMemoryMmap,
         pinned: &[(u64, u64)],
     ) -> Result<(u16, u16)> {
-        let kind = u16::from_le_bytes(req[..2].try_into().unwrap());
-        let addr = u64::from_le_bytes(req[8..16].try_into().unwrap());
-        let count = u16::from_le_bytes(req[16..18].try_into().unwrap()) as u64;
+        let kind = u16::from_le_bytes(req[..2].try_into()?);
+        let addr = u64::from_le_bytes(req[8..16].try_into()?);
+        let count = u16::from_le_bytes(req[16..18].try_into()?) as u64;
         if kind > 3 {
             return Ok((3, 0));
         }
