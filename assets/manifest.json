@@ -1,0 +1,19 @@
+{
+  "alpine": "3.24.1",
+  "arch": "aarch64",
+  "linux-virt": "6.18.52-r0",
+  "sources": [
+    {
+      "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/aarch64/alpine-minirootfs-3.24.1-aarch64.tar.gz",
+      "sha256": "f55a90f69052c5bd6f92cb09a8f47065970830b194c917a006fb94028e721259"
+    },
+    {
+      "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/linux-virt-6.18.52-r0.apk",
+      "sha256": "d90baf2498d5ab602145c51e9374fec039634e0087cf686c9062ac4d322e304a"
+    }
+  ],
+  "outputs": {
+    "Image": "e698a107e4d04117db1a7b0daee99bdae5f0647fba2af50f3cd020a666950ab9",
+    "initramfs.cpio.gz": "cfb362d1c2caa3aaf714ba81c5dc20839f1ece06b4d9557eb9637169f7063684"
+  }
+}

@@ -1,0 +1,11 @@
+/target/
+/.cache/
+/assets/Image
+/assets/initramfs.cpio.gz
+*.qcow2
+*.raw
+/test-results/
+
+/dist/
+/.idea/
+/.ruff_cache/

@@ -1,0 +1,25 @@
+[package]
+name = "w-vmm"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace]
+members = ["demo"]
+default-members = [".", "demo"]
+resolver = "3"
+
+[dependencies]
+anyhow = "1"
+libc = "0.2"
+signal-hook = "0.3"
+vm-memory = { version = "0.18", features = ["backend-mmap"] }
+linux-loader = "0.14"
+vm-fdt = "0.3"
+virtio-queue = "0.18"
+virtio-bindings = "0.2"
+vm-superio = "0.8"
+imago = { version = "=0.2.5", default-features = false, features = ["sync"] }
+
+[profile.release]
+lto = "thin"
