@@ -53,7 +53,7 @@ impl Vmm {
             .config
             .disk
             .as_ref()
-            .map(|p| storage::Disk::open(p, self.config.read_only).map(|d| Block::new(Box::new(d))))
+            .map(|p| storage::Disk::open(p, self.config.read_only).map(Block::new))
             .transpose()?;
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(boot::RAM), layout.size)])?;
         let vm = hvf::Vm::new(mem)?;
@@ -82,7 +82,7 @@ impl Vmm {
                     serial.state().interrupt_identification & 1 == 0,
                 )?;
                 if let Some(b) = &block {
-                    hvf::spi(boot::BLOCK_IRQ, b.interrupt != 0)?;
+                    hvf::spi(boot::BLOCK_IRQ, b.interrupt_pending())?;
                 }
                 let exit = cpu.run()?;
                 match exit.reason {
@@ -189,7 +189,7 @@ impl Vmm {
             }
             Ok(())
         })();
-        let flushed = block.as_mut().map(|b| b.disk.flush()).transpose();
+        let flushed = block.as_ref().map(Block::flush).transpose();
         result?;
         flushed?;
         Ok(())

@@ -8,8 +8,8 @@ use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 const MAX_QUEUE: u16 = 128;
 const MAX_REQUEST: usize = 1024 * 1024;
 
-pub struct Block {
-    pub disk: Box<dyn BlockStorage>,
+pub struct Block<BS: BlockStorage> {
+    disk: BS,
     queue: Queue,
     feature_sel: u32,
     driver_sel: u32,
@@ -17,11 +17,11 @@ pub struct Block {
     features: u64,
     negotiated: u64,
     status: u32,
-    pub interrupt: u32,
+    interrupt: u32,
 }
 
-impl Block {
-    pub fn new(disk: Box<dyn BlockStorage>) -> Self {
+impl<BS: BlockStorage> Block<BS> {
+    pub fn new(disk: BS) -> Self {
         let features = (1u64 << VIRTIO_F_VERSION_1)
             | (1 << VIRTIO_BLK_F_FLUSH)
             | if disk.read_only() {
@@ -40,6 +40,14 @@ impl Block {
             status: 0,
             interrupt: 0,
         }
+    }
+
+    pub(crate) fn interrupt_pending(&self) -> bool {
+        self.interrupt != 0
+    }
+
+    pub(crate) fn flush(&self) -> Result<()> {
+        self.disk.flush()
     }
 
     pub fn read(&self, offset: u64, width: usize) -> u64 {
@@ -351,7 +359,7 @@ mod tests {
         }
     }
 
-    fn setup(ro: bool, fail: bool) -> (Block, GuestMemoryMmap, Rc<Fake>) {
+    fn setup(ro: bool, fail: bool) -> (Block<Rc<Fake>>, GuestMemoryMmap, Rc<Fake>) {
         let disk = Rc::new(Fake {
             data: RefCell::new(vec![0; 4096]),
             ro,
@@ -359,7 +367,7 @@ mod tests {
             flushes: Cell::new(0),
         });
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
-        let mut b = Block::new(Box::new(disk.clone()));
+        let mut b = Block::new(disk.clone());
         for (o, v) in [
             (0x70, 1),
             (0x70, 3),
@@ -380,7 +388,13 @@ mod tests {
         (b, mem, disk)
     }
 
-    fn submit(b: &mut Block, m: &GuestMemoryMmap, kind: u32, sector: u64, len: u32) -> Result<()> {
+    fn submit(
+        b: &mut Block<Rc<Fake>>,
+        m: &GuestMemoryMmap,
+        kind: u32,
+        sector: u64,
+        len: u32,
+    ) -> Result<()> {
         let idx = b.queue.next_avail();
         let header = Descriptor::new(0x4000, 16, 1, 1);
         let data = Descriptor::new(0x5000, len, if kind == VIRTIO_BLK_T_OUT { 1 } else { 3 }, 2);
@@ -411,9 +425,9 @@ mod tests {
         assert_eq!(status(&m), 0);
         assert_eq!(m.read_obj::<u8>(GuestAddress(0x5000)).unwrap(), 0x5a);
         assert_eq!(m.read_obj::<u16>(GuestAddress(0x3002)).unwrap(), 2);
-        assert_eq!(b.interrupt, 1);
+        assert!(b.interrupt_pending());
         b.write(0x64, 1, &m).unwrap();
-        assert_eq!(b.interrupt, 0);
+        assert!(!b.interrupt_pending());
         submit(&mut b, &m, VIRTIO_BLK_T_FLUSH, 0, 0).unwrap();
         assert_eq!(d.flushes.get(), 1);
         b.write(0x70, 0, &m).unwrap();
