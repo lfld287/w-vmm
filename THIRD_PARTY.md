@@ -16,10 +16,13 @@ SPDX-License-Identifier: Apache-2.0
 
 `src/platform/macos_arm64/hvf.rs` 的最小 FFI 声明按本机 Apple SDK 的 Hypervisor 头文件重新编写，没有复制 libkrun 自动生成的 bindings 或完整封装。寄存器编号和 syndrome 位定义来自 ARM64/HVF ABI；VM/vCPU 生命周期采用本项目的 RAII 封装。Apple SDK 头文件未随项目重新分发。
 
+`src/net/macos.rs` 的 vmnet/XPC 最小 FFI 同样依据本机 Apple SDK 编写，使用系统 vmnet.framework；Apple SDK 头文件不随项目分发。
+
 ## Rust 组件
 
 - rust-vmm: vm-memory、linux-loader、vm-fdt、virtio-queue、virtio-bindings、vm-superio。
 - imago 0.2.5: https://docs.rs/imago/0.2.5/imago/ ，使用原生 `sync` feature。
+- block2、dispatch2：Apple Blocks / Grand Central Dispatch 的 Rust 包装，https://github.com/madsmtm/objc2 。
 - 其余依赖见 Cargo.lock 和各 crate 的 license 声明。
 
 ## 嵌入的 Alpine 资源

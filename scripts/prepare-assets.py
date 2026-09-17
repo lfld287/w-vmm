@@ -86,7 +86,7 @@ with archive("linux-virt.apk") as tar:
         for d in deps[path].split():
             add(d)
 
-    for mod in ["virtio_mmio", "virtio_blk", "ext4"]:
+    for mod in ["virtio_mmio", "virtio_blk", "virtio_net", "ext4"]:
         for path in deps:
             if pathlib.PurePosixPath(path).name == mod + ".ko.gz":
                 add(path)
@@ -125,6 +125,7 @@ mount -t devpts devpts /dev/pts
 hostname w-vmm
 modprobe virtio_mmio
 modprobe virtio_blk
+modprobe virtio_net
 modprobe ext4
 echo 'W-VMM ALPINE READY'
 echo 'Use: mount /dev/vda /data; poweroff. Host exit: Ctrl-]'

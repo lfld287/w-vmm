@@ -2,8 +2,15 @@
 mod hvf;
 
 use super::VmRuntime;
-use crate::{VmConfig, boot, devices::block::Block, storage, terminal};
+use crate::{
+    VmConfig, boot,
+    devices::{Device, block::Block, mmio::Mmio, net::Net},
+    net::NetDevice,
+    storage::BlockStorage,
+    terminal,
+};
 use anyhow::{Result, bail, ensure};
+use std::collections::BTreeMap;
 use std::{
     sync::{
         Arc,
@@ -19,17 +26,25 @@ use vm_superio::{Serial, Trigger};
 pub(super) struct Backend;
 
 impl VmRuntime for Backend {
-    fn run(config: &VmConfig) -> Result<()> {
+    fn run<BS: BlockStorage, ND: NetDevice>(
+        config: &VmConfig,
+        blocks: BTreeMap<String, BS>,
+        net: Option<ND>,
+    ) -> Result<()> {
         let layout = boot::Layout::new(config.memory_mib, boot::KERNEL, boot::INITRD.len())?;
-        let mut block = config
-            .disk
-            .as_ref()
-            .map(|p| storage::Disk::open(p, config.read_only).map(Block::new))
-            .transpose()?;
+        let regions = boot::virtio_regions(blocks.len() + usize::from(net.is_some()))?;
+        let mut devices: Vec<Mmio<Device<BS, ND>>> = blocks
+            .into_iter()
+            .map(|(name, disk)| Block::new(name, disk).map(|b| Mmio::new(Device::Block(b))))
+            .collect::<Result<_>>()?;
+        if let Some(net) = net {
+            devices.push(Mmio::new(Device::Net(Net::new(net)?)));
+        }
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(boot::RAM), layout.size)])?;
         let vm = hvf::Vm::new(mem)?;
         let (redist, timers) = vm.gic()?;
-        let dtb = boot::fdt(&layout, block.is_some(), redist, timers)?;
+        hvf::validate_irqs(&regions)?;
+        let dtb = boot::fdt(&layout, &regions, redist, timers)?;
         boot::load(vm.memory(), &layout, &dtb)?;
         let cpu = hvf::Vcpu::new(&vm, layout.entry, layout.dtb)?;
         let terminal = terminal::Terminal::new()?;
@@ -49,8 +64,9 @@ impl VmRuntime for Backend {
                     boot::UART_IRQ,
                     serial.state().interrupt_identification & 1 == 0,
                 )?;
-                if let Some(b) = &block {
-                    hvf::spi(boot::BLOCK_IRQ, b.interrupt_pending())?;
+                for (device, region) in devices.iter_mut().zip(&regions) {
+                    device.poll(vm.memory())?;
+                    hvf::spi(region.irq, device.interrupt_pending())?;
                 }
                 let exit = cpu.run()?;
                 match exit.reason {
@@ -100,16 +116,21 @@ impl VmRuntime for Backend {
                                     } else {
                                         serial.read(offset) as u64
                                     }
-                                } else if (boot::BLOCK..boot::BLOCK + 0x1000).contains(&addr) {
-                                    let b = block.as_mut().ok_or_else(|| {
-                                        anyhow::anyhow!("access to absent block device")
-                                    })?;
+                                } else if let Some(slot) = addr
+                                    .checked_sub(boot::VIRTIO_BASE)
+                                    .and_then(|offset| {
+                                        usize::try_from(offset / boot::VIRTIO_STRIDE).ok()
+                                    })
+                                    .filter(|&slot| slot < devices.len())
+                                {
+                                    let device = &mut devices[slot];
+                                    let offset = addr - regions[slot].address;
                                     if write {
                                         ensure!(width == 4, "virtio MMIO writes must be 32 bit");
-                                        b.write(addr - boot::BLOCK, value as u32, vm.memory())?;
+                                        device.write(offset, value as u32, vm.memory())?;
                                         0
                                     } else {
-                                        b.read(addr - boot::BLOCK, width)
+                                        device.read(offset, width)
                                     }
                                 } else {
                                     bail!(
@@ -157,7 +178,16 @@ impl VmRuntime for Backend {
             }
             Ok(())
         })();
-        let flushed = block.as_ref().map(Block::flush).transpose();
+        // Attempt every disk flush even when a previous disk or the run loop failed.
+        let mut flushed = Ok(());
+        for device in &devices {
+            if let Err(error) = device.flush() {
+                eprintln!("final device flush: {error:#}");
+                if flushed.is_ok() {
+                    flushed = Err(error);
+                }
+            }
+        }
         result?;
         flushed?;
         Ok(())

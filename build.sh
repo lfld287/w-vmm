@@ -5,7 +5,7 @@ root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$root"
 : "${MACOSX_DEPLOYMENT_TARGET:=15.0}"
 export MACOSX_DEPLOYMENT_TARGET
-if [ ! -f assets/Image ] || [ ! -f assets/initramfs.cpio.gz ]; then
+if [ ! -f assets/Image ] || [ ! -f assets/initramfs.cpio.gz ] || [ scripts/prepare-assets.py -nt assets/initramfs.cpio.gz ]; then
     python3 scripts/prepare-assets.py
 fi
 cargo build -p w-vmm-demo --bin w-vmm --release --locked --target-dir "$root/target"

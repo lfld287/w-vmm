@@ -18,22 +18,17 @@ import termios
 import time
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-ap = argparse.ArgumentParser()
-ap.add_argument("--binary", default=str(ROOT / "dist/w-vmm"))
-args = ap.parse_args()
-BINARY = str(pathlib.Path(args.binary).resolve())
+BINARY = str(ROOT / "dist/w-vmm")
 LOGS = ROOT / "test-results"
-LOGS.mkdir(exist_ok=True)
-
 
 class VM:
-    def __init__(self, name, opts=(), binary=BINARY, cwd=None, preexec_fn=None):
+    def __init__(self, name, opts=(), binary=None, cwd=None, preexec_fn=None):
         self.master, self.slave = pty.openpty()
         self.original = termios.tcgetattr(self.slave)
         self.log = open(LOGS / (name + ".log"), "wb")
         self.buf = b""
         self.p = subprocess.Popen(
-            [binary, "run", *opts],
+            [binary or BINARY, "run", *opts],
             stdin=self.slave,
             stdout=self.slave,
             stderr=self.slave,
@@ -130,154 +125,178 @@ def check(*cmd):
     subprocess.run(cmd, check=True)
 
 
-with tempfile.TemporaryDirectory(prefix="w-vmm-smoke-") as temp:
-    td = pathlib.Path(temp)
-    disk = td / "data.qcow2"
-    check(str(ROOT / "scripts/create-disk.sh"), str(disk))
-    with VM("no-disk") as vm:
-        vm.ready()
-        vm.command(
-            'test "$(uname -m)" = aarch64 && test "$(cat /etc/alpine-release)" = 3.24.1',
-            "SHELL_PASS",
-        )
-        vm.poweroff()
-    with VM("write", ["--disk", str(disk)]) as vm:
-        vm.ready()
-        blocked = subprocess.run(
-            [BINARY, "run", "--disk", str(disk)], capture_output=True, timeout=10
-        )
-        assert blocked.returncode != 0 and b"locked" in blocked.stderr, blocked.stderr
-        vm.command("mount /dev/vda /data", "MOUNT_PASS")
-        # 192 KiB nonzero payload spans three 64 KiB qcow2 clusters, even when unaligned.
-        vm.command(
-            "dd if=/dev/urandom of=/data/payload bs=4096 count=48 && cd /data && sha256sum payload > payload.sha256 && sync && cd / && umount /data",
-            "WRITE_PASS",
-        )
-        vm.poweroff()
-    check("qemu-img", "check", str(disk))
-    # Only executable and data disk present; no external boot assets or emulator process.
-    offline = td / "offline"
-    offline.mkdir()
-    shutil.copy2(BINARY, offline / "w-vmm")
-    shutil.move(disk, offline / "data.qcow2")
-    disk = offline / "data.qcow2"
-    assert sorted(p.name for p in offline.iterdir()) == ["data.qcow2", "w-vmm"]
-    with VM(
-        "offline-read", ["--disk", "data.qcow2"], str(offline / "w-vmm"), offline
-    ) as vm:
-        vm.ready()
-        vm.command(
-            "mount /dev/vda /data && cd /data && sha256sum -c payload.sha256 && cd / && umount /data",
-            "READ_PASS",
-        )
-        vm.poweroff()
-    v2 = td / "v2.qcow2"
-    check(
-        "qemu-img",
-        "convert",
-        "-f",
-        "qcow2",
-        "-O",
-        "qcow2",
-        "-o",
-        "compat=0.10",
-        str(disk),
-        str(v2),
-    )
-    with VM("qcow2-v2", ["--disk", str(v2)]) as vm:
-        vm.ready()
-        vm.command(
-            "mount /dev/vda /data && cd /data && sha256sum -c payload.sha256 && echo v2 > version && sync && cd / && umount /data",
-            "V2_PASS",
-        )
-        vm.poweroff()
-    check("qemu-img", "check", str(v2))
-    before = hashlib.sha256(disk.read_bytes()).hexdigest()
-    with VM("read-only", ["--disk", str(disk), "--read-only"]) as vm:
-        vm.ready()
-        vm.command(
-            'test "$(cat /sys/block/vda/ro)" = 1 && mount -o ro /dev/vda /data && cd /data && sha256sum -c payload.sha256 && ! touch /data/forbidden',
-            "RO_PASS",
-        )
-        vm.send("cd /; umount /data")
-        vm.poweroff()
-    assert hashlib.sha256(disk.read_bytes()).hexdigest() == before, (
-        "read-only image changed"
-    )
-    for name, sig in [
-        ("sigterm", signal.SIGTERM),
-        ("sigint", signal.SIGINT),
-        ("sighup", signal.SIGHUP),
-        ("shortcut", None),
-    ]:
-        with VM(name) as vm:
+def main():
+    global BINARY
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--binary", default=BINARY)
+    args = ap.parse_args()
+    BINARY = str(pathlib.Path(args.binary).resolve())
+    LOGS.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="w-vmm-smoke-") as temp:
+        td = pathlib.Path(temp)
+        disk = td / "data.qcow2"
+        check(str(ROOT / "scripts/create-disk.sh"), str(disk))
+        with VM("no-disk") as vm:
             vm.ready()
-            if sig:
-                vm.p.send_signal(sig)
-            else:
-                os.write(vm.master, b"\x1d")
-            vm.wait_exit()
-    # Force a real host EFBIG on a separate disposable image, without filling the host disk.
-    failing = td / "host-error.qcow2"
-    shutil.copy2(disk, failing)
-
-    def limit_file():
-        signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
-        resource.setrlimit(
-            resource.RLIMIT_FSIZE, (failing.stat().st_size, failing.stat().st_size)
+            vm.command(
+                'test "$(uname -m)" = aarch64 && test "$(cat /etc/alpine-release)" = 3.24.1',
+                "SHELL_PASS",
+            )
+            vm.poweroff()
+        second = td / "second.qcow2"
+        check(str(ROOT / "scripts/create-disk.sh"), str(second))
+        with VM("multiple-disks", ["--disk", "sdb=" + str(second), "--disk", "sda=" + str(disk)]) as vm:
+            vm.ready()
+            vm.command('test "$(cat /sys/block/vda/serial)" = sda && test "$(cat /sys/block/vdb/serial)" = sdb', "SERIAL_PASS")
+            vm.command("mkdir -p /data2 && mount /dev/vda /data && mount /dev/vdb /data2 && echo first > /data/identity && echo second > /data2/identity && sync && umount /data && umount /data2", "MULTI_WRITE_PASS")
+            vm.poweroff()
+        with VM("multiple-disks-read", ["--disk", "sda=" + str(disk), "--disk", "sdb=" + str(second), "--read-only"]) as vm:
+            vm.ready()
+            vm.command('mkdir -p /data2 && mount -o ro /dev/vda /data && mount -o ro /dev/vdb /data2 && test "$(cat /data/identity)" = first && test "$(cat /data2/identity)" = second && umount /data && umount /data2', "MULTI_READ_PASS")
+            vm.poweroff()
+        check("qemu-img", "check", str(second))
+        with VM("write", ["--disk", str(disk)]) as vm:
+            vm.ready()
+            blocked = subprocess.run(
+                [BINARY, "run", "--disk", str(disk)], capture_output=True, timeout=10
+            )
+            assert blocked.returncode != 0 and b"locked" in blocked.stderr, blocked.stderr
+            vm.command("mount /dev/vda /data", "MOUNT_PASS")
+            # 192 KiB nonzero payload spans three 64 KiB qcow2 clusters, even when unaligned.
+            vm.command(
+                "dd if=/dev/urandom of=/data/payload bs=4096 count=48 && cd /data && sha256sum payload > payload.sha256 && sync && cd / && umount /data",
+                "WRITE_PASS",
+            )
+            vm.poweroff()
+        check("qemu-img", "check", str(disk))
+        # Only executable and data disk present; no external boot assets or emulator process.
+        offline = td / "offline"
+        offline.mkdir()
+        shutil.copy2(BINARY, offline / "w-vmm")
+        shutil.move(disk, offline / "data.qcow2")
+        disk = offline / "data.qcow2"
+        assert sorted(p.name for p in offline.iterdir()) == ["data.qcow2", "w-vmm"]
+        with VM(
+            "offline-read", ["--disk", "data.qcow2"], str(offline / "w-vmm"), offline
+        ) as vm:
+            vm.ready()
+            vm.command(
+                "mount /dev/vda /data && cd /data && sha256sum -c payload.sha256 && cd / && umount /data",
+                "READ_PASS",
+            )
+            vm.poweroff()
+        v2 = td / "v2.qcow2"
+        check(
+            "qemu-img",
+            "convert",
+            "-f",
+            "qcow2",
+            "-O",
+            "qcow2",
+            "-o",
+            "compat=0.10",
+            str(disk),
+            str(v2),
         )
+        with VM("qcow2-v2", ["--disk", str(v2)]) as vm:
+            vm.ready()
+            vm.command(
+                "mount /dev/vda /data && cd /data && sha256sum -c payload.sha256 && echo v2 > version && sync && cd / && umount /data",
+                "V2_PASS",
+            )
+            vm.poweroff()
+        check("qemu-img", "check", str(v2))
+        before = hashlib.sha256(disk.read_bytes()).hexdigest()
+        with VM("read-only", ["--disk", str(disk), "--read-only"]) as vm:
+            vm.ready()
+            vm.command(
+                'test "$(cat /sys/block/vda/ro)" = 1 && mount -o ro /dev/vda /data && cd /data && sha256sum -c payload.sha256 && ! touch /data/forbidden',
+                "RO_PASS",
+            )
+            vm.send("cd /; umount /data")
+            vm.poweroff()
+        assert hashlib.sha256(disk.read_bytes()).hexdigest() == before, (
+            "read-only image changed"
+        )
+        for name, sig in [
+            ("sigterm", signal.SIGTERM),
+            ("sigint", signal.SIGINT),
+            ("sighup", signal.SIGHUP),
+            ("shortcut", None),
+        ]:
+            with VM(name) as vm:
+                vm.ready()
+                if sig:
+                    vm.p.send_signal(sig)
+                else:
+                    os.write(vm.master, b"\x1d")
+                vm.wait_exit()
+        # Force a real host EFBIG on a separate disposable image, without filling the host disk.
+        failing = td / "host-error.qcow2"
+        shutil.copy2(disk, failing)
 
-    with VM("host-io-error", ["--disk", str(failing)], preexec_fn=limit_file) as vm:
-        vm.ready()
-        vm.command("mount /dev/vda /data", "ERROR_MOUNT_PASS")
-        vm.send("dd if=/dev/zero of=/data/too-large bs=4096 count=2048; sync")
-        vm.expect(b"virtio-blk request", timeout=30)
-        vm.expect(b"File too large", timeout=30)
-        os.write(vm.master, b"\x1d")
-        vm.wait_exit((0, 1))
-    with VM("reboot") as vm:
-        vm.ready()
-        vm.send("reboot")
-        vm.wait_exit()
-    corrupt = td / "corrupt.qcow2"
-    corrupt.write_bytes(b"broken")
-    result = subprocess.run(
-        [BINARY, "run", "--disk", str(corrupt)], capture_output=True, timeout=10
-    )
-    assert result.returncode != 0 and b"qcow2 header" in result.stderr, result.stderr
-    (LOGS / "corrupt.log").write_bytes(result.stderr)
-    check("qemu-img", "check", str(disk))
-print(
-    "PASS: shell, persistence, offline, read-only, lock, corrupt image, real host EFBIG, reboot, signals, terminal restoration"
-)
+        def limit_file():
+            signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+            resource.setrlimit(
+                resource.RLIMIT_FSIZE, (failing.stat().st_size, failing.stat().st_size)
+            )
 
-(LOGS / "summary.json").write_text(
-    json.dumps(
-        {
-            "result": "PASS",
-            "host": platform.platform(),
-            "binary_sha256": hashlib.sha256(
-                pathlib.Path(BINARY).read_bytes()
-            ).hexdigest(),
-            "cases": [
-                "shell",
-                "qcow2-v3-persistence",
-                "qcow2-v2",
-                "offline",
-                "read-only",
-                "exclusive-lock",
-                "corrupt-image",
-                "host-EFBIG",
-                "reboot",
-                "SIGINT",
-                "SIGTERM",
-                "SIGHUP",
-                "Ctrl-]",
-                "terminal-restoration",
-                "qemu-img-check",
-            ],
-        },
-        indent=2,
+        with VM("host-io-error", ["--disk", str(failing)], preexec_fn=limit_file) as vm:
+            vm.ready()
+            vm.command("mount /dev/vda /data", "ERROR_MOUNT_PASS")
+            vm.send("dd if=/dev/zero of=/data/too-large bs=4096 count=2048; sync")
+            vm.expect(b"virtio-blk request", timeout=30)
+            vm.expect(b"File too large", timeout=30)
+            os.write(vm.master, b"\x1d")
+            vm.wait_exit((0, 1))
+        with VM("reboot") as vm:
+            vm.ready()
+            vm.send("reboot")
+            vm.wait_exit()
+        corrupt = td / "corrupt.qcow2"
+        corrupt.write_bytes(b"broken")
+        result = subprocess.run(
+            [BINARY, "run", "--disk", str(corrupt)], capture_output=True, timeout=10
+        )
+        assert result.returncode != 0 and b"qcow2 header" in result.stderr, result.stderr
+        (LOGS / "corrupt.log").write_bytes(result.stderr)
+        check("qemu-img", "check", str(disk))
+    print(
+        "PASS: shell, multiple named disks, persistence, offline, read-only, lock, corrupt image, real host EFBIG, reboot, signals, terminal restoration"
     )
-    + "\n"
-)
+
+    (LOGS / "summary.json").write_text(
+        json.dumps(
+            {
+                "result": "PASS",
+                "host": platform.platform(),
+                "binary_sha256": hashlib.sha256(
+                    pathlib.Path(BINARY).read_bytes()
+                ).hexdigest(),
+                "cases": [
+                    "shell",
+                    "qcow2-v3-persistence",
+                    "multiple-named-disks",
+                    "qcow2-v2",
+                    "offline",
+                    "read-only",
+                    "exclusive-lock",
+                    "corrupt-image",
+                    "host-EFBIG",
+                    "reboot",
+                    "SIGINT",
+                    "SIGTERM",
+                    "SIGHUP",
+                    "Ctrl-]",
+                    "terminal-restoration",
+                    "qemu-img-check",
+                ],
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+
+
+if __name__ == "__main__":
+    main()

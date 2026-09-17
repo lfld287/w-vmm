@@ -20,6 +20,25 @@ pub trait BlockStorage {
     fn flush(&self) -> Result<()>;
 }
 
+// Allow a named map to contain different storage implementations when needed.
+impl<T: BlockStorage + ?Sized> BlockStorage for Box<T> {
+    fn size(&self) -> u64 {
+        (**self).size()
+    }
+    fn read_only(&self) -> bool {
+        (**self).read_only()
+    }
+    fn read(&self, offset: u64, data: &mut [u8]) -> Result<()> {
+        (**self).read(offset, data)
+    }
+    fn write(&self, offset: u64, data: &[u8]) -> Result<()> {
+        (**self).write(offset, data)
+    }
+    fn flush(&self) -> Result<()> {
+        (**self).flush()
+    }
+}
+
 pub fn bounds(size: u64, offset: u64, len: usize) -> Result<()> {
     ensure!(
         offset

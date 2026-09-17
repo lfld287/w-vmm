@@ -41,6 +41,8 @@ unsafe extern "C" {
 
     fn hv_gic_get_intid(kind: u16, id: *mut u32) -> i32;
 
+    fn hv_gic_get_spi_interrupt_range(base: *mut u32, count: *mut u32) -> i32;
+
     fn hv_gic_set_spi(id: u32, level: bool) -> i32;
 
     fn hv_vcpu_create(id: *mut u64, exit: *mut *const Exit, c: *const c_void) -> i32;
@@ -71,6 +73,25 @@ fn check(code: i32, op: &str) -> Result<()> {
 
 pub fn spi(id: u32, level: bool) -> Result<()> {
     unsafe { check(hv_gic_set_spi(id, level), "GIC SPI") }
+}
+
+pub fn validate_irqs(regions: &[boot::VirtioRegion]) -> Result<()> {
+    let (mut base, mut count) = (0, 0);
+    unsafe {
+        check(
+            hv_gic_get_spi_interrupt_range(&mut base, &mut count),
+            "GIC SPI range",
+        )?;
+    }
+    let end = base
+        .checked_add(count)
+        .ok_or_else(|| anyhow::anyhow!("invalid GIC SPI range"))?;
+    ensure!(
+        (base..end).contains(&boot::UART_IRQ)
+            && regions.iter().all(|r| (base..end).contains(&r.irq)),
+        "too many devices for host GIC SPI range {base}..{end}"
+    );
+    Ok(())
 }
 
 pub fn kick(id: u64) {
