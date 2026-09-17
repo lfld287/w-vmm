@@ -6,6 +6,7 @@ use w_vmm::{
     net::{NetDevice, macos::Vmnet},
     storage::Disk,
 };
+use w_vmm_demo::terminal::Terminal;
 
 #[derive(Parser)]
 #[command(name = "w-vmm", version, about = "Local Apple Silicon ARM64 VMM")]
@@ -65,7 +66,9 @@ fn run(command: Command) -> Result<()> {
             net.ipv4()
         );
     }
-    Vmm::new(VmConfig { memory_mib }).run(disks, network)
+    let terminal = Terminal::new()?;
+    eprintln!("w-vmm: 1 vCPU, {memory_mib} MiB; Ctrl-] exits");
+    Vmm::new(VmConfig { memory_mib }).run(disks, network, terminal)
 }
 
 fn main() -> std::process::ExitCode {

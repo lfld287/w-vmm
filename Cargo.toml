@@ -12,7 +12,6 @@ resolver = "3"
 [dependencies]
 anyhow = "1"
 libc = "0.2"
-signal-hook = "0.3"
 vm-memory = { version = "0.18", features = ["backend-mmap"] }
 linux-loader = "0.14"
 vm-fdt = "0.3"

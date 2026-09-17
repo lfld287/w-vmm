@@ -493,7 +493,6 @@ dependencies = [
  "imago",
  "libc",
  "linux-loader",
- "signal-hook",
  "virtio-bindings",
  "virtio-queue",
  "vm-fdt",
@@ -507,6 +506,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
+ "signal-hook",
  "w-vmm",
 ]
 

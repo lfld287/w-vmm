@@ -7,6 +7,7 @@ use std::{
     path::Path,
 };
 use w_vmm::{VmConfig, Vmm, net::NetDevice, storage::Disk};
+use w_vmm_demo::terminal::Terminal;
 
 const PEER_MAC: [u8; 6] = [2, 0, 0, 0, 0, 2];
 const PEER_IP: [u8; 4] = [192, 0, 2, 1];
@@ -107,5 +108,7 @@ fn main() -> Result<()> {
         .enumerate()
         .map(|(i, path)| Disk::open(Path::new(&path), false).map(|d| (format!("disk{i}"), d)))
         .collect::<Result<BTreeMap<_, _>>>()?;
-    Vmm::new(VmConfig::default()).run(blocks, Some(Peer::default()))
+    let terminal = Terminal::new()?;
+    eprintln!("w-vmm: 1 vCPU, 512 MiB; Ctrl-] exits");
+    Vmm::new(VmConfig::default()).run(blocks, Some(Peer::default()), terminal)
 }

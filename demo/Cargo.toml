@@ -13,3 +13,5 @@ path = "src/main.rs"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 w-vmm = { path = ".." }
+libc = "0.2"
+signal-hook = "0.3"

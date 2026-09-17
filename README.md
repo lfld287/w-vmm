@@ -64,11 +64,27 @@ w-vmm = { path = "../w-vmm" }
 ```
 
 ```rust
-use std::collections::BTreeMap;
-use w_vmm::{VmConfig, Vmm, storage::Disk, net::macos::Vmnet};
+use std::{collections::BTreeMap, io::{self, Write}};
+use w_vmm::{VmConfig, Vmm, storage::Disk, net::macos::Vmnet, serial::SerialIo};
+
+// Output only; the guest can stop the VM with poweroff.
+struct Console;
+impl Write for Console {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        io::stdout().write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        io::stdout().flush()
+    }
+}
+impl SerialIo for Console {
+    fn recv(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+        Ok(0)
+    }
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    Vmm::new(VmConfig::default()).run::<Disk, Vmnet>(BTreeMap::new(), None)?;
+    Vmm::new(VmConfig::default()).run::<Disk, Vmnet, _>(BTreeMap::new(), None, Console)?;
     Ok(())
 }
 ```
@@ -76,10 +92,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 `VmConfig` 仅配置 `memory_mib`。后端由调用方创建并交给泛型入口：
 
 ```rust,ignore
-pub fn run<BS: BlockStorage, ND: NetDevice>(
+pub fn run<BS: BlockStorage, ND: NetDevice, SI: SerialIo>(
     self,
     blocks: BTreeMap<String, BS>,
     net: Option<ND>,
+    serial: SI,
 ) -> anyhow::Result<()>;
 ```
 
@@ -87,14 +104,14 @@ pub fn run<BS: BlockStorage, ND: NetDevice>(
 
 ```rust,no_run
 use std::{collections::BTreeMap, path::Path};
-use w_vmm::{VmConfig, Vmm, storage::Disk, net::macos::Vmnet};
+use w_vmm::{VmConfig, Vmm, storage::Disk, net::macos::Vmnet, serial::SerialIo};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn run(serial: impl SerialIo) -> Result<(), Box<dyn std::error::Error>> {
     let blocks = BTreeMap::from([
         ("sda".into(), Disk::open(Path::new("system.qcow2"), true)?),
         ("sdb".into(), Disk::open(Path::new("data.qcow2"), false)?),
     ]);
-    Vmm::new(VmConfig::default()).run(blocks, None::<Vmnet>)?;
+    Vmm::new(VmConfig::default()).run(blocks, None::<Vmnet>, serial)?;
     Ok(())
 }
 ```
@@ -105,7 +122,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 `net::NetDevice` 提供 `mac_address`、`mtu`、`max_frame_len` 和非阻塞 `send` / `recv`，传输完整以太网帧，不含 FCS 或 virtio 头。`send` 返回 `false` 表示未消费该帧、稍后重试；`recv` 返回 `None` 表示没有数据。trait 不涉及 DHCP、IP、路由或 NAT；这些服务由具体后端决定。实现不需要 `Send` / `Sync`，也可以使用 `Box<dyn NetDevice>`。
 
-内核、initramfs、终端与信号处理仍由库负责；调用程序需附加相同的 Hypervisor entitlement 本地签名。库 API 已由原先的 `VmConfig.disk/read_only` 和零参数 `run()` 调整为后端注入形式。
+`serial::SerialIo: std::io::Write` 是必传的串口后端。`recv(&mut [u8])` 非阻塞读取发往客户机的数据，返回长度不得超过缓冲区；`0`（含 EOF）、`WouldBlock` 和 `Interrupted` 表示暂无输入。每轮只读取 UART FIFO 剩余容量，满时不读取。`should_stop()` 默认返回 `false`，每轮独立检查，FIFO 满时也能停止。所有调用在 VMM 线程执行，无需 `Send` / `Sync`，支持 `Box<dyn SerialIo>`。
+
+客户机输出使用同步 `write_all` / `flush`，没有额外输出队列。输入的其他错误及输出错误会终止运行，并尝试刷新全部磁盘。库不解释 `0x1d` 等控制字节；终端 raw mode、stdin/stdout、Ctrl-]、信号和恢复由 `demo/src/terminal.rs` 的 `Terminal` 实现负责。自定义后端需要退出时通过 `should_stop()` 表达。
+
+内核和 initramfs 仍由库提供；调用程序需附加相同的 Hypervisor entitlement 本地签名。`run` 已改为必须传入三个后端参数，不再隐式创建终端。
 
 ## 多盘和网络
 
@@ -143,6 +164,7 @@ brew install qemu e2fsprogs
 
 ```sh
 cargo build --workspace --locked
+cargo check --workspace --all-targets --locked
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
@@ -151,7 +173,7 @@ cargo build -p w-vmm --lib --locked
 python3 scripts/smoke.py --binary dist/w-vmm
 ```
 
-单元测试覆盖设备树与多设备地址分配、公共 MMIO 协商/复位/双队列/中断、描述符校验、多盘状态隔离、磁盘 I/O 错误，以及网络分散缓冲收发、背压重试、短缓冲丢包和后端错误。
+单元测试覆盖串口双向字节、FIFO 容量、空输入、停止请求、读写/刷新错误、控制字节直通和 trait 对象，以及设备树与多设备地址分配、公共 MMIO 协商/复位/双队列/中断、描述符校验、多盘状态隔离、磁盘 I/O 错误、网络分散缓冲收发、背压重试、短缓冲丢包和后端错误。
 
 冒烟脚本仅创建临时测试盘，日志保存在 `test-results/`。执行真实 HVF 启动、shell 命令、多盘 serial 映射与独立持久化、ext4 挂载、192 KiB 随机数据写入与 SHA-256 校验、同步/卸载/关机/重启读回、只读镜像哈希不变、重复打开锁冲突、损坏文件、宿主文件大小限制导致的真实 EFBIG、重启退出和信号/快捷键后的终端恢复。关机后调用 `qemu-img check`。
 
@@ -197,10 +219,10 @@ ping -c 3 1.1.1.1
 
 ### 本地测试后端
 
-无需 vmnet 权限的真实客户机网络测试使用 `examples/net-peer.rs`，它通过公开的 `NetDevice` 注入一个只响应 ARP/ICMP 的本地测试对端：
+无需 vmnet 权限的真实客户机网络测试使用 `demo/examples/net-peer.rs`，它通过公开的 `NetDevice` 注入一个只响应 ARP/ICMP 的本地测试对端，并复用 demo 的 `Terminal`：
 
 ```sh
-cargo build --example net-peer --locked
+cargo build -p w-vmm-demo --example net-peer --locked
 codesign --force --sign - --entitlements assets/entitlements.plist target/debug/examples/net-peer
 python3 scripts/smoke-net.py --peer --binary target/debug/examples/net-peer
 ```
@@ -237,8 +259,9 @@ sudo env "PATH=$PATH" python3 scripts/smoke-net.py \
 - `src/devices/net.rs`：网络请求与配置，RX/TX 各 128 项队列，完整帧收发与发送背压。
 - `src/net.rs`、`src/net/macos.rs`：`NetDevice` trait 与 macOS vmnet NAT 后端。
 - `src/storage.rs`：imago 原生同步 qcow2、同 inode 文件锁、范围校验、内部缓存 flush 与宿主 sync/fsync。
-- `src/terminal.rs`：原始终端、非阻塞输入与信号恢复。
-- `src/lib.rs`：`VmConfig` / `Vmm::new(...).run(blocks, net)`，委托 `platform::run`。
+- `src/serial.rs`：`SerialIo` trait、Box 转发和 FIFO 输入轮询。
+- `demo/src/terminal.rs`：原始终端、非阻塞输入、Ctrl-] 与信号恢复，CLI 和网络示例共用。
+- `src/lib.rs`：`VmConfig` / `Vmm::new(...).run(blocks, net, serial)`，委托 `platform::run`。
 - `demo/src/main.rs`：CLI、错误输出，通过路径依赖调用根库。
 
 设备 MMIO：GIC distributor `0x08000000`，16550 `0x09000000`（SPI 33），virtio 设备从 `0x0a000000` 开始，每个占 `0x1000`，中断从 SPI 34 递增。先按名称排列磁盘，再放置可选网卡，每个设备使用独立 MMIO 和中断。GIC redistributor 位于 `0x10000000`，RAM 位于 `0x40000000`。实际可用 SPI 范围、定时器 INTID 和 redistributor 空间大小查询 HVF；设备超出范围时启动报错。

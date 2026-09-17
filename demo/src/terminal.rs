@@ -3,16 +3,18 @@ use signal_hook::{
     SigId,
     consts::{SIGHUP, SIGINT, SIGTERM},
 };
+use std::io::{self, Write};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use w_vmm::serial::SerialIo;
 
 pub struct Terminal {
     saved: Option<libc::termios>,
     flags: i32,
     signals: Vec<SigId>,
-    pub stop: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
 }
 
 impl Terminal {
@@ -47,29 +49,37 @@ impl Terminal {
         }
         Ok(t)
     }
+}
 
-    pub fn input(&self, capacity: usize) -> Result<Vec<u8>> {
-        let mut buf = vec![0; capacity.min(256)];
-        if buf.is_empty() {
-            return Ok(buf);
+impl Write for Terminal {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        io::stdout().write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        io::stdout().flush()
+    }
+}
+
+impl SerialIo for Terminal {
+    fn recv(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
         }
-        let n = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len()) };
+        let n = unsafe { libc::read(0, buffer.as_mut_ptr().cast(), buffer.len()) };
         if n < 0 {
-            let e = std::io::Error::last_os_error();
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-            ) {
-                return Ok(vec![]);
-            }
-            return Err(e.into());
+            return Err(io::Error::last_os_error());
         }
-        buf.truncate(n as usize);
-        if let Some(p) = buf.iter().position(|b| *b == 0x1d) {
+        let n = n as usize;
+        if let Some(p) = buffer[..n].iter().position(|b| *b == 0x1d) {
             self.stop.store(true, Ordering::Relaxed);
-            buf.truncate(p);
+            return Ok(p);
         }
-        Ok(buf)
+        Ok(n)
+    }
+
+    fn should_stop(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
     }
 }
 

@@ -6,8 +6,8 @@ use crate::{
     VmConfig, boot,
     devices::{Device, block::Block, mmio::Mmio, net::Net},
     net::NetDevice,
+    serial::{SerialIo, poll_input},
     storage::BlockStorage,
-    terminal,
 };
 use anyhow::{Result, bail, ensure};
 use std::collections::BTreeMap;
@@ -26,10 +26,11 @@ use vm_superio::{Serial, Trigger};
 pub(super) struct Backend;
 
 impl VmRuntime for Backend {
-    fn run<BS: BlockStorage, ND: NetDevice>(
+    fn run<BS: BlockStorage, ND: NetDevice, SI: SerialIo>(
         config: &VmConfig,
         blocks: BTreeMap<String, BS>,
         net: Option<ND>,
+        serial: SI,
     ) -> Result<()> {
         let layout = boot::Layout::new(config.memory_mib, boot::KERNEL, boot::INITRD.len())?;
         let regions = boot::virtio_regions(blocks.len() + usize::from(net.is_some()))?;
@@ -47,18 +48,12 @@ impl VmRuntime for Backend {
         let dtb = boot::fdt(&layout, &regions, redist, timers)?;
         boot::load(vm.memory(), &layout, &dtb)?;
         let cpu = hvf::Vcpu::new(&vm, layout.entry, layout.dtb)?;
-        let terminal = terminal::Terminal::new()?;
         let _kicker = Kicker::new(cpu.id);
-        let mut serial = Serial::new(Irq, std::io::stdout());
-        eprintln!("w-vmm: 1 vCPU, {} MiB; Ctrl-] exits", config.memory_mib);
+        let mut serial = Serial::new(Irq, serial);
         let result = (|| -> Result<()> {
             loop {
-                if terminal.stop.load(Ordering::Relaxed) {
+                if poll_input(&mut serial)? {
                     break;
-                }
-                let input = terminal.input(serial.fifo_capacity())?;
-                if !input.is_empty() {
-                    serial.enqueue_raw_bytes(&input)?;
                 }
                 hvf::spi(
                     boot::UART_IRQ,
@@ -204,7 +199,7 @@ impl Trigger for Irq {
     }
 }
 
-// Wake blocked HVF runs so stdin and host signals remain responsive. Join before destroying vCPU.
+// Wake blocked HVF runs so serial input and stop requests remain responsive. Join before destroying vCPU.
 pub struct Kicker {
     done: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
