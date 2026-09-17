@@ -1,5 +1,8 @@
 //! Thin HVF binding, authored against Apple's SDK. See THIRD_PARTY.md for libkrun reference.
-use crate::boot;
+use crate::{
+    boot,
+    devices::memory::{Mapper, Memory},
+};
 use anyhow::{Result, ensure};
 use std::{ffi::c_void, marker::PhantomData, rc::Rc};
 use vm_memory::{Address, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion};
@@ -21,6 +24,8 @@ pub struct Exit {
 
 #[link(name = "Hypervisor", kind = "framework")]
 unsafe extern "C" {
+    fn hv_vm_get_max_vcpu_count(count: *mut u32) -> i32;
+
     fn hv_vm_create(config: *const c_void) -> i32;
 
     fn hv_vm_destroy() -> i32;
@@ -102,7 +107,7 @@ pub fn kick(id: u64) {
 
 // !Send and !Sync: HVF VM/vCPU operations have owning-thread requirements.
 pub struct Vm {
-    mem: GuestMemoryMmap,
+    pub mem: Memory<Mapping>,
     mapped: bool,
     _thread: PhantomData<Rc<()>>,
 }
@@ -116,11 +121,11 @@ impl Vm {
             )?;
         }
         let mut vm = Self {
-            mem,
+            mem: Memory::new(mem, Mapping),
             mapped: false,
             _thread: PhantomData,
         };
-        let region = vm.mem.iter().next().unwrap();
+        let region = vm.mem.view.iter().next().unwrap();
         let ptr = region.as_ptr();
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
         ensure!(
@@ -143,7 +148,7 @@ impl Vm {
     }
 
     pub fn memory(&self) -> &GuestMemoryMmap {
-        &self.mem
+        &self.mem.view
     }
 
     pub fn gic(&self) -> Result<(u64, [u32; 2])> {
@@ -180,22 +185,65 @@ impl Vm {
 impl Drop for Vm {
     fn drop(&mut self) {
         unsafe {
+            for region in self
+                .mem
+                .view
+                .iter()
+                .skip(1)
+                .chain(self.mem.retained.iter().map(AsRef::as_ref))
+            {
+                hv_vm_unmap(region.start_addr().raw_value(), region.len() as usize);
+            }
             if self.mapped {
-                hv_vm_unmap(boot::RAM, self.mem.iter().next().unwrap().len() as usize);
+                hv_vm_unmap(
+                    boot::RAM,
+                    self.mem.view.iter().next().unwrap().len() as usize,
+                );
             }
             hv_vm_destroy();
         }
     }
 }
 
-pub struct Vcpu<'a> {
+pub fn max_vcpus() -> Result<u32> {
+    let mut count = 0;
+    unsafe {
+        check(hv_vm_get_max_vcpu_count(&mut count), "max vCPU count")?;
+    }
+    Ok(count)
+}
+pub struct Mapping;
+impl Mapper for Mapping {
+    fn map(&mut self, region: &vm_memory::GuestRegionMmap) -> Result<()> {
+        unsafe {
+            check(
+                hv_vm_map(
+                    region.as_ptr().cast(),
+                    region.start_addr().raw_value(),
+                    region.len() as usize,
+                    7,
+                ),
+                "map hotplug RAM",
+            )
+        }
+    }
+    fn unmap(&mut self, region: &vm_memory::GuestRegionMmap) -> Result<()> {
+        unsafe {
+            check(
+                hv_vm_unmap(region.start_addr().raw_value(), region.len() as usize),
+                "unmap hotplug RAM",
+            )
+        }
+    }
+}
+// Created and destroyed on its worker thread. Cpus is joined before Vm drops.
+pub struct Vcpu {
     pub id: u64,
     exit: *const Exit,
-    _vm: &'a Vm,
+    _thread: PhantomData<Rc<()>>,
 }
-
-impl<'a> Vcpu<'a> {
-    pub fn new(vm: &'a Vm, entry: u64, dtb: u64) -> Result<Self> {
+impl Vcpu {
+    pub fn new(mpidr: u64) -> Result<Self> {
         let mut id = 0;
         let mut exit = std::ptr::null();
         unsafe {
@@ -204,14 +252,30 @@ impl<'a> Vcpu<'a> {
                 "create vCPU",
             )?;
         }
-        let v = Self { id, exit, _vm: vm };
+        let v = Self {
+            id,
+            exit,
+            _thread: PhantomData,
+        };
         unsafe {
-            check(hv_vcpu_set_sys_reg(id, 0xc005, 0), "MPIDR")?;
+            check(hv_vcpu_set_sys_reg(id, 0xc005, mpidr), "MPIDR")?;
         }
-        v.set(34, 0x3c5)?;
-        v.set(31, entry)?;
-        v.set(0, dtb)?;
         Ok(v)
+    }
+    pub fn boot(&self, entry: u64, context: u64) -> Result<()> {
+        // CPU_ON re-enters at EL1 with translation and caches disabled.
+        unsafe {
+            check(
+                hv_vcpu_set_sys_reg(self.id, 0xc080, 0x30d00800),
+                "SCTLR_EL1",
+            )?;
+        }
+        for reg in 0..31 {
+            self.set(reg, 0)?;
+        }
+        self.set(34, 0x3c5)?;
+        self.set(31, entry)?;
+        self.set(0, context)
     }
 
     pub fn run(&self) -> Result<Exit> {
@@ -238,7 +302,7 @@ impl<'a> Vcpu<'a> {
     }
 }
 
-impl Drop for Vcpu<'_> {
+impl Drop for Vcpu {
     fn drop(&mut self) {
         unsafe {
             hv_vcpu_destroy(self.id);

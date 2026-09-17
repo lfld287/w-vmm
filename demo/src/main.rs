@@ -2,11 +2,14 @@ use anyhow::{Result, ensure};
 use clap::{Parser, Subcommand};
 use std::{collections::BTreeMap, path::Path};
 use w_vmm::{
-    VmConfig, Vmm,
+    VirtioMemConfig, VmConfig, Vmm,
     net::{NetDevice, macos::Vmnet},
     storage::Disk,
 };
-use w_vmm_demo::terminal::Terminal;
+use w_vmm_demo::{
+    control::{self, Request, Server},
+    terminal::Terminal,
+};
 
 #[derive(Parser)]
 #[command(name = "w-vmm", version, about = "Local Apple Silicon ARM64 VMM")]
@@ -17,12 +20,30 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    MemorySet {
+        #[arg(long)]
+        socket: std::path::PathBuf,
+        #[arg(long)]
+        requested_mib: u64,
+    },
+    MemoryStatus {
+        #[arg(long)]
+        socket: std::path::PathBuf,
+    },
     Run {
         /// Attach a disk; repeat for multiple disks. Bare paths get disk0, disk1, ...
         #[arg(long, value_name = "[NAME=]PATH")]
         disk: Vec<String>,
         #[arg(long, default_value_t = 512)]
         memory_mib: u64,
+        #[arg(long, default_value_t = 1)]
+        vcpus: u32,
+        #[arg(long)]
+        virtio_mem_size_mib: Option<u64>,
+        #[arg(long, requires = "virtio_mem_size_mib")]
+        virtio_mem_requested_mib: Option<u64>,
+        #[arg(long, requires = "virtio_mem_size_mib")]
+        control_socket: Option<std::path::PathBuf>,
         /// Open all supplied disks read-only.
         #[arg(long, requires = "disk")]
         read_only: bool,
@@ -47,12 +68,27 @@ fn disk_paths(disks: Vec<String>) -> Result<BTreeMap<String, String>> {
 }
 
 fn run(command: Command) -> Result<()> {
+    let command = match command {
+        Command::MemorySet {
+            socket,
+            requested_mib,
+        } => return control_command(&socket, Request::MemorySet { requested_mib }),
+        Command::MemoryStatus { socket } => return control_command(&socket, Request::MemoryStatus),
+        run => run,
+    };
     let Command::Run {
         disk,
         memory_mib,
+        vcpus,
+        virtio_mem_size_mib,
+        virtio_mem_requested_mib,
+        control_socket,
         read_only,
         net,
-    } = command;
+    } = command
+    else {
+        unreachable!()
+    };
     let disks = disk_paths(disk)?
         .into_iter()
         .map(|(name, path)| Disk::open(Path::new(&path), read_only).map(|disk| (name, disk)))
@@ -66,9 +102,28 @@ fn run(command: Command) -> Result<()> {
             net.ipv4()
         );
     }
+    let vmm = Vmm::new(VmConfig {
+        memory_mib,
+        vcpu_count: vcpus,
+        virtio_mem: virtio_mem_size_mib.map(|region_size_mib| VirtioMemConfig {
+            region_size_mib,
+            requested_size_mib: virtio_mem_requested_mib.unwrap_or(0),
+        }),
+    });
+    let _control = control_socket
+        .map(|path| Server::bind(&path, vmm.memory_control().unwrap()))
+        .transpose()?;
     let terminal = Terminal::new()?;
-    eprintln!("w-vmm: 1 vCPU, {memory_mib} MiB; Ctrl-] exits");
-    Vmm::new(VmConfig { memory_mib }).run(disks, network, terminal)
+    eprintln!("w-vmm: {vcpus} vCPU, {memory_mib} MiB; Ctrl-] exits");
+    vmm.run(disks, network, terminal)
+}
+
+fn control_command(socket: &Path, req: Request) -> Result<()> {
+    let response = control::request(socket, req)
+        .unwrap_or_else(|e| serde_json::json!({"ok": false, "error": e.to_string()}));
+    println!("{response}");
+    ensure!(response["ok"] == true, "control request failed");
+    Ok(())
 }
 
 fn main() -> std::process::ExitCode {

@@ -92,7 +92,10 @@ pub fn fdt(
     devices: &[VirtioRegion],
     redist_size: u64,
     timers: [u32; 2],
+    vcpu_count: u32,
+    virtio_mem: bool,
 ) -> Result<Vec<u8>> {
+    ensure!(vcpu_count > 0, "at least one CPU required");
     let mut f = FdtWriter::new()?;
     let root = f.begin_node("")?;
     f.property_string("compatible", "w-vmm,arm64")?;
@@ -102,7 +105,7 @@ pub fn fdt(
     let n = f.begin_node("chosen")?;
     f.property_string(
         "bootargs",
-        "console=ttyS0,115200 earlycon=uart8250,mmio,0x09000000 rdinit=/init panic=-1",
+        &format!("console=ttyS0,115200 earlycon=uart8250,mmio,0x09000000 rdinit=/init panic=-1{}", if virtio_mem { " memory_hotplug.online_policy=auto-movable memory_hotplug.auto_movable_ratio=301 memhp_default_state=online" } else { "" }),
     )?;
     f.property_string("stdout-path", "/serial@9000000")?;
     f.property_u64("linux,initrd-start", l.initrd)?;
@@ -115,12 +118,14 @@ pub fn fdt(
     let n = f.begin_node("cpus")?;
     f.property_u32("#address-cells", 1)?;
     f.property_u32("#size-cells", 0)?;
-    let cpu = f.begin_node("cpu@0")?;
-    f.property_string("device_type", "cpu")?;
-    f.property_string("compatible", "arm,arm-v8")?;
-    f.property_u32("reg", 0)?;
-    f.property_string("enable-method", "psci")?;
-    f.end_node(cpu)?;
+    for id in 0..vcpu_count {
+        let cpu = f.begin_node(&format!("cpu@{id:x}"))?;
+        f.property_string("device_type", "cpu")?;
+        f.property_string("compatible", "arm,arm-v8")?;
+        f.property_u32("reg", id)?;
+        f.property_string("enable-method", "psci")?;
+        f.end_node(cpu)?;
+    }
     f.end_node(n)?;
     let n = f.begin_node("psci")?;
     f.property_string("compatible", "arm,psci-0.2")?;
@@ -193,9 +198,22 @@ mod tests {
     fn layout_and_dtb() {
         let l = Layout::new(512, KERNEL, INITRD.len()).unwrap();
         assert!(l.entry < l.initrd && l.initrd < l.dtb);
-        let dtb = fdt(&l, &virtio_regions(1).unwrap(), 0x20000, [30, 27]).unwrap();
+        let dtb = fdt(&l, &virtio_regions(1).unwrap(), 0x20000, [30, 27], 1, false).unwrap();
         assert_eq!(&dtb[..4], &0xd00dfeedu32.to_be_bytes());
         assert!(dtb.windows(12).any(|w| w == b"virtio,mmio\0"));
+    }
+
+    #[test]
+    fn cpu_topology_and_base_only_memory() {
+        let l = Layout::new(512, KERNEL, INITRD.len()).unwrap();
+        let dtb = fdt(&l, &virtio_regions(1).unwrap(), 0x80000, [30, 27], 4, true).unwrap();
+        for id in 0..4 {
+            let name = format!("cpu@{id:x}\0");
+            assert!(dtb.windows(name.len()).any(|w| w == name.as_bytes()));
+        }
+        assert_eq!(dtb.windows(7).filter(|w| *w == b"memory@").count(), 1);
+        assert!(dtb.windows(12).any(|w| w == b"auto-movable"));
+        assert!(fdt(&l, &[], 0x80000, [30, 27], 0, false).is_err());
     }
 
     #[test]
@@ -212,7 +230,7 @@ mod tests {
         let layout = Layout::new(512, KERNEL, INITRD.len()).unwrap();
         for count in [0, 1, 2, 3] {
             let regions = virtio_regions(count).unwrap();
-            let dtb = fdt(&layout, &regions, 0x20000, [30, 27]).unwrap();
+            let dtb = fdt(&layout, &regions, 0x20000, [30, 27], 1, false).unwrap();
             assert_eq!(
                 dtb.windows(12).filter(|w| *w == b"virtio_mmio@").count(),
                 count

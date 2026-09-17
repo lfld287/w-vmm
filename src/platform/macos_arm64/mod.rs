@@ -1,39 +1,38 @@
-//! macOS/arm64 (Apple Silicon) backend: HVF run loop, vCPU wake-up and serial IRQ plumbing.
+//! HVF workers own vCPUs; the caller exclusively owns all device backends.
+mod cpus;
 mod hvf;
-
 use super::VmRuntime;
 use crate::{
-    VmConfig, boot,
-    devices::{Device, block::Block, mmio::Mmio, net::Net},
+    MemoryControl, MemoryLifecycle, VmConfig, boot,
+    devices::{Device, block::Block, memory::Mem, mmio::Mmio, net::Net},
     net::NetDevice,
     serial::{SerialIo, poll_input},
     storage::BlockStorage,
 };
 use anyhow::{Result, bail, ensure};
-use std::collections::BTreeMap;
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    thread::JoinHandle,
-    time::Duration,
-};
+use std::{collections::BTreeMap, sync::mpsc, time::Duration};
 use vm_memory::{GuestAddress, GuestMemoryMmap};
 use vm_superio::{Serial, Trigger};
-
-/// Unit backend selected as `platform::Runtime` on macOS/arm64 builds.
 pub(super) struct Backend;
-
 impl VmRuntime for Backend {
     fn run<BS: BlockStorage, ND: NetDevice, SI: SerialIo>(
         config: &VmConfig,
+        control: Option<MemoryControl>,
         blocks: BTreeMap<String, BS>,
         net: Option<ND>,
         serial: SI,
     ) -> Result<()> {
         let layout = boot::Layout::new(config.memory_mib, boot::KERNEL, boot::INITRD.len())?;
-        let regions = boot::virtio_regions(blocks.len() + usize::from(net.is_some()))?;
+        ensure!(
+            (1..=hvf::max_vcpus()?).contains(&config.vcpu_count),
+            "vCPU count outside HVF supported range"
+        );
+        if let Some(c) = &config.virtio_mem {
+            c.validate(config.memory_mib)?;
+        }
+        let regions = boot::virtio_regions(
+            blocks.len() + usize::from(net.is_some()) + usize::from(control.is_some()),
+        )?;
         let mut devices: Vec<Mmio<Device<BS, ND>>> = blocks
             .into_iter()
             .map(|(name, disk)| Block::new(name, disk).map(|b| Mmio::new(Device::Block(b))))
@@ -41,16 +40,36 @@ impl VmRuntime for Backend {
         if let Some(net) = net {
             devices.push(Mmio::new(Device::Net(Net::new(net)?)));
         }
-        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(boot::RAM), layout.size)])?;
-        let vm = hvf::Vm::new(mem)?;
-        let (redist, timers) = vm.gic()?;
-        hvf::validate_irqs(&regions)?;
-        let dtb = boot::fdt(&layout, &regions, redist, timers)?;
-        boot::load(vm.memory(), &layout, &dtb)?;
-        let cpu = hvf::Vcpu::new(&vm, layout.entry, layout.dtb)?;
-        let _kicker = Kicker::new(cpu.id);
-        let mut serial = Serial::new(Irq, serial);
+        if let Some(c) = &control {
+            devices.push(Mmio::new(Device::Mem(Mem::new(
+                config.memory_mib,
+                c.clone(),
+            ))));
+        }
+        // All failures from VM setup onward still attempt every backend flush.
+        let mut vm_slot = None;
         let result = (|| -> Result<()> {
+            let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(boot::RAM), layout.size)])?;
+            vm_slot = Some(hvf::Vm::new(mem)?);
+            let vm = vm_slot.as_mut().unwrap();
+            let (redist, timers) = vm.gic()?;
+            hvf::validate_irqs(&regions)?;
+            let dtb = boot::fdt(
+                &layout,
+                &regions,
+                redist,
+                timers,
+                config.vcpu_count,
+                control.is_some(),
+            )?;
+            boot::load(vm.memory(), &layout, &dtb)?;
+            let (tx, rx) = mpsc::channel();
+            let cpus = cpus::Cpus::create(config.vcpu_count, tx)?;
+            if let Some(c) = &control {
+                c.lock().lifecycle = MemoryLifecycle::Running;
+            }
+            cpus.start(layout.entry, layout.dtb);
+            let mut serial = Serial::new(Irq, serial);
             loop {
                 if poll_input(&mut serial)? {
                     break;
@@ -59,174 +78,100 @@ impl VmRuntime for Backend {
                     boot::UART_IRQ,
                     serial.state().interrupt_identification & 1 == 0,
                 )?;
-                for (device, region) in devices.iter_mut().zip(&regions) {
+                for device in &mut devices {
                     device.poll(vm.memory())?;
-                    hvf::spi(region.irq, device.interrupt_pending())?;
                 }
-                let exit = cpu.run()?;
-                match exit.reason {
-                    0 => continue,
-                    1 => {
-                        let e = exit.exception;
-                        let esr = e.syndrome;
-                        match esr >> 26 {
-                            0x16 => {
-                                let function = cpu.get(0)?;
-                                match function {
-                                    0x84000008 | 0x84000009 => {
-                                        eprintln!(
-                                            "w-vmm: guest requested {}",
-                                            if function == 0x84000008 {
-                                                "poweroff"
-                                            } else {
-                                                "reset (exit)"
-                                            }
-                                        );
-                                        break;
-                                    }
-                                    0x84000000 => cpu.set(0, 2)?,
-                                    0x84000006 => cpu.set(0, 2)?,
-                                    _ => cpu.set(0, u64::MAX)?,
-                                }
-
-                                // HVC returns PC after the trapping instruction.
-                            }
-                            0x24 => {
-                                ensure!(
-                                    esr & (1 << 24) != 0 && esr & ((1 << 7) | (1 << 8)) == 0,
-                                    "unsupported data abort: {e:?}"
-                                );
-                                let width = 1usize << ((esr >> 22) & 3);
-                                let reg = ((esr >> 16) & 31) as u32;
-                                let write = esr & (1 << 6) != 0;
-                                let addr = e.physical_address;
-                                let value = if write && reg != 31 { cpu.get(reg)? } else { 0 };
-                                let read = if (boot::UART..boot::UART + 8).contains(&addr)
-                                    && width == 1
-                                {
-                                    let offset = (addr - boot::UART) as u8;
-                                    if write {
-                                        serial.write(offset, value as u8)?;
-                                        0
-                                    } else {
-                                        serial.read(offset) as u64
-                                    }
-                                } else if let Some(slot) = addr
-                                    .checked_sub(boot::VIRTIO_BASE)
-                                    .and_then(|offset| {
-                                        usize::try_from(offset / boot::VIRTIO_STRIDE).ok()
-                                    })
-                                    .filter(|&slot| slot < devices.len())
-                                {
-                                    let device = &mut devices[slot];
-                                    let offset = addr - regions[slot].address;
-                                    if write {
-                                        ensure!(width == 4, "virtio MMIO writes must be 32 bit");
-                                        device.write(offset, value as u32, vm.memory())?;
-                                        0
-                                    } else {
-                                        device.read(offset, width)
-                                    }
-                                } else {
-                                    bail!(
-                                        "unmapped MMIO {addr:#x}, size {width}, PC={:#x}",
-                                        cpu.get(31)?
-                                    )
-                                };
-                                if !write && reg != 31 {
-                                    let mut read = read;
-                                    if esr & (1 << 21) != 0 {
-                                        read = ((read << (64 - width * 8)) as i64
-                                            >> (64 - width * 8))
-                                            as u64;
-                                    }
-                                    if esr & (1 << 15) == 0 {
-                                        read &= 0xffff_ffff;
-                                    }
-                                    cpu.set(reg, read)?;
-                                }
-                                cpu.advance()?;
-                            }
-                            0x18 => {
-                                let sysreg = (((esr >> 20) & 3) << 14)
-                                    | (((esr >> 14) & 7) << 11)
-                                    | (((esr >> 10) & 15) << 7)
-                                    | (((esr >> 1) & 15) << 3)
-                                    | ((esr >> 17) & 7);
-                                // No virtual external debugger: OS lock and double lock are RAZ/WI.
-                                ensure!(
-                                    matches!(sysreg, 0x8084 | 0x808c | 0x809c),
-                                    "unsupported sysreg {sysreg:#x}, ESR={esr:#x}"
-                                );
-                                let rt = ((esr >> 5) & 31) as u32;
-                                if esr & 1 != 0 && rt != 31 {
-                                    cpu.set(rt, 0)?;
-                                }
-                                cpu.advance()?;
-                            }
-                            1 => cpu.advance()?, // WFI/WFE; next run or host kicker resumes.
-                            _ => bail!("unhandled HVF exception {e:?}, PC={:#x}", cpu.get(31)?),
+                if control.is_some() {
+                    let last = devices.len() - 1;
+                    let active = devices[last].active();
+                    if let Device::Mem(d) = &mut devices[last].device
+                        && d.sync_target(active)
+                    {
+                        devices[last].config_changed();
+                    }
+                    if active && devices[last].queues.available(0, vm.memory())? != 0 {
+                        let _pause = cpus.shared.pause()?;
+                        let pinned = devices
+                            .iter()
+                            .map(|d| d.queues.pinned(vm.memory()))
+                            .collect::<Result<Vec<_>>>()?
+                            .into_iter()
+                            .flatten()
+                            .collect::<Vec<_>>();
+                        let device = &mut devices[last];
+                        if let Device::Mem(d) = &mut device.device {
+                            d.process(&mut device.queues, &mut vm.mem, &pinned)?;
                         }
                     }
-                    _ => bail!("unexpected HVF exit {exit:?}; native GIC should handle timers"),
+                }
+                for (device, region) in devices.iter().zip(&regions) {
+                    hvf::spi(region.irq, device.interrupt_pending())?;
+                }
+                match rx.recv_timeout(Duration::from_millis(2)) {
+                    Ok(cpus::Event::Failed(error)) => return Err(error),
+                    Ok(cpus::Event::Shutdown) => break,
+                    Ok(cpus::Event::Access(a)) => {
+                        let value =
+                            if (boot::UART..boot::UART + 8).contains(&a.addr) && a.width == 1 {
+                                let offset = (a.addr - boot::UART) as u8;
+                                if a.write {
+                                    serial.write(offset, a.value as u8)?;
+                                    0
+                                } else {
+                                    serial.read(offset) as u64
+                                }
+                            } else if let Some(slot) = a
+                                .addr
+                                .checked_sub(boot::VIRTIO_BASE)
+                                .and_then(|o| usize::try_from(o / boot::VIRTIO_STRIDE).ok())
+                                .filter(|&s| s < devices.len())
+                            {
+                                let offset = a.addr - regions[slot].address;
+                                if a.write {
+                                    ensure!(a.width == 4, "virtio MMIO writes must be 32 bit");
+                                    devices[slot].write(offset, a.value as u32, vm.memory())?;
+                                    0
+                                } else {
+                                    devices[slot].read(offset, a.width)
+                                }
+                            } else {
+                                bail!("unmapped MMIO {:#x}, size {}", a.addr, a.width);
+                            };
+                        let _ = a.reply.send(value);
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        bail!("all vCPU event senders disconnected")
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if cpus.stopping() {
+                            // Worker posts the failure/shutdown event before finishing.
+                            if let Ok(cpus::Event::Failed(e)) = rx.try_recv() {
+                                return Err(e);
+                            }
+                            break;
+                        }
+                    }
                 }
             }
             Ok(())
         })();
-        // Attempt every disk flush even when a previous disk or the run loop failed.
         let mut flushed = Ok(());
         for device in &devices {
-            if let Err(error) = device.flush() {
-                eprintln!("final device flush: {error:#}");
+            if let Err(e) = device.flush() {
+                eprintln!("final device flush: {e:#}");
                 if flushed.is_ok() {
-                    flushed = Err(error);
+                    flushed = Err(e);
                 }
             }
         }
-        result?;
-        flushed?;
-        Ok(())
+        drop(vm_slot);
+        result.and(flushed)
     }
 }
-
 struct Irq;
-
 impl Trigger for Irq {
     type E = std::io::Error;
-
     fn trigger(&self) -> std::io::Result<()> {
         Ok(())
-    }
-}
-
-// Wake blocked HVF runs so serial input and stop requests remain responsive. Join before destroying vCPU.
-pub struct Kicker {
-    done: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl Kicker {
-    pub fn new(id: u64) -> Self {
-        let done = Arc::new(AtomicBool::new(false));
-        let flag = done.clone();
-        let thread = std::thread::spawn(move || {
-            while !flag.load(Ordering::Acquire) {
-                std::thread::sleep(Duration::from_millis(10));
-                hvf::kick(id);
-            }
-        });
-        Self {
-            done,
-            thread: Some(thread),
-        }
-    }
-}
-
-impl Drop for Kicker {
-    fn drop(&mut self) {
-        self.done.store(true, Ordering::Release);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
     }
 }

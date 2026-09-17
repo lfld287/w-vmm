@@ -34,6 +34,20 @@ sudo ./w-vmm run --net --disk sda=data.qcow2
 
 网络使用系统 vmnet NAT，需要 root 或 Apple 批准的网络 entitlement。默认无网卡；开启后不自动配置 IP、路由或运行 DHCP 客户端。启动时打印后端返回的 MAC、MTU 和 IPv4 子网信息，客户机按需手动配置。
 
+## 多核和动态内存
+
+```sh
+./w-vmm run --vcpus 4 --memory-mib 512 --virtio-mem-size-mib 1024 \
+  --virtio-mem-requested-mib 256 --control-socket /tmp/w-vmm.sock
+# 另一个本地终端
+./w-vmm memory-set --socket /tmp/w-vmm.sock --requested-mib 768
+./w-vmm memory-status --socket /tmp/w-vmm.sock
+```
+
+默认仍为 1 核、512 MiB 基础内存、不启用动态内存。核数受宿主 HVF 上限约束。基础 RAM 不可移除；动态区域是额外内存，区域容量为正的 128 MiB 倍数，目标为 2 MiB 倍数，基础加区域容量最多 16384 MiB。
+
+控制命令输出 JSON。目标接受后由客户机异步扩缩容；`plugged_size_mib` 表示实际插入量，可能暂时无法达到目标。socket 权限为 `0600`，拒绝覆盖已有路径，仅退出时清理自己创建的 socket。CPU 数量启动后固定，支持客户机次级核离线和重新上线。
+
 ## 网络测试
 
 在 Mac 终端启动（不需要磁盘）：

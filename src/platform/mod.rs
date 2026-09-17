@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 pub(crate) trait VmRuntime {
     fn run<BS: BlockStorage, ND: NetDevice, SI: SerialIo>(
         config: &VmConfig,
+        control: Option<crate::MemoryControl>,
         blocks: BTreeMap<String, BS>,
         net: Option<ND>,
         serial: SI,
@@ -23,12 +24,13 @@ type Runtime = macos_arm64::Backend;
 
 pub(crate) fn run<BS: BlockStorage, ND: NetDevice, SI: SerialIo>(
     config: &VmConfig,
+    control: Option<crate::MemoryControl>,
     blocks: BTreeMap<String, BS>,
     net: Option<ND>,
     serial: SI,
 ) -> Result<()> {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    return Runtime::run(config, blocks, net, serial);
+    return Runtime::run(config, control, blocks, net, serial);
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     anyhow::bail!("w-vmm requires Apple Silicon macOS 15+"); // unreachable: crate-root compile_error! fires first
 }

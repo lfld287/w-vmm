@@ -109,6 +109,27 @@ fn main() -> Result<()> {
         .map(|(i, path)| Disk::open(Path::new(&path), false).map(|d| (format!("disk{i}"), d)))
         .collect::<Result<BTreeMap<_, _>>>()?;
     let terminal = Terminal::new()?;
-    eprintln!("w-vmm: 1 vCPU, 512 MiB; Ctrl-] exits");
-    Vmm::new(VmConfig::default()).run(blocks, Some(Peer::default()), terminal)
+    let config = VmConfig {
+        vcpu_count: std::env::var("W_VMM_VCPUS")
+            .ok()
+            .map(|s| s.parse())
+            .transpose()?
+            .unwrap_or(1),
+        virtio_mem: std::env::var("W_VMM_MEMORY_SOCKET")
+            .ok()
+            .map(|_| w_vmm::VirtioMemConfig {
+                region_size_mib: 1024,
+                requested_size_mib: 256,
+            }),
+        ..VmConfig::default()
+    };
+    eprintln!("w-vmm: {} vCPU, 512 MiB; Ctrl-] exits", config.vcpu_count);
+    let vmm = Vmm::new(config);
+    let _control = std::env::var("W_VMM_MEMORY_SOCKET")
+        .ok()
+        .map(|path| {
+            w_vmm_demo::control::Server::bind(Path::new(&path), vmm.memory_control().unwrap())
+        })
+        .transpose()?;
+    vmm.run(blocks, Some(Peer::default()), terminal)
 }

@@ -1,6 +1,6 @@
 # w-vmm
 
-在 Apple Silicon 上通过 macOS Hypervisor.framework 直接启动 Alpine ARM64 的独立 Rust VMM。1 个 vCPU，默认 512 MiB RAM，原生 GICv3，16550 串口 shell，多块可命名 qcow2 数据盘及可选 virtio-net 网卡。内核和 initramfs 编译进可执行文件；客户机根文件系统驻留内存。
+在 Apple Silicon 上通过 macOS Hypervisor.framework 直接启动 Alpine ARM64 的独立 Rust VMM。可配置并行 vCPU，默认 1 核、512 MiB 基础 RAM，可选 virtio-mem 动态内存，原生 GICv3，16550 串口 shell，多块可命名 qcow2 数据盘及可选 virtio-net 网卡。内核和 initramfs 编译进可执行文件；客户机根文件系统驻留内存。
 
 所有准备、构建、运行和验收均在本机完成。没有上传、远程托管或部署步骤。
 
@@ -38,7 +38,7 @@ poweroff
 ./build.sh
 ```
 
-准备脚本下载固定 SHA-256 的 Alpine 3.24.1 aarch64 minirootfs 和 `linux-virt-6.18.52-r0.apk`。内核与模块来自同一个包。脚本解析 EFI zboot gzip 封装生成 ARM64 Image，选择 virtio-mmio、virtio-blk、virtio-net、ext4 及模块依赖，在 Mac 上生成确定性 newc/gzip initramfs。BusyBox init 作为 PID 1 回收子进程、启动串口 shell 并负责关机。
+准备脚本下载固定 SHA-256 的 Alpine 3.24.1 aarch64 minirootfs 和 `linux-virt-6.18.52-r0.apk`。内核与模块来自同一个包。脚本解析 EFI zboot gzip 封装生成 ARM64 Image，选择 virtio-mmio、virtio-blk、virtio-net、virtio-mem、ext4 及模块依赖，在 Mac 上生成确定性 newc/gzip initramfs。BusyBox init 作为 PID 1 回收子进程、启动串口 shell 并负责关机。
 
 下载缓存位于 `.cache/`，嵌入文件位于 `assets/Image` 和 `assets/initramfs.cpio.gz`，来源与校验值见 `assets/manifest.json`。普通 Cargo 构建不下载启动资源，缺少资源会直接编译失败。缓存存在后可离线重新打包；依赖已缓存时可执行 `cargo build --release --locked --offline`。
 
@@ -89,7 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`VmConfig` 仅配置 `memory_mib`。后端由调用方创建并交给泛型入口：
+`VmConfig` 配置 `memory_mib`、`vcpu_count` 和 `virtio_mem`；旧结构体字面量可加上 `..VmConfig::default()`。后端由调用方创建并交给泛型入口：
 
 ```rust,ignore
 pub fn run<BS: BlockStorage, ND: NetDevice, SI: SerialIo>(
@@ -127,6 +127,45 @@ fn run(serial: impl SerialIo) -> Result<(), Box<dyn std::error::Error>> {
 客户机输出使用同步 `write_all` / `flush`，没有额外输出队列。输入的其他错误及输出错误会终止运行，并尝试刷新全部磁盘。库不解释 `0x1d` 等控制字节；终端 raw mode、stdin/stdout、Ctrl-]、信号和恢复由 `demo/src/terminal.rs` 的 `Terminal` 实现负责。自定义后端需要退出时通过 `should_stop()` 表达。
 
 内核和 initramfs 仍由库提供；调用程序需附加相同的 Hypervisor entitlement 本地签名。`run` 已改为必须传入三个后端参数，不再隐式创建终端。
+
+## 多核与动态内存
+
+```sh
+./dist/w-vmm run --vcpus 4 --memory-mib 512 \
+  --virtio-mem-size-mib 1024 --virtio-mem-requested-mib 256 \
+  --control-socket /tmp/w-vmm.sock
+# 在另一个本地终端：
+./dist/w-vmm memory-set --socket /tmp/w-vmm.sock --requested-mib 768
+./dist/w-vmm memory-status --socket /tmp/w-vmm.sock
+```
+
+核数范围为 `1..=HVF 查询到的上限`，启动后固定。所有 vCPU 在自己的线程上创建、运行和销毁，启动前建立全部 GIC 拓扑。PSCI 0.2 支持 `CPU_ON`、`CPU_OFF`、`AFFINITY_INFO`；可通过客户机 `/sys/devices/system/cpu/cpu1/online` 离线、重新上线次级核。设备后端仍由调用线程独占，无需 `Send` / `Sync`。
+
+`memory_mib` 是不可移除的基础 RAM；virtio-mem 的区域容量和目标容量都是**额外**内存。基础内存加区域容量最多 16384 MiB。区域容量必须为正的 128 MiB 倍数，起点位于基础 RAM 后并向上对齐 128 MiB；目标默认 0，必须为 2 MiB 倍数且不超过区域容量。未启用时保持原有默认启动行为。
+
+库可在 `run` 前取得控制句柄，然后移交给其他线程：
+
+```rust,no_run
+use w_vmm::{VmConfig, Vmm, VirtioMemConfig};
+let vm = Vmm::new(VmConfig {
+    vcpu_count: 4,
+    virtio_mem: Some(VirtioMemConfig { region_size_mib: 1024, requested_size_mib: 256 }),
+    ..VmConfig::default()
+});
+let memory = vm.memory_control().unwrap();
+memory.set_requested_mib(512)?;
+println!("{:?}", memory.status());
+// 将 memory.clone() 交给控制线程，再调用 vm.run(blocks, net, serial)。
+# Ok::<(), anyhow::Error>(())
+```
+
+调节成功表示目标已接受，客户机异步完成扩缩容。`status()` 包含 `region_size_mib`、`requested_size_mib`、`plugged_size_mib`、`driver_ready` 和 `Created / Running / Stopped` 生命周期。启动前允许调节；退出或放弃未启动的 Vmm 后拒绝调节，句柄保留最终状态。
+
+驱动必须协商 `VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE`。未插入块不映射到 HVF，也不在设备 DMA 内存视图中。变更映射时暂停所有 vCPU，保护有效队列和待处理缓冲区；失败则回滚，回滚失败终止 VM。普通设备 reset 保留已插入内存及数据，`UNPLUG_ALL` 才移除全部块。
+
+启用动态内存时，Linux 使用 `auto-movable` 上线策略，比例 301%。客户机可能因页面占用而暂时无法缩容，观察目标与实际插入容量差异即可；不保证任意目标立即完成。协议参见 [virtio 1.2](https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html)，上线策略参见 [virtio-mem Linux 指南](https://virtio-mem.gitlab.io/user-guide/user-guide-linux.html)。
+
+控制 socket 只在显式指定时创建，权限 `0600`，拒绝覆盖已有路径，退出时按 inode 身份清理自身 socket。每连接一条换行 JSON 请求及响应，上限 4096 字节，读写超时 500 ms。例如 `{"command":"memory-set","requested_mib":768}` 或 `{"command":"memory-status"}`；成功返回 `{"ok":true,"status":{...}}`，失败返回 `{"ok":false,"error":"..."}`。CLI 两个控制命令均输出 JSON，失败退出码非零。不要在启动前遗留同名 socket；不会自动删除他人文件。
 
 ## 多盘和网络
 
@@ -178,6 +217,18 @@ python3 scripts/smoke.py --binary dist/w-vmm
 冒烟脚本仅创建临时测试盘，日志保存在 `test-results/`。执行真实 HVF 启动、shell 命令、多盘 serial 映射与独立持久化、ext4 挂载、192 KiB 随机数据写入与 SHA-256 校验、同步/卸载/关机/重启读回、只读镜像哈希不变、重复打开锁冲突、损坏文件、宿主文件大小限制导致的真实 EFBIG、重启退出和信号/快捷键后的终端恢复。关机后调用 `qemu-img check`。
 
 离线测试把可执行文件和数据盘放入仅含这两个文件的临时目录启动。未指定网络后端时不会创建宿主网络接口；运行时不会调用外部工具。`otool -L` 的链接项包括 Hypervisor.framework、vmnet.framework 和 macOS 系统库。验收宿主为 macOS 27.0 / Apple Silicon，尚未在 macOS 15 真机上回归。
+
+### 多核与内存验收
+
+```sh
+# guest-probe 仅用于测试，需要本地 aarch64-linux-musl-gcc、qemu-img、e2fsprogs。
+python3 scripts/smoke-memory.py --binary dist/w-vmm
+cargo build -p w-vmm-demo --example net-peer --locked
+codesign --force --sign - --entitlements assets/entitlements.plist target/debug/examples/net-peer
+python3 scripts/smoke-net.py --peer --memory --binary target/debug/examples/net-peer
+```
+
+内存冒烟使用临时测试盘，验证 1/2/4 核、每核绑核计算、次级核离线/上线、4 核重启/信号/快捷键与终端恢复。客户机反复扩容、写入并校验 640 MiB（超过基础 RAM）、缩容到零、再扩容，同时核对控制状态、`MemTotal` 和宿主 RSS 回收。组合测试在 4 核和动态内存反复扩缩容时执行本地网络及双盘 I/O，不使用 vmnet 或外部网络。
 
 ### vmnet 手动测试
 
@@ -252,9 +303,13 @@ sudo env "PATH=$PATH" python3 scripts/smoke-net.py \
 - `demo/Cargo.toml`：不可发布的 `w-vmm-demo` 包，声明 `w-vmm` 二进制及 CLI 依赖。
 - `src/boot.rs`：校验 ARM64 Image、RAM/内核/initramfs/FDT 布局，linux-loader 加载及 vm-fdt 设备树。
 - `src/platform/mod.rs`：`VmRuntime` trait 与按构建目标的运行时选择（`Runtime` 别名、`run()` 分派）。
-- `src/platform/macos_arm64/mod.rs`：`VmRuntime` 的 macOS/arm64 实现——HVF 运行循环、vCPU 唤醒（Kicker）与串口中断接线；`#[cfg]` 门控，仅 Apple Silicon 编译。
+- `src/platform/macos_arm64/mod.rs`：`VmRuntime` 的 macOS/arm64 实现——调用线程上的设备事件循环与串口中断接线；`#[cfg]` 门控，仅 Apple Silicon 编译。
 - `src/platform/macos_arm64/hvf.rs`：最小 FFI、VM 映射、原生 GIC 和绑定创建线程的 RAII vCPU。VM 内存由 vm-memory 持有，先销毁 vCPU 和映射，再释放 RAM。
 - `src/devices/mmio.rs`：共享 modern virtio-mmio、功能协商、队列配置、描述符校验、复位及中断确认。
+- `src/platform/macos_arm64/cpus.rs`：每核独立线程、PSCI 启停、全核暂停及统一退出。
+- `src/memory.rs`：可跨线程克隆的内存控制句柄与生命周期。
+- `src/devices/memory.rs`：virtio-mem 请求与按 2 MiB 块事务映射、回滚、回收。
+- `demo/src/control.rs`：可选本地 Unix socket JSON 服务与客户端。
 - `src/devices/block.rs`：磁盘请求与配置，单个 128 项 split virtqueue，IN/OUT/FLUSH/GET_ID，单请求上限 1 MiB。
 - `src/devices/net.rs`：网络请求与配置，RX/TX 各 128 项队列，完整帧收发与发送背压。
 - `src/net.rs`、`src/net/macos.rs`：`NetDevice` trait 与 macOS vmnet NAT 后端。
@@ -264,8 +319,8 @@ sudo env "PATH=$PATH" python3 scripts/smoke-net.py \
 - `src/lib.rs`：`VmConfig` / `Vmm::new(...).run(blocks, net, serial)`，委托 `platform::run`。
 - `demo/src/main.rs`：CLI、错误输出，通过路径依赖调用根库。
 
-设备 MMIO：GIC distributor `0x08000000`，16550 `0x09000000`（SPI 33），virtio 设备从 `0x0a000000` 开始，每个占 `0x1000`，中断从 SPI 34 递增。先按名称排列磁盘，再放置可选网卡，每个设备使用独立 MMIO 和中断。GIC redistributor 位于 `0x10000000`，RAM 位于 `0x40000000`。实际可用 SPI 范围、定时器 INTID 和 redistributor 空间大小查询 HVF；设备超出范围时启动报错。
+设备 MMIO：GIC distributor `0x08000000`，16550 `0x09000000`（SPI 33），virtio 设备从 `0x0a000000` 开始，每个占 `0x1000`，中断从 SPI 34 递增。先按名称排列磁盘，再放置可选网卡和 virtio-mem，每个设备使用独立 MMIO 和中断。GIC redistributor 位于 `0x10000000`，RAM 位于 `0x40000000`。实际可用 SPI 范围、定时器 INTID 和 redistributor 空间大小查询 HVF；设备超出范围时启动报错。
 
-初版无图形、SMP、快照、热插拔或其他宿主平台。轮询唤醒周期为 10 ms，网络每轮每方向最多处理 64 个包，存储请求同步执行，未做吞吐/延迟优化。非法设备访问/队列结构会报错并退出；普通磁盘请求 I/O 错误返回 virtio IOERR 并记录原因。此实现尚未经过不可信客户机的安全审计。
+目前无图形、快照、CPU 热添加或其他宿主平台。设备事件循环空闲等待最多 2 ms，网络每轮每方向最多处理 64 个包，存储请求同步执行，未做吞吐/延迟优化。非法设备访问/队列结构会报错并退出；普通磁盘请求 I/O 错误返回 virtio IOERR 并记录原因。此实现尚未经过不可信客户机的安全审计。
 
 第三方来源与许可见 [THIRD_PARTY.md](THIRD_PARTY.md)。

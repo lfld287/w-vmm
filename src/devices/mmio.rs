@@ -8,6 +8,12 @@ use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 pub const MAX_QUEUE: u16 = 128;
 
 pub trait VirtioDevice {
+    fn required_features(&self) -> u64 {
+        0
+    }
+    fn generation(&self) -> u32 {
+        0
+    }
     fn device_id(&self) -> u32;
     fn features(&self) -> u64;
     fn queue_count(&self) -> usize;
@@ -36,6 +42,48 @@ pub struct Queues {
 }
 
 impl Queues {
+    pub fn pinned(&self, mem: &GuestMemoryMmap) -> Result<Vec<(u64, u64)>> {
+        let mut pins = Vec::new();
+        for q in self.rings.iter().filter(|q| q.ready()) {
+            ensure!(q.is_valid(mem), "invalid live queue");
+            pins.extend([
+                (q.desc_table(), u64::from(q.size()) * 16),
+                (q.avail_ring(), 6 + u64::from(q.size()) * 2),
+                (q.used_ring(), 6 + u64::from(q.size()) * 8),
+            ]);
+            let available = q
+                .avail_idx(mem, Ordering::Acquire)?
+                .0
+                .wrapping_sub(q.next_avail());
+            ensure!(available <= q.size(), "available ring overrun");
+            for i in 0..available {
+                let slot = q.next_avail().wrapping_add(i) % q.size();
+                let mut index: u16 =
+                    mem.read_obj(GuestAddress(q.avail_ring() + 4 + u64::from(slot) * 2))?;
+                let mut ended = false;
+                for _ in 0..q.size() {
+                    ensure!(index < q.size(), "descriptor index out of range");
+                    let d: Descriptor =
+                        mem.read_obj(GuestAddress(q.desc_table() + u64::from(index) * 16))?;
+                    ensure!(
+                        d.flags() & !3 == 0 && mem.check_range(d.addr(), d.len() as usize),
+                        "invalid pending descriptor"
+                    );
+                    if d.len() != 0 {
+                        pins.push((d.addr().0, u64::from(d.len())));
+                    }
+                    if !d.has_next() {
+                        ended = true;
+                        break;
+                    }
+                    index = d.next();
+                }
+                ensure!(ended, "cyclic pending descriptor chain");
+            }
+        }
+        Ok(pins)
+    }
+
     pub fn available(&self, index: usize, mem: &GuestMemoryMmap) -> Result<u16> {
         let q = &self.rings[index];
         ensure!(q.is_valid(mem), "invalid virtqueue");
@@ -131,11 +179,15 @@ impl<D: VirtioDevice> Mmio<D> {
         self.queues.interrupt != 0
     }
 
+    pub fn config_changed(&mut self) {
+        self.queues.interrupt |= 2;
+    }
+
     pub fn flush(&self) -> Result<()> {
         self.device.flush()
     }
 
-    fn active(&self) -> bool {
+    pub(crate) fn active(&self) -> bool {
         self.status & 0xcf == 0xf
     }
 
@@ -175,6 +227,7 @@ impl<D: VirtioDevice> Mmio<D> {
                 .is_some_and(QueueT::ready) as u64,
             0x60 => self.queues.interrupt as u64,
             0x70 => self.status as u64,
+            0xfc => self.device.generation() as u64,
             _ => 0,
         }
     }
@@ -210,7 +263,9 @@ impl<D: VirtioDevice> Mmio<D> {
                 self.status = value;
                 if value & 8 != 0
                     && (self.queues.negotiated & !self.features != 0
-                        || self.queues.negotiated & (1 << VIRTIO_F_VERSION_1) == 0)
+                        || self.queues.negotiated & (1 << VIRTIO_F_VERSION_1) == 0
+                        || self.queues.negotiated & self.device.required_features()
+                            != self.device.required_features())
                 {
                     self.status &= !8;
                 }
