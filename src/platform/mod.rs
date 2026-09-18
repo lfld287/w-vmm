@@ -144,7 +144,10 @@ pub enum Event<C> {
 
 /// VM operations run on the caller's thread; no Send/Sync bound is required.
 /// `prepare` loads the guest and initializes CPUs/interrupts without running them.
-/// `pause` must quiesce every vCPU before returning success. `stop` must always
+/// `pause` must quiesce every vCPU, including exception handling and I/O
+/// completion writeback, before returning success. Pending events must survive
+/// pause; an I/O waiter must not prevent quiescence. `resume` releases the barrier.
+/// `stop` must always
 /// join every worker, including after partial startup, and be idempotent. Drop
 /// must also stop workers and destroy all mappings without releasing borrowed RAM.
 pub trait VirtualMachine: Mapper {
@@ -173,6 +176,7 @@ pub(crate) fn run<
     SI: crate::serial::SerialIo,
 >(
     config: &VmConfig,
+    control: &crate::VmControl,
     blocks: std::collections::BTreeMap<String, BS>,
     net: Option<ND>,
     memory: Option<crate::VirtioMem>,
@@ -180,11 +184,11 @@ pub(crate) fn run<
 ) -> Result<()> {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        crate::runtime::run(config, Hvf, blocks, net, memory, serial)
+        crate::runtime::run(config, control, Hvf, blocks, net, memory, serial)
     }
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     {
-        let _ = (config, blocks, net, memory, serial);
+        let _ = (config, control, blocks, net, memory, serial);
         anyhow::bail!("no default platform; use Vmm::run_with_platform")
     }
 }

@@ -20,6 +20,22 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    Pause {
+        #[arg(long)]
+        socket: std::path::PathBuf,
+    },
+    Resume {
+        #[arg(long)]
+        socket: std::path::PathBuf,
+    },
+    Stop {
+        #[arg(long)]
+        socket: std::path::PathBuf,
+    },
+    Status {
+        #[arg(long)]
+        socket: std::path::PathBuf,
+    },
     MemorySet {
         #[arg(long)]
         socket: std::path::PathBuf,
@@ -40,7 +56,7 @@ enum Command {
         vcpus: u32,
         #[arg(long)]
         virtio_mem_size_mib: Option<u64>,
-        #[arg(long, requires = "virtio_mem_size_mib")]
+        #[arg(long)]
         control_socket: Option<std::path::PathBuf>,
         /// Open all supplied disks read-only.
         #[arg(long, requires = "disk")]
@@ -67,6 +83,10 @@ fn disk_paths(disks: Vec<String>) -> Result<BTreeMap<String, String>> {
 
 fn run(command: Command) -> Result<()> {
     let command = match command {
+        Command::Pause { socket } => return control_command(&socket, Request::Pause),
+        Command::Resume { socket } => return control_command(&socket, Request::Resume),
+        Command::Stop { socket } => return control_command(&socket, Request::Stop),
+        Command::Status { socket } => return control_command(&socket, Request::Status),
         Command::MemorySet {
             socket,
             requested_mib,
@@ -104,10 +124,16 @@ fn run(command: Command) -> Result<()> {
         vcpu_count: vcpus,
     });
     let memory = virtio_mem_size_mib.map(VirtioMem::new).transpose()?;
+    let (terminal, _terminal_guard) = Terminal::new(vmm.control())?;
     let _control = control_socket
-        .map(|path| Server::bind(&path, memory.as_ref().unwrap().control()))
+        .map(|path| {
+            Server::bind(
+                &path,
+                vmm.control(),
+                memory.as_ref().map(VirtioMem::control),
+            )
+        })
         .transpose()?;
-    let terminal = Terminal::new()?;
     eprintln!("w-vmm: {vcpus} vCPU, {memory_mib} MiB; Ctrl-] exits");
     vmm.run(disks, network, memory, terminal)
 }

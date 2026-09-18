@@ -52,15 +52,15 @@ with tempfile.TemporaryDirectory(prefix="w-vmm-net-") as temp:
             vm.ready()
             resize_stop = threading.Event()
             resize_errors, resized = [], []
+            def request(command):
+                with socket.socket(socket.AF_UNIX) as conn:
+                    conn.settimeout(2)
+                    conn.connect(os.environ["W_VMM_MEMORY_SOCKET"])
+                    conn.sendall(json.dumps(command).encode() + b"\n")
+                    response = json.loads(conn.makefile("rb").readline())
+                    assert response["ok"], response
+                    return response["status"]
             def resize_loop():
-                def request(command):
-                    with socket.socket(socket.AF_UNIX) as conn:
-                        conn.settimeout(2)
-                        conn.connect(os.environ["W_VMM_MEMORY_SOCKET"])
-                        conn.sendall(json.dumps(command).encode() + b"\n")
-                        response = json.loads(conn.makefile("rb").readline())
-                        assert response["ok"], response
-                        return response["status"]
                 try:
                     while not resize_stop.is_set():
                         for target in [0, 384, 128]:
@@ -79,6 +79,13 @@ with tempfile.TemporaryDirectory(prefix="w-vmm-net-") as temp:
                 vm.command('test "$(cat /sys/block/vda/serial)" = disk0 && test "$(cat /sys/block/vdb/serial)" = disk1', "NET_DISKS_PASS")
                 vm.command("mkdir -p /data2 && mount /dev/vda /data && mount /dev/vdb /data2 && echo first > /data/identity && echo second > /data2/identity && sync && umount /data && umount /data2", "NET_DISK_IO_PASS")
             vm.command(f"ip link set eth0 up && ip addr add {guest} dev eth0", "STATIC_IP_PASS")
+            if args.memory:
+                vm.send(f'ping -i 0.01 -s 1472 {host} > /tmp/pause-ping & pingpid=$!')
+                for _ in range(10):
+                    assert request({"command": "pause"})["lifecycle"] == "Paused"
+                    time.sleep(0.02)
+                    assert request({"command": "resume"})["lifecycle"] == "Running"
+                vm.command('kill -INT "$pingpid"; wait "$pingpid"; true', 'PAUSED_PING_OK')
             # Exercise full-size frames and enough packets to wrap a 128-entry ring.
             vm.command(f"ping -c 140 -i 0.01 -s 1472 -W 2 {host} > /tmp/ping && cat /tmp/ping && grep -q '140 packets received, 0% packet loss' /tmp/ping", "PING_PASS")
             if not args.peer:

@@ -8,31 +8,20 @@ pub trait SerialIo: Write {
     /// Nonblocking input for the guest. Return at most `buffer.len()` bytes.
     /// Zero (including EOF), `WouldBlock`, and `Interrupted` mean no input now.
     /// Other errors terminate the VM and run its disk cleanup.
+    /// Not called while paused; host input remains buffered until resume.
     fn recv(&mut self, buffer: &mut [u8]) -> io::Result<usize>;
-
-    /// Request a clean stop independently of input availability or FIFO space.
-    fn should_stop(&self) -> bool {
-        false
-    }
 }
 
 impl<T: SerialIo + ?Sized> SerialIo for Box<T> {
     fn recv(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         (**self).recv(buffer)
     }
-
-    fn should_stop(&self) -> bool {
-        (**self).should_stop()
-    }
 }
 
-/// Poll once, returning whether the backend requests a stop.
+/// Poll once, respecting UART FIFO backpressure.
 pub(crate) fn poll_input<T: Trigger<E = io::Error>, SI: SerialIo>(
     serial: &mut Serial<T, vm_superio::serial::NoEvents, SI>,
-) -> anyhow::Result<bool> {
-    if serial.writer_mut().should_stop() {
-        return Ok(true);
-    }
+) -> anyhow::Result<()> {
     let capacity = serial.fifo_capacity();
     if capacity != 0 {
         let mut buffer = vec![0; capacity];
@@ -59,7 +48,7 @@ pub(crate) fn poll_input<T: Trigger<E = io::Error>, SI: SerialIo>(
             serial.enqueue_raw_bytes(&buffer[..count])?;
         }
     }
-    Ok(serial.writer_mut().should_stop())
+    Ok(())
 }
 
 #[cfg(test)]
@@ -82,12 +71,11 @@ mod tests {
         input: VecDeque<u8>,
         output: Vec<u8>,
         capacities: Vec<usize>,
-        stop: Rc<Cell<bool>>,
+        reads: Rc<Cell<usize>>,
         read_error: Option<io::ErrorKind>,
         write_error: Option<io::ErrorKind>,
         flush_error: Option<io::ErrorKind>,
         invalid_length: bool,
-        stop_on_recv: bool,
     }
 
     impl Write for Memory {
@@ -113,48 +101,39 @@ mod tests {
             if self.invalid_length {
                 return Ok(buffer.len() + 1);
             }
-            if self.stop_on_recv {
-                self.stop.set(true);
-            }
+            self.reads.set(self.reads.get() + 1);
             let count = buffer.len().min(self.input.len());
             for byte in &mut buffer[..count] {
                 *byte = self.input.pop_front().unwrap();
             }
             Ok(count)
         }
-
-        fn should_stop(&self) -> bool {
-            self.stop.get()
-        }
     }
 
     #[test]
-    fn bytes_capacity_and_stop_with_full_fifo() {
+    fn bytes_and_fifo_backpressure() {
         let mut serial = Serial::new(Irq, Memory::default());
         let capacity = serial.fifo_capacity();
         let bytes: Vec<_> = (0..capacity + 3).map(|i| i as u8).collect();
         serial.writer_mut().input.extend(&bytes);
-        assert!(!poll_input(&mut serial).unwrap());
+        poll_input(&mut serial).unwrap();
         assert_eq!(serial.fifo_capacity(), 0);
-        assert!(!poll_input(&mut serial).unwrap());
+        poll_input(&mut serial).unwrap();
         assert_eq!(serial.writer_mut().capacities, [capacity]);
         assert_eq!(serial.read(0), bytes[0]);
-        assert!(!poll_input(&mut serial).unwrap());
+        poll_input(&mut serial).unwrap();
         assert_eq!(serial.writer_mut().capacities, [capacity, 1]);
         for byte in &bytes[1..=capacity] {
             assert_eq!(serial.read(0), *byte);
         }
         serial.writer_mut().input.clear();
         serial.writer_mut().input.push_back(0x1d);
-        assert!(!poll_input(&mut serial).unwrap());
+        poll_input(&mut serial).unwrap();
         assert_eq!(serial.read(0), 0x1d);
         for byte in b"guest output" {
             serial.write(0, *byte).unwrap();
         }
         assert_eq!(serial.writer_mut().output, b"guest output");
-        serial.enqueue_raw_bytes(&vec![0; capacity]).unwrap();
-        serial.writer_mut().stop.set(true);
-        assert!(poll_input(&mut serial).unwrap());
     }
 
     #[test]
@@ -166,7 +145,7 @@ mod tests {
             Some(io::ErrorKind::Interrupted),
         ] {
             serial.writer_mut().read_error = kind;
-            assert!(!poll_input(&mut serial).unwrap());
+            poll_input(&mut serial).unwrap();
         }
         serial.writer_mut().read_error = Some(io::ErrorKind::BrokenPipe);
         assert_eq!(
@@ -206,12 +185,14 @@ mod tests {
     }
 
     #[test]
-    fn non_send_trait_object_and_stop_during_recv() {
+    fn non_send_trait_object() {
+        let reads = Rc::new(Cell::new(0));
         let backend: Box<dyn SerialIo> = Box::new(Memory {
-            stop_on_recv: true,
+            reads: reads.clone(),
             ..Memory::default()
         });
         let mut serial = Serial::new(Irq, backend);
-        assert!(poll_input(&mut serial).unwrap());
+        poll_input(&mut serial).unwrap();
+        assert_eq!(reads.get(), 1);
     }
 }

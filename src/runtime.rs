@@ -14,6 +14,7 @@ use vm_superio::{Serial, Trigger};
 
 pub(crate) fn run<P: Platform, BS: BlockStorage, ND: NetDevice, SI: SerialIo>(
     config: &VmConfig,
+    control: &crate::VmControl,
     platform: P,
     blocks: BTreeMap<String, BS>,
     net: Option<ND>,
@@ -21,10 +22,17 @@ pub(crate) fn run<P: Platform, BS: BlockStorage, ND: NetDevice, SI: SerialIo>(
     serial: SI,
 ) -> Result<()> {
     let mut runtime = Runtime::new(config, &platform, blocks, net, memory)?;
-    let result = runtime
-        .init(config, &platform)
-        .and_then(|view| runtime.run_loop(view, serial));
+    let result = if control.stopping() {
+        Ok(())
+    } else {
+        runtime.init(config, &platform, control).and_then(|view| {
+            control.running();
+            runtime.run_loop(view, serial, control)
+        })
+    };
+    control.cleaning();
     let cleanup_result = runtime.cleanup();
+    control.cleanup_result(&cleanup_result);
     result.and(cleanup_result)
 }
 
@@ -89,6 +97,7 @@ impl<VM: VirtualMachine, BS: BlockStorage, ND: NetDevice> Runtime<VM, BS, ND> {
         &mut self,
         config: &VmConfig,
         platform: &P,
+        control: &crate::VmControl,
     ) -> Result<GuestMemoryMmap> {
         let ranges = self
             .layout
@@ -98,13 +107,25 @@ impl<VM: VirtualMachine, BS: BlockStorage, ND: NetDevice> Runtime<VM, BS, ND> {
             .collect::<Vec<_>>();
         self.base = Some(GuestMemoryMmap::from_ranges(&ranges)?);
         let view = self.base.as_ref().unwrap().clone();
+        if control.stopping() {
+            return Ok(view);
+        }
         self.vm = Some(platform.create(config)?);
         let vm = self.vm.as_mut().unwrap();
         for region in self.base.as_ref().unwrap().iter() {
+            if control.stopping() {
+                return Ok(view);
+            }
             vm.map(region)?;
             self.mapped += 1;
         }
+        if control.stopping() {
+            return Ok(view);
+        }
         vm.prepare(&view, &self.layout)?;
+        if control.stopping() {
+            return Ok(view);
+        }
         vm.start()?;
         for d in &self.devices {
             if let Device::Mem(m) = &d.device {
@@ -114,12 +135,37 @@ impl<VM: VirtualMachine, BS: BlockStorage, ND: NetDevice> Runtime<VM, BS, ND> {
         Ok(view)
     }
 
-    fn run_loop<SI: SerialIo>(&mut self, mut view: GuestMemoryMmap, serial: SI) -> Result<()> {
+    fn run_loop<SI: SerialIo>(
+        &mut self,
+        mut view: GuestMemoryMmap,
+        serial: SI,
+        control: &crate::VmControl,
+    ) -> Result<()> {
         let mut serial = Serial::new(Irq, serial);
+        let mut paused = false;
         loop {
-            if poll_input(&mut serial)? {
+            if control.stopping() {
                 break;
             }
+            if let Some(request) = control.next() {
+                let vm = self.vm.as_mut().unwrap();
+                let outcome = match request.operation {
+                    crate::control::Operation::Pause if !paused => vm.pause(),
+                    crate::control::Operation::Resume if paused => vm.resume(),
+                    _ => Ok(()),
+                };
+                if outcome.is_ok() {
+                    paused = matches!(request.operation, crate::control::Operation::Pause);
+                }
+                control.complete(request, &outcome);
+                outcome?;
+                continue;
+            }
+            if paused {
+                control.wait();
+                continue;
+            }
+            poll_input(&mut serial)?;
             self.vm.as_mut().unwrap().set_irq(
                 self.layout.uart.irq,
                 serial.state().interrupt_identification & 1 == 0,

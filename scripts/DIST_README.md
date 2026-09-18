@@ -44,7 +44,7 @@ sudo ./w-vmm run --net --disk sda=data.qcow2
 ./w-vmm memory-status --socket /tmp/w-vmm.sock
 ```
 
-默认仍为 1 核、512 MiB 基础内存、不启用动态内存。核数受宿主 HVF 上限约束。基础 RAM 不可移除；动态区域是额外内存，区域容量为正的 128 MiB 倍数，目标为 2 MiB 倍数，基础加区域容量最多 16384 MiB。
+默认仍为 1 核、512 MiB 基础内存、不启用动态内存。核数受宿主 HVF 上限约束。基础 RAM 不可移除；动态区域是额外内存，区域容量为正的 128 MiB 倍数，目标为零或 128 MiB 倍数且不超过区域容量。地址范围受宿主 HVF IPA 位宽限制。
 
 控制命令输出 JSON。目标接受后由客户机异步扩缩容；`plugged_size_mib` 表示实际插入量，可能暂时无法达到目标。socket 权限为 `0600`，拒绝覆盖已有路径，仅退出时清理自己创建的 socket。CPU 数量启动后固定，支持客户机次级核离线和重新上线。
 
@@ -69,3 +69,18 @@ ping -c 3 192.168.2.1
 网关能回复后，再用 `ping -c 3 1.1.1.1` 测试 NAT 出网。网关或掩码不同时，先替换命令中的地址及前缀；客户机地址为临时手工配置，需避免与其他设备冲突。`ip route get 1.1.1.1` 只显示路由，不证明网关可达。网关不通时查看 `ip neigh show dev eth0`，优先检查子网与邻居解析。
 
 测试后执行 `poweroff`。自动化大包、TCP 上传下载及多盘共存测试见源码仓库 `scripts/smoke-net.py` 和根目录 README 的“vmnet 自动化测试”。
+
+## VM 控制
+
+`--control-socket /tmp/w-vmm.sock` 无需启用 virtio-mem。另一个本地终端可调用：
+
+```sh
+./w-vmm status --socket /tmp/w-vmm.sock
+./w-vmm pause --socket /tmp/w-vmm.sock
+./w-vmm resume --socket /tmp/w-vmm.sock
+./w-vmm stop --socket /tmp/w-vmm.sock
+```
+
+暂停、恢复和停止均等待操作完成，没有超时；暂停、恢复幂等。暂停期间 guest 和设备处理停止，串口不读取输入；普通输入和 Ctrl-] 留在宿主缓冲区，恢复后才处理。SIGINT、SIGTERM、SIGHUP 或控制命令仍可立即请求停止。停止响应在 vCPU 退出、磁盘刷新和资源释放后返回，服务随后回收连接并清理 socket；这不是客户机正常关机。
+
+`status` 返回生命周期和可选最终错误。`memory-set` 在暂停期间仍可设置宿主目标，客户机恢复后异步扩缩容；未配置 virtio-mem 时内存命令报错。JSON 命令使用与 CLI 相同的名称，成功格式为 `{"ok":true,"status":{...}}`，错误格式为 `{"ok":false,"error":"..."}`。

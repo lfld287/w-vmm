@@ -115,6 +115,24 @@ impl Shared {
         }
     }
 
+    fn wait_io(&self, index: usize) {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.running[index] = false;
+        self.changed.notify_all();
+    }
+
+    fn complete_io(&self, index: usize) -> bool {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        while s.paused && !s.stop {
+            s = self.changed.wait(s).unwrap_or_else(|e| e.into_inner());
+        }
+        if s.stop {
+            return false;
+        }
+        s.running[index] = true;
+        true
+    }
+
     pub fn pause(&self) -> Result<()> {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         s.paused = true;
@@ -245,6 +263,8 @@ fn worker(
 ) -> Result<()> {
     loop {
         let mut s = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.running[index] = false;
+        shared.changed.notify_all();
         while !s.stop && (!s.started || s.paused || s.power[index] == Power::Off) {
             s = shared.changed.wait(s).unwrap_or_else(|e| e.into_inner());
         }
@@ -258,9 +278,7 @@ fn worker(
         s.running[index] = true;
         drop(s);
         let exit = cpu.run();
-        let mut s = shared.state.lock().unwrap_or_else(|e| e.into_inner());
-        s.running[index] = false;
-        shared.changed.notify_all();
+        let s = shared.state.lock().unwrap_or_else(|e| e.into_inner());
         if s.stop {
             return Ok(());
         }
@@ -311,6 +329,9 @@ fn worker(
                             value: if write && reg != 31 { cpu.get(reg)? } else { 0 },
                             reply,
                         }))?;
+                        // A queued access owns its reply channel; it remains pending
+                        // across pause. No guest register work occurs while waiting.
+                        shared.wait_io(index);
                         let value = loop {
                             match rx.recv_timeout(Duration::from_millis(10)) {
                                 Ok(value) => break value,
@@ -327,6 +348,9 @@ fn worker(
                                 Err(_) => {}
                             }
                         };
+                        if !shared.complete_io(index) {
+                            return Ok(());
+                        }
                         if !write && reg != 31 {
                             let mut value = value;
                             if esr & (1 << 21) != 0 {
@@ -415,6 +439,30 @@ mod tests {
         assert!(!s.state.lock().unwrap_or_else(|e| e.into_inner()).paused);
         s.stop();
         assert!(s.pause().is_err());
+    }
+
+    #[test]
+    fn mmio_reply_cannot_cross_pause_barrier() {
+        for stop in [false, true] {
+            let s = Arc::new(Shared::new(4));
+            s.state.lock().unwrap().running[0] = true;
+            s.wait_io(0);
+            s.pause().unwrap();
+            let worker = s.clone();
+            let (tx, rx) = mpsc::channel();
+            let t = std::thread::spawn(move || {
+                tx.send(worker.complete_io(0)).unwrap();
+            });
+            assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());
+            assert!(!s.state.lock().unwrap().running[0]);
+            if stop {
+                s.stop();
+            } else {
+                s.resume();
+            }
+            assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), !stop);
+            t.join().unwrap();
+        }
     }
 
     #[test]

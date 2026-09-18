@@ -1,10 +1,12 @@
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub mod boot;
+mod control;
 mod devices;
 pub mod memory;
 pub mod net;
 pub mod platform;
 mod runtime;
+pub use control::{VmControl, VmLifecycle, VmStatus};
 pub use memory::{MemoryControl, MemoryLifecycle, MemoryStatus, VirtioMem};
 pub mod serial;
 pub mod storage;
@@ -31,11 +33,20 @@ impl Default for VmConfig {
 
 pub struct Vmm {
     config: VmConfig,
+    control: VmControl,
 }
 
 impl Vmm {
     pub fn new(config: VmConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            control: VmControl::new(),
+        }
+    }
+
+    /// Obtain a cloneable handle for use from a control thread.
+    pub fn control(&self) -> VmControl {
+        self.control.clone()
     }
 
     /// Run using a caller-provided platform and the built-in devices.
@@ -52,7 +63,18 @@ impl Vmm {
         memory: Option<VirtioMem>,
         serial: SI,
     ) -> Result<()> {
-        runtime::run(&self.config, platform, blocks, net, memory, serial)
+        self.control.begin()?;
+        let result = runtime::run(
+            &self.config,
+            &self.control,
+            platform,
+            blocks,
+            net,
+            memory,
+            serial,
+        );
+        self.control.finish(&result);
+        result
     }
 
     /// Run with named disks, optional Ethernet and memory devices, and a serial backend.
@@ -67,7 +89,10 @@ impl Vmm {
         memory: Option<VirtioMem>,
         serial: SI,
     ) -> Result<()> {
-        platform::run(&self.config, blocks, net, memory, serial)
+        self.control.begin()?;
+        let result = platform::run(&self.config, &self.control, blocks, net, memory, serial);
+        self.control.finish(&result);
+        result
     }
 }
 
@@ -110,5 +135,11 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(control.status().lifecycle, MemoryLifecycle::Stopped);
         assert!(control.set_requested_mib(2).is_err());
+    }
+}
+
+impl Drop for Vmm {
+    fn drop(&mut self) {
+        self.control.dropped();
     }
 }

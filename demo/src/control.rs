@@ -18,13 +18,17 @@ use std::{
     thread::JoinHandle,
     time::Duration,
 };
-use w_vmm::MemoryControl;
+use w_vmm::{MemoryControl, VmControl};
 const LIMIT: usize = 4096;
 const TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Request {
+    Pause,
+    Resume,
+    Stop,
+    Status,
     MemoryStatus,
     MemorySet { requested_mib: u64 },
 }
@@ -65,16 +69,35 @@ fn line(stream: &mut UnixStream) -> Result<Vec<u8>> {
     }
 }
 
-fn serve(mut stream: UnixStream, control: &MemoryControl) -> Result<()> {
+fn serve(mut stream: UnixStream, vm: &VmControl, memory: Option<&MemoryControl>) -> Result<()> {
     stream
         .set_write_timeout(Some(TIMEOUT))
         .context("set write timeout")?;
     let result = (|| -> Result<Value> {
-        match serde_json::from_slice::<Request>(&line(&mut stream)?)? {
-            Request::MemoryStatus => {}
-            Request::MemorySet { requested_mib } => control.set_requested_mib(requested_mib)?,
+        let request = serde_json::from_slice::<Request>(&line(&mut stream)?)?;
+        match request {
+            Request::MemoryStatus | Request::MemorySet { .. } => {
+                let control =
+                    memory.ok_or_else(|| anyhow::anyhow!("virtio-mem is not configured"))?;
+                if let Request::MemorySet { requested_mib } = request {
+                    control.set_requested_mib(requested_mib)?;
+                }
+                Ok(json!({"ok": true, "status": status(control)}))
+            }
+            _ => {
+                match request {
+                    Request::Pause => vm.pause()?,
+                    Request::Resume => vm.resume()?,
+                    Request::Stop => vm.stop()?,
+                    Request::Status => (),
+                    _ => unreachable!(),
+                }
+                let state = vm.status();
+                Ok(
+                    json!({"ok": true, "status": {"lifecycle": format!("{:?}", state.lifecycle), "final_error": state.final_error}}),
+                )
+            }
         }
-        Ok(json!({"ok": true, "status": status(control)}))
     })();
     let response = result.unwrap_or_else(|e| json!({"ok": false, "error": e.to_string()}));
     writeln!(stream, "{response}")?;
@@ -89,7 +112,7 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn bind(path: &Path, control: MemoryControl) -> Result<Self> {
+    pub fn bind(path: &Path, control: VmControl, memory: Option<MemoryControl>) -> Result<Self> {
         // bind atomically refuses any existing file, symlink or socket.
         let listener = UnixListener::bind(path)?;
         let meta = fs::symlink_metadata(path)?;
@@ -104,18 +127,43 @@ impl Server {
         let stop = server.stop.clone();
         server.thread = Some(
             std::thread::Builder::new()
-                .name("memory-control".into())
+                .name("vm-control".into())
                 .spawn(move || {
+                    let mut connections: Vec<JoinHandle<()>> = Vec::new();
                     while !stop.load(Ordering::Acquire) {
+                        let mut i = 0;
+                        while i < connections.len() {
+                            if connections[i].is_finished() {
+                                let _ = connections.swap_remove(i).join();
+                            } else {
+                                i += 1;
+                            }
+                        }
+                        if connections.len() == 16 {
+                            std::thread::sleep(Duration::from_millis(10));
+                            continue;
+                        }
                         match listener.accept() {
                             Ok((stream, _)) => {
-                                let _ = serve(stream, &control);
+                                let control = control.clone();
+                                let memory = memory.clone();
+                                match std::thread::Builder::new()
+                                    .name("vm-control-client".into())
+                                    .spawn(move || {
+                                        let _ = serve(stream, &control, memory.as_ref());
+                                    }) {
+                                    Ok(t) => connections.push(t),
+                                    Err(_) => break,
+                                }
                             }
                             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                                 std::thread::sleep(Duration::from_millis(10))
                             }
                             Err(_) => break,
                         }
+                    }
+                    for t in connections {
+                        let _ = t.join();
                     }
                 })?,
         );
@@ -141,7 +189,18 @@ pub fn request(path: &Path, request: Request) -> Result<Value> {
         .set_write_timeout(Some(TIMEOUT))
         .context("set write timeout")?;
     writeln!(stream, "{}", serde_json::to_string(&request)?)?;
-    Ok(serde_json::from_slice(&line(&mut stream)?)?)
+    // Operations have no completion deadline. Keep a bounded response buffer.
+    let mut data = Vec::new();
+    loop {
+        let mut byte = [0];
+        ensure!(stream.read(&mut byte)? == 1, "disconnected before response");
+        if byte[0] == b'\n' {
+            break;
+        }
+        ensure!(data.len() < LIMIT, "control response too long");
+        data.push(byte[0]);
+    }
+    Ok(serde_json::from_slice(&data)?)
 }
 
 #[cfg(test)]
@@ -150,18 +209,55 @@ mod tests {
     use w_vmm::VirtioMem;
 
     #[test]
+    fn vm_only_concurrent_clients_and_stop_response() {
+        let dir = std::env::temp_dir().join(format!("w-vmm-lifecycle-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("control.sock");
+        let vm = w_vmm::Vmm::new(w_vmm::VmConfig::default());
+        let server = Server::bind(&path, vm.control(), None).unwrap();
+        // A client sending no newline must not block status or stop clients.
+        let idle = UnixStream::connect(&path).unwrap();
+        let clients: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || request(&path, Request::Status).unwrap())
+            })
+            .collect();
+        for t in clients {
+            assert_eq!(t.join().unwrap()["status"]["lifecycle"], "Created");
+        }
+        assert_eq!(request(&path, Request::Pause).unwrap()["ok"], false);
+        assert_eq!(request(&path, Request::Resume).unwrap()["ok"], false);
+        assert_eq!(request(&path, Request::MemoryStatus).unwrap()["ok"], false);
+        assert_eq!(
+            request(&path, Request::MemorySet { requested_mib: 0 }).unwrap()["ok"],
+            false
+        );
+        assert_eq!(
+            request(&path, Request::Stop).unwrap()["status"]["lifecycle"],
+            "Stopped"
+        );
+        assert_eq!(request(&path, Request::Stop).unwrap()["ok"], true);
+        drop(idle);
+        drop(server);
+        assert!(!path.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn socket_control_conflict_disconnect_cleanup() {
         let dir = std::env::temp_dir().join(format!("w-vmm-control-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("control.sock");
         let memory = VirtioMem::new(128).unwrap();
         let control = memory.control();
-        let server = Server::bind(&path, control.clone()).unwrap();
+        let vm = w_vmm::Vmm::new(w_vmm::VmConfig::default());
+        let server = Server::bind(&path, vm.control(), Some(control.clone())).unwrap();
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        assert!(Server::bind(&path, control).is_err());
+        assert!(Server::bind(&path, vm.control(), Some(control)).is_err());
         assert_eq!(
             request(&path, Request::MemorySet { requested_mib: 128 }).unwrap()["status"]["requested_size_mib"],
             128

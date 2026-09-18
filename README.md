@@ -123,9 +123,9 @@ fn run(serial: impl SerialIo) -> Result<(), Box<dyn std::error::Error>> {
 
 `net::NetDevice` 提供 `mac_address`、必填关联常量 `MTU: u16`、`max_frame_len` 和非阻塞 `send` / `recv`，传输完整以太网帧，不含 FCS 或 virtio 头。`send` 返回 `false` 表示未消费该帧、稍后重试；`recv` 返回 `None` 表示没有数据。trait 不涉及 DHCP、IP、路由或 NAT；这些服务由具体后端决定。实现不需要 `Send` / `Sync`，可用 `Box<T>` 包装具体后端，关联常量会转发给 `T`。
 
-`serial::SerialIo: std::io::Write` 是必传的串口后端。`recv(&mut [u8])` 非阻塞读取发往客户机的数据，返回长度不得超过缓冲区；`0`（含 EOF）、`WouldBlock` 和 `Interrupted` 表示暂无输入。每轮只读取 UART FIFO 剩余容量，满时不读取。`should_stop()` 默认返回 `false`，每轮独立检查，FIFO 满时也能停止。所有调用在 VMM 线程执行，无需 `Send` / `Sync`，支持 `Box<dyn SerialIo>`。
+`serial::SerialIo: std::io::Write` 是必传的串口后端。`recv(&mut [u8])` 非阻塞读取发往客户机的数据，返回长度不得超过缓冲区；`0`（含 EOF）、`WouldBlock` 和 `Interrupted` 表示暂无输入。每轮只读取 UART FIFO 剩余容量，满时不读取。暂停期间不调用 `recv()`，输入留在宿主缓冲区，恢复后继续按 FIFO 容量读取。所有调用在 VMM 线程执行，无需 `Send` / `Sync`，支持 `Box<dyn SerialIo>`。
 
-客户机输出使用同步 `write_all` / `flush`，没有额外输出队列。输入的其他错误及输出错误会终止运行，并尝试刷新全部磁盘。库不解释 `0x1d` 等控制字节；终端 raw mode、stdin/stdout、Ctrl-]、信号和恢复由 `demo/src/terminal.rs` 的 `Terminal` 实现负责。自定义后端需要退出时通过 `should_stop()` 表达。
+客户机输出使用同步 `write_all` / `flush`，没有额外输出队列。输入的其他错误及输出错误会终止运行，并尝试刷新全部磁盘。库不解释 `0x1d` 等控制字节；终端 raw mode、stdin/stdout、Ctrl-]、信号和恢复由 `demo/src/terminal.rs` 的 `Terminal` 实现负责。`Terminal::new(vm.control())` 返回 `(Terminal, TerminalGuard)`，调用方必须保留 guard 直到 `run()` 返回。信号和 Ctrl-] 通过本地通知通道唤醒独立线程，再调用同步 `VmControl::stop()`；串口销毁只恢复终端，guard 注销信号并回收线程。自定义后端需要退出时也应通知其他线程调用 `VmControl::stop()`，不可在 VMM 回调内调用阻塞控制方法。
 
 内核和 initramfs 仍由库提供；调用程序需附加相同的 Hypervisor entitlement 本地签名。`run` 已改为必须传入四个参数（磁盘、网络、内存设备、串口），不再隐式创建终端。
 
@@ -163,7 +163,41 @@ println!("{:?}", control.status());
 
 启用动态内存时，Linux 使用 `auto-movable` 上线策略，比例 301%。客户机可能因页面占用而暂时无法缩容，观察目标与实际插入容量差异即可；不保证任意目标立即完成。协议参见 [virtio 1.2](https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html)，上线策略参见 [virtio-mem Linux 指南](https://virtio-mem.gitlab.io/user-guide/user-guide-linux.html)。
 
-控制 socket 只在显式指定时创建，权限 `0600`，拒绝覆盖已有路径，退出时按 inode 身份清理自身 socket。每连接一条换行 JSON 请求及响应，上限 4096 字节，读写超时 500 ms。例如 `{"command":"memory-set","requested_mib":768}` 或 `{"command":"memory-status"}`；成功返回 `{"ok":true,"status":{...}}`，失败返回 `{"ok":false,"error":"..."}`。CLI 两个控制命令均输出 JSON，失败退出码非零。不要在启动前遗留同名 socket；不会自动删除他人文件。
+## VM 外部控制
+
+库根导出 `VmControl`、`VmLifecycle`、`VmStatus`。在运行前通过 `vm.control()` 取得 `Clone + Send + Sync` 句柄，交给控制线程；平台、串口和设备后端仍只在 VMM 线程执行，不要求 `Send` / `Sync`。
+
+```rust,no_run
+use w_vmm::{VmConfig, Vmm};
+let vm = Vmm::new(VmConfig::default());
+let control = vm.control();
+// 将 control.clone() 交给控制线程，然后在当前线程调用 vm.run(...)。
+// VM 进入 Running 后，控制线程可以调用：
+// control.pause()?;
+// control.resume()?;
+// control.stop()?;
+println!("{:?}", control.status());
+```
+
+`pause()` 等待全部 vCPU（含异常处理和 MMIO 回写）与设备处理暂停；`resume()` 等待解除暂停并恢复调度。重复暂停、恢复幂等。暂停期间不处理 guest MMIO、块设备、网络设备或动态内存映射；串口不读取输入，普通输入和 Ctrl-] 留在宿主缓冲区，恢复后才处理。暂停等待仅由控制通知唤醒，没有定时轮询；demo 的 SIGINT、SIGTERM、SIGHUP 和控制停止命令在暂停期间仍有效。内部动态映射使用的短暂暂停不改变对外生命周期。`MemoryControl::set_requested_mib` 在启动前和暂停期间均可设置，仍只确认宿主目标值，客户机在运行后异步扩缩容。
+
+`stop()` 等待 vCPU 停止、全部磁盘刷新和资源释放，重复调用返回保存的清理结果。它不是客户机正常关机，不包含内存转储或快照恢复。三个阻塞方法均不设超时；从 VMM 运行线程（包括设备回调）调用会立即报错，`status()` 随时可读。
+
+生命周期为 `Created / Starting / Running / Paused / Stopping / Stopped`，状态包含可选的 `final_error`。尚未运行时暂停、恢复报错；启动前停止会取消 VM 并拒绝随后运行，启动中停止在初始化安全边界进入清理。停止优先取消未执行的暂停、恢复请求。启动失败、运行错误、客户机关机和丢弃未运行的 VM 均更新最终状态并通知等待者；暂停或恢复失败也会终止并清理。
+
+```sh
+# 无需配置 virtio-mem
+./dist/w-vmm run --control-socket /tmp/w-vmm.sock
+# 另一个本地终端
+./dist/w-vmm status --socket /tmp/w-vmm.sock
+./dist/w-vmm pause --socket /tmp/w-vmm.sock
+./dist/w-vmm resume --socket /tmp/w-vmm.sock
+./dist/w-vmm stop --socket /tmp/w-vmm.sock
+```
+
+控制 socket 只在显式指定时创建，权限 `0600`，拒绝覆盖已有路径，退出时按 inode 身份清理自身 socket。每连接一条换行 JSON 请求及响应，上限 4096 字节；请求接收和响应写入限时 500 ms，同步操作及客户端等待完成不设超时。服务最多使用 16 个并发连接处理线程，退出前等待连接响应完成再清理 socket。
+
+JSON 命令为 `{"command":"pause"}`、`resume`、`stop`、`status`，成功返回 `{"ok":true,"status":{"lifecycle":"Paused","final_error":null}}`。`{"command":"memory-set","requested_mib":768}` 和 `{"command":"memory-status"}` 保持原有响应字段；未配置内存设备时明确报错。所有错误返回 `{"ok":false,"error":"..."}`，CLI 输出 JSON，失败退出码非零。不要在启动前遗留同名 socket；不会自动删除他人文件。
 
 ## 多盘和网络
 
@@ -210,7 +244,7 @@ cargo build -p w-vmm --lib --locked
 python3 scripts/smoke.py --binary dist/w-vmm
 ```
 
-单元测试覆盖串口双向字节、FIFO 容量、空输入、停止请求、读写/刷新错误、控制字节直通和 trait 对象，以及设备树与多设备地址分配、公共 MMIO 协商/复位/双队列/中断、描述符校验、多盘状态隔离、磁盘 I/O 错误、网络分散缓冲收发、背压重试、短缓冲丢包和后端错误。
+单元测试覆盖串口双向字节、FIFO 容量、空输入、读写/刷新错误、控制字节直通和 trait 对象，以及设备树与多设备地址分配、公共 MMIO 协商/复位/双队列/中断、描述符校验、多盘状态隔离、磁盘 I/O 错误、网络分散缓冲收发、背压重试、短缓冲丢包和后端错误。
 
 冒烟脚本仅创建临时测试盘，日志保存在 `test-results/`。执行真实 HVF 启动、shell 命令、多盘 serial 映射与独立持久化、ext4 挂载、192 KiB 随机数据写入与 SHA-256 校验、同步/卸载/关机/重启读回、只读镜像哈希不变、重复打开锁冲突、损坏文件、宿主文件大小限制导致的真实 EFBIG、重启退出和信号/快捷键后的终端恢复。关机后调用 `qemu-img check`。
 
@@ -221,10 +255,13 @@ python3 scripts/smoke.py --binary dist/w-vmm
 ```sh
 # guest-probe 仅用于测试，需要本地 aarch64-linux-musl-gcc、qemu-img、e2fsprogs。
 python3 scripts/smoke-memory.py --binary dist/w-vmm
+python3 scripts/smoke-control.py --binary dist/w-vmm
 cargo build -p w-vmm-demo --example net-peer --locked
 codesign --force --sign - --entitlements assets/entitlements.plist target/debug/examples/net-peer
 python3 scripts/smoke-net.py --peer --memory --binary target/debug/examples/net-peer
 ```
+
+控制冒烟使用临时测试盘，验证 1/4 核反复暂停恢复、离线核、磁盘负载、UART 输入保留、Ctrl-] 延后处理、并发状态读取、暂停时停止和信号退出、并发信号与 socket stop、启动失败及正常关机回收、socket 清理，以及暂停期间设置内存目标。
 
 内存冒烟使用临时测试盘，验证 1/2/4 核、每核绑核计算、次级核离线/上线、4 核重启/信号/快捷键与终端恢复。客户机反复扩容、写入并校验 640 MiB（超过基础 RAM）、缩容到零、再扩容，同时核对控制状态、`MemTotal` 和宿主 RSS 回收。组合测试在 4 核和动态内存反复扩缩容时执行本地网络及双盘 I/O，不使用 vmnet 或外部网络。
 
