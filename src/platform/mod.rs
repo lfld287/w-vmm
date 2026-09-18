@@ -13,11 +13,13 @@ pub enum IoSpace {
     Mmio,
     Port,
 }
+
 #[derive(Clone, Copy, Debug)]
 pub struct MemoryRange {
     pub address: u64,
     pub size: u64,
 }
+
 #[derive(Clone, Copy, Debug)]
 pub struct IoRegion {
     pub space: IoSpace,
@@ -25,23 +27,27 @@ pub struct IoRegion {
     pub size: u64,
     pub irq: u32,
 }
+
 #[derive(Clone, Debug)]
 pub enum DeviceKind {
     Block(String),
     Net,
     Memory,
 }
+
 #[derive(Clone, Debug)]
 pub struct MemoryRequirement {
     pub capacity: u64,
     pub alignment: u64,
 }
+
 #[derive(Clone, Debug)]
 pub struct DeviceRequirements {
     /// Sorted disks, followed by network and dynamic memory.
     pub devices: Vec<DeviceKind>,
     pub hotplug: Option<MemoryRequirement>,
 }
+
 #[derive(Clone, Debug)]
 pub struct MachineLayout {
     pub ram: Vec<MemoryRange>,
@@ -49,6 +55,7 @@ pub struct MachineLayout {
     pub virtio: Vec<IoRegion>,
     pub hotplug: Option<MemoryRange>,
 }
+
 impl MachineLayout {
     pub(crate) fn validate(&self, config: &VmConfig, needs: &DeviceRequirements) -> Result<()> {
         ensure!(config.vcpu_count > 0, "vCPU count must be positive");
@@ -110,12 +117,16 @@ impl MachineLayout {
         Ok(())
     }
 }
+
 /// A platform owns architecture-specific layout and VM creation policy.
 pub trait Platform {
     type Vm: VirtualMachine;
+
     fn layout(&self, config: &VmConfig, devices: &DeviceRequirements) -> Result<MachineLayout>;
+
     fn create(&self, config: &VmConfig) -> Result<Self::Vm>;
 }
+
 /// Values are little-endian; width is in bytes. Completion is opaque to the runtime.
 pub struct IoAccess<C> {
     pub space: IoSpace,
@@ -125,10 +136,12 @@ pub struct IoAccess<C> {
     pub value: u64,
     pub completion: C,
 }
+
 pub enum Event<C> {
     Io(IoAccess<C>),
     Shutdown,
 }
+
 /// VM operations run on the caller's thread; no Send/Sync bound is required.
 /// `prepare` loads the guest and initializes CPUs/interrupts without running them.
 /// `pause` must quiesce every vCPU before returning success. `stop` must always
@@ -136,13 +149,21 @@ pub enum Event<C> {
 /// must also stop workers and destroy all mappings without releasing borrowed RAM.
 pub trait VirtualMachine: Mapper {
     type Completion;
+
     fn prepare(&mut self, memory: &GuestMemoryMmap, layout: &MachineLayout) -> Result<()>;
+
     fn start(&mut self) -> Result<()>;
+
     fn poll_event(&mut self, timeout: Duration) -> Result<Option<Event<Self::Completion>>>;
+
     fn complete_io(&mut self, completion: Self::Completion, value: u64) -> Result<()>;
+
     fn set_irq(&mut self, irq: u32, level: bool) -> Result<()>;
+
     fn pause(&mut self) -> Result<()>;
+
     fn resume(&mut self) -> Result<()>;
+
     fn stop(&mut self);
 }
 

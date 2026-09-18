@@ -136,6 +136,7 @@ impl VirtioMem {
         self.requested = crate::memory::mib_bytes(self.control.status().requested_size_mib)?;
         Ok(())
     }
+
     #[cfg(test)]
     fn attach(&mut self, base_mib: u64) -> Result<()> {
         let end = 0x4000_0000u64
@@ -144,6 +145,7 @@ impl VirtioMem {
             .ok_or_else(|| anyhow::anyhow!("hotplug overflow"))?;
         self.attach_at(end)
     }
+
     #[cfg(test)]
     fn validate_ipa(&self, bits: u32) -> Result<()> {
         ensure!(

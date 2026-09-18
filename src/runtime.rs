@@ -12,6 +12,7 @@ use anyhow::{Result, bail, ensure};
 use std::{collections::BTreeMap, time::Duration};
 use vm_memory::{GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 use vm_superio::{Serial, Trigger};
+
 pub(crate) fn run<P: Platform, BS: BlockStorage, ND: NetDevice, SI: SerialIo>(
     config: &VmConfig,
     platform: P,
@@ -187,9 +188,12 @@ pub(crate) fn run<P: Platform, BS: BlockStorage, ND: NetDevice, SI: SerialIo>(
     drop(devices);
     result.and(cleanup)
 }
+
 struct Irq;
+
 impl Trigger for Irq {
     type E = std::io::Error;
+
     fn trigger(&self) -> std::io::Result<()> {
         Ok(())
     }

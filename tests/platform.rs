@@ -35,6 +35,7 @@ enum Fault {
     Flush,
     Unmap,
 }
+
 #[derive(Default)]
 struct State {
     allocations: Vec<(u64, std::sync::Weak<vm_memory::MmapRegion>)>,
@@ -44,15 +45,19 @@ struct State {
     output: Vec<u8>,
     irqs: Vec<(u32, bool)>,
 }
+
 type Shared = Rc<RefCell<State>>; // Deliberately !Send/!Sync.
+
 struct TestPlatform {
     state: Shared,
     fault: Fault,
     port: bool,
     base: u64,
 }
+
 impl Platform for TestPlatform {
     type Vm = TestVm;
+
     fn layout(&self, _: &VmConfig, needs: &DeviceRequirements) -> Result<MachineLayout> {
         assert!(
             matches!(&needs.devices[..], [DeviceKind::Block(a), DeviceKind::Block(b), DeviceKind::Memory] if a == "a" && b == "z")
@@ -105,6 +110,7 @@ impl Platform for TestPlatform {
         }
         Ok(l)
     }
+
     fn create(&self, _: &VmConfig) -> Result<TestVm> {
         ensure!(self.fault != Fault::Create, "create failure");
         self.state.borrow_mut().log.push("create".into());
@@ -119,6 +125,7 @@ impl Platform for TestPlatform {
         })
     }
 }
+
 struct TestVm {
     state: Shared,
     fault: Fault,
@@ -128,6 +135,7 @@ struct TestVm {
     paused: bool,
     base: u64,
 }
+
 impl Mapper for TestVm {
     fn map(&mut self, r: &GuestRegionMmap) -> Result<()> {
         let mut s = self.state.borrow_mut();
@@ -148,6 +156,7 @@ impl Mapper for TestVm {
         );
         Ok(())
     }
+
     fn unmap(&mut self, r: &GuestRegionMmap) -> Result<()> {
         self.state
             .borrow_mut()
@@ -162,8 +171,10 @@ impl Mapper for TestVm {
         Ok(())
     }
 }
+
 impl VirtualMachine for TestVm {
     type Completion = usize;
+
     fn prepare(&mut self, memory: &GuestMemoryMmap, layout: &MachineLayout) -> Result<()> {
         self.state.borrow_mut().log.push("prepare".into());
         self.memory = Some(memory.clone());
@@ -227,37 +238,44 @@ impl VirtualMachine for TestVm {
         self.events.push_back(Event::Shutdown);
         Ok(())
     }
+
     fn start(&mut self) -> Result<()> {
         self.state.borrow_mut().log.push("start".into());
         ensure!(self.fault != Fault::Start, "start failure");
         Ok(())
     }
+
     fn poll_event(&mut self, _: Duration) -> Result<Option<Event<usize>>> {
         ensure!(self.fault != Fault::Poll, "poll failure");
         Ok(self.events.pop_front())
     }
+
     fn complete_io(&mut self, completion: usize, value: u64) -> Result<()> {
         let mut s = self.state.borrow_mut();
         assert_eq!(completion, s.replies.len());
         s.replies.push(value);
         Ok(())
     }
+
     fn set_irq(&mut self, irq: u32, level: bool) -> Result<()> {
         self.state.borrow_mut().irqs.push((irq, level));
         Ok(())
     }
+
     fn pause(&mut self) -> Result<()> {
         self.state.borrow_mut().log.push("pause".into());
         ensure!(self.fault != Fault::Pause, "pause failure");
         self.paused = true;
         Ok(())
     }
+
     fn resume(&mut self) -> Result<()> {
         self.state.borrow_mut().log.push("resume".into());
         ensure!(self.fault != Fault::Resume, "resume failure");
         self.paused = false;
         Ok(())
     }
+
     fn stop(&mut self) {
         if !self.stopped {
             self.state.borrow_mut().log.push("stop".into());
@@ -265,6 +283,7 @@ impl VirtualMachine for TestVm {
         }
     }
 }
+
 impl Drop for TestVm {
     fn drop(&mut self) {
         self.stop();
@@ -288,63 +307,81 @@ impl Drop for TestVm {
         self.state.borrow_mut().log.push("destroy".into());
     }
 }
+
 struct Disk(Shared, bool);
+
 impl BlockStorage for Disk {
     fn size(&self) -> u64 {
         512
     }
+
     fn read_only(&self) -> bool {
         false
     }
+
     fn read(&self, _: u64, d: &mut [u8]) -> Result<()> {
         d.fill(0);
         Ok(())
     }
+
     fn write(&self, _: u64, _: &[u8]) -> Result<()> {
         Ok(())
     }
+
     fn flush(&self) -> Result<()> {
         self.0.borrow_mut().log.push("flush".into());
         ensure!(!self.1, "flush failure");
         Ok(())
     }
 }
+
 impl Drop for Disk {
     fn drop(&mut self) {
         self.0.borrow_mut().log.push("disk-drop".into());
     }
 }
+
 struct Serial(Shared);
+
 impl io::Write for Serial {
     fn write(&mut self, b: &[u8]) -> io::Result<usize> {
         self.0.borrow_mut().output.extend(b);
         Ok(b.len())
     }
+
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
 }
+
 impl SerialIo for Serial {
     fn recv(&mut self, _: &mut [u8]) -> io::Result<usize> {
         Ok(0)
     }
 }
+
 struct NoNet;
+
 impl NetDevice for NoNet {
     const MTU: u16 = 1500;
+
     fn mac_address(&self) -> [u8; 6] {
         [2, 0, 0, 0, 0, 1]
     }
+
     fn max_frame_len(&self) -> usize {
         1514
     }
+
     fn send(&mut self, _: &[u8]) -> Result<bool> {
         Ok(true)
     }
+
     fn recv(&mut self, _: &mut [u8]) -> Result<Option<usize>> {
         Ok(None)
     }
 }
+
 fn run(fault: Fault, port: bool, base: u64) -> Shared {
     let state = Shared::default();
     let memory = VirtioMem::new(128).unwrap();
@@ -419,6 +456,7 @@ fn run(fault: Fault, port: bool, base: u64) -> Shared {
     drop(s);
     state
 }
+
 #[test]
 fn external_platform_mmio_and_port_io_multiple_ram_ranges() {
     for port in [false, true] {
@@ -427,6 +465,7 @@ fn external_platform_mmio_and_port_io_multiple_ram_ranges() {
         }
     }
 }
+
 #[test]
 fn errors_and_transaction_rollback_cleanup() {
     for fault in [
@@ -450,6 +489,7 @@ fn errors_and_transaction_rollback_cleanup() {
         run(fault, false, 0x100000);
     }
 }
+
 #[test]
 fn dropping_unused_memory_stops_control() {
     let m = VirtioMem::new(128).unwrap();

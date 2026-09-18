@@ -8,6 +8,7 @@ use vm_memory::GuestRegionMmap;
 
 /// Built-in Apple Silicon platform using the bundled ARM64 guest.
 pub struct Hvf;
+
 pub struct Vm {
     cpus: Option<cpus::Cpus>,
     rx: Option<mpsc::Receiver<cpus::Event>>,
@@ -15,8 +16,10 @@ pub struct Vm {
     config: VmConfig,
     boot: Option<boot::Layout>,
 }
+
 impl Platform for Hvf {
     type Vm = Vm;
+
     fn layout(&self, config: &VmConfig, devices: &DeviceRequirements) -> Result<MachineLayout> {
         let boot = boot::Layout::new(config.memory_mib, boot::KERNEL, boot::INITRD.len())?;
         ensure!(
@@ -65,6 +68,7 @@ impl Platform for Hvf {
                 .collect(),
         })
     }
+
     fn create(&self, config: &VmConfig) -> Result<Vm> {
         Ok(Vm {
             cpus: None,
@@ -75,16 +79,20 @@ impl Platform for Hvf {
         })
     }
 }
+
 impl Mapper for Vm {
     fn map(&mut self, region: &GuestRegionMmap) -> Result<()> {
         self.inner.map(region)
     }
+
     fn unmap(&mut self, region: &GuestRegionMmap) -> Result<()> {
         self.inner.unmap(region)
     }
 }
+
 impl VirtualMachine for Vm {
     type Completion = mpsc::SyncSender<u64>;
+
     fn prepare(&mut self, memory: &GuestMemoryMmap, layout: &MachineLayout) -> Result<()> {
         let boot = boot::Layout::new(self.config.memory_mib, boot::KERNEL, boot::INITRD.len())?;
         let regions = layout
@@ -112,6 +120,7 @@ impl VirtualMachine for Vm {
         self.boot = Some(boot);
         Ok(())
     }
+
     fn start(&mut self) -> Result<()> {
         let b = self
             .boot
@@ -120,6 +129,7 @@ impl VirtualMachine for Vm {
         self.cpus.as_ref().unwrap().start(b.entry, b.dtb);
         Ok(())
     }
+
     fn poll_event(&mut self, timeout: Duration) -> Result<Option<Event<Self::Completion>>> {
         match self.rx.as_ref().unwrap().recv_timeout(timeout) {
             Ok(cpus::Event::Shutdown) => Ok(Some(Event::Shutdown)),
@@ -147,24 +157,30 @@ impl VirtualMachine for Vm {
             }
         }
     }
+
     fn complete_io(&mut self, completion: Self::Completion, value: u64) -> Result<()> {
         let _ = completion.send(value);
         Ok(())
     }
+
     fn set_irq(&mut self, irq: u32, level: bool) -> Result<()> {
         hvf::spi(irq, level)
     }
+
     fn pause(&mut self) -> Result<()> {
         self.cpus.as_ref().unwrap().shared.pause()
     }
+
     fn resume(&mut self) -> Result<()> {
         self.cpus.as_ref().unwrap().shared.resume();
         Ok(())
     }
+
     fn stop(&mut self) {
         self.cpus.take();
     }
 }
+
 impl Drop for Vm {
     fn drop(&mut self) {
         self.stop();

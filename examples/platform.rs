@@ -12,13 +12,16 @@ use w_vmm::{
 };
 
 struct InProcess;
+
 struct Vm {
     mappings: BTreeMap<u64, u64>,
     running: bool,
     next: usize,
 }
+
 impl Platform for InProcess {
     type Vm = Vm;
+
     fn layout(&self, config: &VmConfig, needs: &DeviceRequirements) -> Result<MachineLayout> {
         ensure!(
             needs.devices.is_empty() && needs.hotplug.is_none(),
@@ -43,6 +46,7 @@ impl Platform for InProcess {
             hotplug: None,
         })
     }
+
     fn create(&self, config: &VmConfig) -> Result<Vm> {
         ensure!(config.vcpu_count == 1, "example supports one CPU");
         Ok(Vm {
@@ -52,6 +56,7 @@ impl Platform for InProcess {
         })
     }
 }
+
 impl Mapper for Vm {
     fn map(&mut self, region: &GuestRegionMmap) -> Result<()> {
         ensure!(!self.running, "mapping requires quiescence");
@@ -61,23 +66,28 @@ impl Mapper for Vm {
         self.mappings.insert(address, region.len());
         Ok(())
     }
+
     fn unmap(&mut self, region: &GuestRegionMmap) -> Result<()> {
         ensure!(!self.running, "unmapping requires quiescence");
         self.mappings.remove(&region.start_addr().0);
         Ok(())
     }
 }
+
 impl VirtualMachine for Vm {
     type Completion = usize;
+
     fn prepare(&mut self, _: &GuestMemoryMmap, _: &MachineLayout) -> Result<()> {
         // Real platforms load their image, initialize registers and interrupt
         // controllers, and create parked vCPUs here. No CPU may execute yet.
         Ok(())
     }
+
     fn start(&mut self) -> Result<()> {
         self.running = true;
         Ok(())
     }
+
     fn poll_event(&mut self, _: Duration) -> Result<Option<Event<usize>>> {
         let message = b"Hello from a custom platform!\n";
         if self.next == message.len() {
@@ -92,63 +102,80 @@ impl VirtualMachine for Vm {
             completion: self.next,
         })))
     }
+
     fn complete_io(&mut self, completion: usize, _: u64) -> Result<()> {
         ensure!(completion == self.next, "unexpected completion");
         // A real platform writes back the read value and advances the guest PC.
         self.next += 1;
         Ok(())
     }
+
     fn set_irq(&mut self, _: u32, _: bool) -> Result<()> {
         Ok(())
     }
+
     fn pause(&mut self) -> Result<()> {
         self.running = false;
         Ok(())
     }
+
     fn resume(&mut self) -> Result<()> {
         self.running = true;
         Ok(())
     }
+
     fn stop(&mut self) {
         self.running = false;
     }
 }
+
 impl Drop for Vm {
     fn drop(&mut self) {
         self.stop();
         self.mappings.clear();
     }
 }
+
 struct Console;
+
 impl Write for Console {
     fn write(&mut self, b: &[u8]) -> io::Result<usize> {
         io::stdout().write(b)
     }
+
     fn flush(&mut self) -> io::Result<()> {
         io::stdout().flush()
     }
 }
+
 impl SerialIo for Console {
     fn recv(&mut self, _: &mut [u8]) -> io::Result<usize> {
         Ok(0)
     }
 }
+
 struct NoNet;
+
 impl NetDevice for NoNet {
     const MTU: u16 = 1500;
+
     fn mac_address(&self) -> [u8; 6] {
         [2, 0, 0, 0, 0, 1]
     }
+
     fn max_frame_len(&self) -> usize {
         1514
     }
+
     fn send(&mut self, _: &[u8]) -> Result<bool> {
         Ok(true)
     }
+
     fn recv(&mut self, _: &mut [u8]) -> Result<Option<usize>> {
         Ok(None)
     }
 }
+
 fn main() -> Result<()> {
     Vmm::new(VmConfig {
         memory_mib: 2,
