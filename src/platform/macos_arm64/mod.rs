@@ -29,8 +29,11 @@ impl VmRuntime for Backend {
             (1..=hvf::max_vcpus()?).contains(&config.vcpu_count),
             "vCPU count outside HVF supported range"
         );
+        let ipa_bits = hvf::ipa_bits()?;
+        boot::validate_ipa_range(boot::RAM, u64::try_from(layout.size)?, ipa_bits)?;
         if let Some(d) = &mut memory {
             d.attach(config.memory_mib)?;
+            d.validate_ipa(ipa_bits)?;
         }
         let has_memory = memory.is_some();
         let regions = boot::virtio_regions(

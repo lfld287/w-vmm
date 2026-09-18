@@ -66,6 +66,24 @@ def main():
             resize(256)
             vm.command('umount /data', 'UNMOUNT_OK')
             vm.poweroff()
+        with VM('memory-32g', ['--vcpus', '4', '--disk', str(disk), '--virtio-mem-size-mib', '32768', '--control-socket', sock], binary=binary) as vm:
+            vm.ready()
+            vm.command('mount /dev/vda /data', 'LARGE_MOUNT_OK')
+            resize(0)
+            baseline = rss()
+            assert control('memory-status')['status']['region_size_mib'] == 32768
+            assert baseline < 1024 * 1024, baseline  # Capacity is not eagerly mapped.
+            resize(128)
+            resize(256)
+            vm.command('/data/probe 4 576', 'LARGE_MEM_WRITE_OK')
+            before = rss()
+            resize(128)
+            resize(0)
+            after = rss()
+            print(f'32 GiB sparse region: initial RSS {baseline} KiB, reclaimed {before - after} KiB', flush=True)
+            assert before - after > 64 * 1024, (before, after)
+            vm.command('umount /data', 'LARGE_UNMOUNT_OK')
+            vm.poweroff()
         assert not pathlib.Path(sock).exists()
         subprocess.run(['qemu-img', 'check', str(disk)], check=True)
     for name, action in [('reboot', 'reboot'), ('signal', None), ('shortcut', None)]:

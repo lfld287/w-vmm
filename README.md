@@ -26,7 +26,7 @@ umount /data
 poweroff
 ```
 
-只读盘使用 `mount -o ro /dev/vda /data`。程序不会自动格式化或自动挂载数据盘。不传 `--disk` 时没有 `/dev/vda`。RAM 支持 128–16384 MiB；默认 512 MiB。
+只读盘使用 `mount -o ro /dev/vda /data`。程序不会自动格式化或自动挂载数据盘。不传 `--disk` 时没有 `/dev/vda`。基础 RAM 最低 128 MiB，默认 512 MiB；无固定容量上限，受 HVF IPA 地址范围和主机资源限制。
 
 `poweroff` 正常关机；`reboot` 使宿主进程退出，需要重新执行命令启动。宿主 `Ctrl-]` 可退出，`Ctrl-C` 传给客户机 shell。SIGINT、SIGTERM、SIGHUP 会使宿主停止 vCPU、刷新磁盘并恢复终端。强制退出前应在客户机执行 `sync` / `umount`；宿主只能刷新已经收到的磁盘请求，不能代替客户机刷新文件系统。SIGKILL 或宿主崩溃无法执行清理。
 
@@ -142,7 +142,7 @@ fn run(serial: impl SerialIo) -> Result<(), Box<dyn std::error::Error>> {
 
 核数范围为 `1..=HVF 查询到的上限`，启动后固定。所有 vCPU 在自己的线程上创建、运行和销毁，启动前建立全部 GIC 拓扑。PSCI 0.2 支持 `CPU_ON`、`CPU_OFF`、`AFFINITY_INFO`；可通过客户机 `/sys/devices/system/cpu/cpu1/online` 离线、重新上线次级核。设备后端仍由调用线程独占，无需 `Send` / `Sync`。
 
-`memory_mib` 是不可移除的基础 RAM；virtio-mem 的区域容量和目标容量都是**额外**内存。基础内存加区域容量最多 16384 MiB。区域容量必须为正的 128 MiB 倍数，起点位于基础 RAM 后并向上对齐 128 MiB；目标默认 0，必须为 2 MiB 倍数且不超过区域容量。未启用时保持原有默认启动行为。
+`memory_mib` 是不可移除的基础 RAM；virtio-mem 的区域容量和目标容量都是**额外**内存。基础 RAM、动态区域和合计容量均无 16 GiB 固定上限；完整地址范围（含对齐间隙）必须落在当前 VM 的 HVF IPA 位宽内，容量换算与地址计算也必须可表示。区域容量必须为 Linux 热插拔块大小的正整数倍，起点位于基础 RAM 后并按该块大小向上对齐；目标默认 0，必须为零或该块大小的整数倍且不超过区域容量。内部常量 `HOTPLUG_BLOCK_SIZE` 与当前内核对应的值为 128 MiB，不自动探测客户机。virtio-mem 协议和底层映射仍以 2 MiB 为单位，因此异步调整中的实际插入量可以小于 Linux 热插拔块大小。未启用时保持原有默认启动行为。
 
 库可在 `run` 前取得控制句柄，然后移交给其他线程：
 

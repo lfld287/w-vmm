@@ -15,6 +15,25 @@ pub const VIRTIO_IRQ_BASE: u32 = 34;
 pub const KERNEL: &[u8] = include_bytes!("../assets/Image");
 pub const INITRD: &[u8] = include_bytes!("../assets/initramfs.cpio.gz");
 
+pub(crate) const MIB: u64 = 1 << 20;
+
+pub(crate) fn mib_bytes(mib: u64) -> Result<u64> {
+    mib.checked_mul(MIB)
+        .ok_or_else(|| anyhow::anyhow!("memory capacity conversion overflow"))
+}
+
+pub(crate) fn validate_ipa_range(start: u64, size: u64, bits: u32) -> Result<()> {
+    ensure!((1..=64).contains(&bits), "invalid HVF IPA width {bits}");
+    let end = start
+        .checked_add(size)
+        .ok_or_else(|| anyhow::anyhow!("memory address overflow"))?;
+    ensure!(
+        bits == 64 || end <= (1u64 << bits),
+        "memory range {start:#x}..{end:#x} exceeds HVF {bits}-bit IPA range"
+    );
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct Layout {
     pub size: usize,
@@ -25,10 +44,7 @@ pub struct Layout {
 
 impl Layout {
     pub fn new(mib: u64, kernel: &[u8], initrd_len: usize) -> Result<Self> {
-        ensure!(
-            (128..=16384).contains(&mib),
-            "memory must be 128..16384 MiB"
-        );
+        ensure!(mib >= 128, "memory must be at least 128 MiB");
         ensure!(
             kernel.len() >= 64 && &kernel[56..60] == b"ARM\x64",
             "invalid ARM64 Image"
@@ -45,8 +61,15 @@ impl Layout {
         let entry = RAM
             .checked_add(offset)
             .ok_or_else(|| anyhow::anyhow!("kernel offset overflow"))?;
-        let size = (mib << 20) as usize;
-        let end = RAM + size as u64;
+        let bytes = mib_bytes(mib)?;
+        let size = usize::try_from(bytes)?;
+        ensure!(
+            size <= isize::MAX as usize,
+            "RAM exceeds host allocation size"
+        );
+        let end = RAM
+            .checked_add(bytes)
+            .ok_or_else(|| anyhow::anyhow!("RAM address overflow"))?;
         let dtb = end - 0x20_0000;
         let initrd = dtb
             .checked_sub(initrd_len as u64)
@@ -214,6 +237,25 @@ mod tests {
         assert_eq!(dtb.windows(7).filter(|w| *w == b"memory@").count(), 1);
         assert!(dtb.windows(12).any(|w| w == b"auto-movable"));
         assert!(fdt(&l, &[], 0x80000, [30, 27], 0, false).is_err());
+    }
+
+    #[test]
+    fn large_ram_and_ipa_boundaries() {
+        assert_eq!(
+            Layout::new(32768, KERNEL, INITRD.len()).unwrap().size,
+            32768 * MIB as usize
+        );
+        for mib in [u64::MAX, u64::MAX / MIB + 1, u64::MAX / MIB] {
+            assert!(Layout::new(mib, KERNEL, 0).is_err());
+        }
+        let limit = 1u64 << 36;
+        validate_ipa_range(RAM, limit - RAM, 36).unwrap();
+        assert!(validate_ipa_range(RAM, limit - RAM + 1, 36).is_err());
+        assert!(validate_ipa_range(u64::MAX, 1, 64).is_err());
+        for bits in [0, 65] {
+            assert!(validate_ipa_range(RAM, MIB, bits).is_err());
+        }
+        validate_ipa_range(RAM, MIB, 64).unwrap();
     }
 
     #[test]

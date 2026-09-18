@@ -9,13 +9,16 @@ use vm_memory::{
     Address, Bytes, GuestAddress, GuestMemoryMmap, GuestMemoryRegion, GuestRegionMmap,
 };
 
+// virtio-mem protocol/mapping granularity, independent of Linux hotplug blocks.
 const BLOCK: u64 = 2 << 20;
-const ALIGN: u64 = 128 << 20;
+// Linux memory hotplug block size for the bundled guest kernel.
+const HOTPLUG_BLOCK_SIZE: u64 = 128 << 20;
 
 fn validate_target(target: u64, capacity: u64) -> Result<()> {
     ensure!(
-        target.is_multiple_of(2) && target <= capacity,
-        "requested memory must be a multiple of 2 MiB within region capacity"
+        target.is_multiple_of(HOTPLUG_BLOCK_SIZE / crate::boot::MIB) && target <= capacity,
+        "requested memory must be a multiple of {} MiB within region capacity",
+        HOTPLUG_BLOCK_SIZE / crate::boot::MIB
     );
     Ok(())
 }
@@ -164,16 +167,15 @@ impl VirtioMem {
 impl VirtioMem {
     pub fn new(region_size_mib: u64) -> Result<Self> {
         ensure!(
-            region_size_mib > 0 && region_size_mib.is_multiple_of(128),
-            "virtio-mem region must be a positive multiple of 128 MiB"
+            region_size_mib > 0
+                && region_size_mib.is_multiple_of(HOTPLUG_BLOCK_SIZE / crate::boot::MIB),
+            "virtio-mem region must be a positive multiple of {} MiB",
+            HOTPLUG_BLOCK_SIZE / crate::boot::MIB
         );
-        ensure!(
-            region_size_mib <= 16384,
-            "virtio-mem capacity exceeds 16384 MiB"
-        );
+        let capacity = crate::boot::mib_bytes(region_size_mib)?;
         Ok(Self {
             start: 0,
-            capacity: region_size_mib << 20,
+            capacity,
             requested: 0,
             plugged: 0,
             generation: 0,
@@ -188,15 +190,22 @@ impl VirtioMem {
     }
 
     pub(crate) fn attach(&mut self, base_mib: u64) -> Result<()> {
-        ensure!(
-            base_mib
-                .checked_add(self.capacity >> 20)
-                .is_some_and(|n| n <= 16384),
-            "total RAM capacity exceeds 16384 MiB"
-        );
-        self.start = (crate::boot::RAM + (base_mib << 20)).next_multiple_of(ALIGN);
-        self.requested = self.control.status().requested_size_mib << 20;
+        let base_end = crate::boot::RAM
+            .checked_add(crate::boot::mib_bytes(base_mib)?)
+            .ok_or_else(|| anyhow::anyhow!("base RAM address overflow"))?;
+        let start = base_end
+            .checked_next_multiple_of(HOTPLUG_BLOCK_SIZE)
+            .ok_or_else(|| anyhow::anyhow!("hotplug alignment overflow"))?;
+        start
+            .checked_add(self.capacity)
+            .ok_or_else(|| anyhow::anyhow!("virtio-mem region address overflow"))?;
+        self.start = start;
+        self.requested = crate::boot::mib_bytes(self.control.status().requested_size_mib)?;
         Ok(())
+    }
+
+    pub(crate) fn validate_ipa(&self, bits: u32) -> Result<()> {
+        crate::boot::validate_ipa_range(self.start, self.capacity, bits)
     }
 
     pub(crate) fn start(&self) {
@@ -223,7 +232,8 @@ impl VirtioMem {
     pub(crate) fn sync_target(&mut self, ready: bool) -> bool {
         let mut status = self.control.lock();
         status.driver_ready = ready;
-        let requested = status.requested_size_mib << 20;
+        // Accepted targets are bounded by the byte-checked region capacity.
+        let requested = status.requested_size_mib * crate::boot::MIB;
         if requested == self.requested {
             return false;
         }
@@ -279,7 +289,9 @@ impl VirtioMem {
         // Serialize target acceptance with the transaction and plugged-size update.
         let control = self.control.clone();
         let mut status = control.lock();
-        if kind == 0 && (self.count() + count) * 2 > status.requested_size_mib {
+        if kind == 0
+            && (self.count() + count) > status.requested_size_mib / (BLOCK / crate::boot::MIB)
+        {
             return Ok((1, 0));
         }
         if kind != 0
@@ -447,17 +459,19 @@ mod tests {
 
     #[test]
     fn capacity_and_lifecycle() {
-        for size in [0, 1, 129, 16512, u64::MAX] {
+        const H: u64 = HOTPLUG_BLOCK_SIZE / crate::boot::MIB;
+        for size in [0, 1, H + 1, u64::MAX, (u64::MAX / H) * H] {
             assert!(VirtioMem::new(size).is_err());
         }
         let mut max = VirtioMem::new(16384).unwrap();
-        assert!(max.attach(128).is_err());
-        let mut d = VirtioMem::new(128).unwrap();
+        max.attach(32768).unwrap();
+        max.validate_ipa(36).unwrap();
+        let mut d = VirtioMem::new(HOTPLUG_BLOCK_SIZE / crate::boot::MIB).unwrap();
         let c = d.control();
         assert_eq!(
             c.status(),
             MemoryStatus {
-                region_size_mib: 128,
+                region_size_mib: H,
                 requested_size_mib: 0,
                 plugged_size_mib: 0,
                 driver_ready: false,
@@ -465,28 +479,94 @@ mod tests {
             }
         );
         assert!(c.set_requested_mib(3).is_err());
-        assert!(c.set_requested_mib(130).is_err());
+        assert!(c.set_requested_mib(2 * H).is_err());
         std::thread::scope(|s| {
             for n in 0..32 {
                 let c = c.clone();
-                s.spawn(move || c.set_requested_mib(n * 2).unwrap());
+                s.spawn(move || c.set_requested_mib((n % 2) * H).unwrap());
             }
         });
-        c.set_requested_mib(128).unwrap();
+        c.set_requested_mib(H).unwrap();
         assert!(d.attach(u64::MAX).is_err());
-        assert!(d.attach(16257).is_err());
-        d.attach(16256).unwrap();
-        assert_eq!(d.start % ALIGN, 0);
-        assert_eq!(d.requested, 128 << 20);
+        d.attach(128 * H + 1).unwrap();
+        assert_eq!(d.start, crate::boot::RAM + 129 * HOTPLUG_BLOCK_SIZE);
+        assert_eq!(d.start % HOTPLUG_BLOCK_SIZE, 0);
+        assert_eq!(d.requested, HOTPLUG_BLOCK_SIZE);
         d.start();
         assert_eq!(c.status().lifecycle, MemoryLifecycle::Running);
         d.stop(&mut Fake::default());
         assert_eq!(c.status().lifecycle, MemoryLifecycle::Stopped);
         assert!(c.set_requested_mib(0).is_err());
-        let unused = VirtioMem::new(128).unwrap();
+        let unused = VirtioMem::new(HOTPLUG_BLOCK_SIZE / crate::boot::MIB).unwrap();
         let c = unused.control();
         drop(unused);
         assert_eq!(c.status().lifecycle, MemoryLifecycle::Stopped);
+    }
+
+    #[test]
+    fn region_address_boundaries() {
+        const H: u64 = HOTPLUG_BLOCK_SIZE / crate::boot::MIB;
+        let mut d = VirtioMem::new(2 * H).unwrap();
+        for target in [0, H, 2 * H] {
+            d.control().set_requested_mib(target).unwrap();
+        }
+        for target in [1, H - 1, H + 1, 3 * H, u64::MAX] {
+            assert!(d.control().set_requested_mib(target).is_err());
+            assert_eq!(d.control().status().requested_size_mib, 2 * H);
+        }
+        let limit = 1u64 << 36;
+        let base_mib = (limit - crate::boot::RAM - d.capacity) / crate::boot::MIB;
+        d.attach(base_mib).unwrap();
+        d.validate_ipa(36).unwrap();
+        d.attach(base_mib + 1).unwrap();
+        assert!(d.validate_ipa(36).is_err()); // Include the alignment gap.
+        assert!(d.attach(u64::MAX / crate::boot::MIB).is_err()); // Base end.
+        assert!(
+            d.attach((u64::MAX - crate::boot::RAM) / crate::boot::MIB)
+                .is_err()
+        ); // Alignment.
+        let capacity = (u64::MAX / HOTPLUG_BLOCK_SIZE) * H;
+        let mut huge = VirtioMem::new(capacity).unwrap();
+        assert!(huge.attach(H).is_err()); // Region end.
+    }
+
+    #[test]
+    fn large_sparse_region_grows_and_reclaims_allocations() {
+        const H: u64 = HOTPLUG_BLOCK_SIZE / crate::boot::MIB;
+        let mut d = VirtioMem::new(32768).unwrap();
+        d.attach(512).unwrap();
+        let mut view = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mut mapper = Fake::default();
+        let mut allocations = Vec::new();
+        for target in [0, H, 2 * H, H, 0] {
+            d.control().set_requested_mib(target).unwrap();
+            let blocks = target * crate::boot::MIB / BLOCK;
+            let old = d.count();
+            if blocks != old {
+                let (kind, first, count) = if blocks > old {
+                    (0, old, blocks - old)
+                } else {
+                    (1, blocks, old - blocks)
+                };
+                assert_eq!(
+                    d.request(
+                        &req(kind, d.start + first * BLOCK, count.try_into().unwrap()),
+                        &mut mapper,
+                        &mut view,
+                        &[]
+                    )
+                    .unwrap()
+                    .0,
+                    0
+                );
+                allocations.extend(d.blocks.values().map(Arc::downgrade));
+            }
+            assert_eq!(d.count(), blocks);
+            assert_eq!(mapper.mapped.len() as u64, blocks);
+            assert_eq!(view.num_regions() as u64, blocks + 1);
+            assert_eq!(d.control().status().plugged_size_mib, target);
+        }
+        assert!(allocations.iter().all(|r| r.upgrade().is_none()));
     }
 
     #[test]
@@ -514,8 +594,10 @@ mod tests {
     }
 
     fn setup() -> (VirtioMem, GuestMemoryMmap, Fake) {
-        let mut d = VirtioMem::new(128).unwrap();
-        d.control().set_requested_mib(128).unwrap();
+        let mut d = VirtioMem::new(HOTPLUG_BLOCK_SIZE / crate::boot::MIB).unwrap();
+        d.control()
+            .set_requested_mib(HOTPLUG_BLOCK_SIZE / crate::boot::MIB)
+            .unwrap();
         d.attach(512).unwrap();
         (
             d,
@@ -596,7 +678,7 @@ mod tests {
                 .0,
             3
         );
-        d.control.set_requested_mib(2).unwrap();
+        d.control.set_requested_mib(0).unwrap();
         assert_eq!(
             d.request(&req(0, a, 1), &mut mapper, &mut view, &[])
                 .unwrap()
@@ -621,7 +703,7 @@ mod tests {
             (0, a, 0),
             (0, a + 1, 1),
             (0, a - BLOCK, 1),
-            (0, a + 128 * 1024 * 1024, 1),
+            (0, a + HOTPLUG_BLOCK_SIZE, 1),
             (0, u64::MAX, 2),
             (7, a, 1),
         ] {
@@ -671,7 +753,9 @@ mod tests {
 
     #[test]
     fn negotiation_generation_and_queue_response() {
-        let (d, mut view, mut mapper) = setup();
+        let (mut d, mut view, mut mapper) = setup();
+        d.control().set_requested_mib(0).unwrap();
+        d.attach(512).unwrap();
         let a = d.start;
         let mut mmio = Mmio::new(d);
         mmio.write(0x24, 1, &view).unwrap();
@@ -680,7 +764,10 @@ mod tests {
         assert_eq!(mmio.read(0x70, 4) & 8, 0);
         mmio.write(0x70, 0, &view).unwrap();
         initialize(&mut mmio, &view);
-        mmio.device.control.set_requested_mib(64).unwrap();
+        mmio.device
+            .control()
+            .set_requested_mib(HOTPLUG_BLOCK_SIZE / crate::boot::MIB)
+            .unwrap();
         assert!(mmio.device.sync_target(true));
         mmio.config_changed();
         assert_eq!(mmio.read(0xfc, 4), 1);

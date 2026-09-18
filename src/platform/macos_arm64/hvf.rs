@@ -23,6 +23,8 @@ pub struct Exit {
 unsafe extern "C" {
     fn hv_vm_get_max_vcpu_count(count: *mut u32) -> i32;
 
+    fn hv_vm_config_get_default_ipa_size(bits: *mut u32) -> i32;
+
     fn hv_vm_create(config: *const c_void) -> i32;
 
     fn hv_vm_destroy() -> i32;
@@ -190,6 +192,18 @@ impl Drop for Vm {
             hv_vm_destroy();
         }
     }
+}
+
+// Vm::new passes NULL configuration, so the default is this VM's actual width.
+pub fn ipa_bits() -> Result<u32> {
+    let mut bits = 0;
+    unsafe {
+        check(
+            hv_vm_config_get_default_ipa_size(&mut bits),
+            "default VM IPA size",
+        )?;
+    }
+    Ok(bits)
 }
 
 pub fn max_vcpus() -> Result<u32> {

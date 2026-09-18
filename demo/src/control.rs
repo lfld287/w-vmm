@@ -163,8 +163,8 @@ mod tests {
         );
         assert!(Server::bind(&path, control).is_err());
         assert_eq!(
-            request(&path, Request::MemorySet { requested_mib: 64 }).unwrap()["status"]["requested_size_mib"],
-            64
+            request(&path, Request::MemorySet { requested_mib: 128 }).unwrap()["status"]["requested_size_mib"],
+            128
         );
         assert_eq!(
             request(&path, Request::MemorySet { requested_mib: 3 }).unwrap()["ok"],
