@@ -84,7 +84,7 @@ impl SerialIo for Console {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    Vmm::new(VmConfig::default()).run::<Disk, Vmnet, _>(BTreeMap::new(), None, Console)?;
+    Vmm::new(VmConfig::default()).run::<Disk, Vmnet, _>(BTreeMap::new(), None, None, Console)?;
     Ok(())
 }
 ```
@@ -321,3 +321,23 @@ sudo env "PATH=$PATH" python3 scripts/smoke-net.py \
 目前无图形、快照、CPU 热添加或其他宿主平台。设备事件循环空闲等待最多 2 ms，网络每轮每方向最多处理 64 个包，存储请求同步执行，未做吞吐/延迟优化。非法设备访问/队列结构会报错并退出；普通磁盘请求 I/O 错误返回 virtio IOERR 并记录原因。此实现尚未经过不可信客户机的安全审计。
 
 第三方来源与许可见 [THIRD_PARTY.md](THIRD_PARTY.md)。
+
+## 第三方平台接入
+
+公共库支持 Linux / macOS 的 ARM64 与 x86_64。`run()` 在 Apple Silicon 上使用内置 HVF，其他目标返回错误并提示使用 `run_with_platform()`。`boot` API 和嵌入的 ARM64 镜像仅在 Apple Silicon macOS 上编译；demo 保持使用默认 HVF。
+
+完整可运行实现和调用见 [`examples/platform.rs`](examples/platform.rs)：
+
+```sh
+cargo run -p w-vmm --example platform
+```
+
+此示例通过端口 UART 输出一行文字后关机，无需虚拟化权限。外部项目需要 `anyhow = "1"`、`vm-memory = { version = "0.18", features = ["backend-mmap"] }` 和 `w-vmm`。覆盖多个 RAM 区间、virtio 队列、动态内存映射及故障注入的完整实现见 [`tests/platform.rs`](tests/platform.rs)，它仅使用公开 API。
+
+实现 `platform::Platform` 的 `layout` 和 `create`，关联的 VM 实现 `memory::Mapper` 与 `platform::VirtualMachine`。布局需求按磁盘名称排序，然后是网络、动态内存；返回相同顺序的 virtio-MMIO 区间。库校验地址溢出、区间重叠、RAM 总容量、设备数量与热插拔容量/对齐。端口与 MMIO 属于不同地址空间；UART 使用八个连续的字节寄存器。平台还须校验自身支持的 CPU 数量、映射粒度和 IRQ 范围。
+
+`prepare` 接收已映射的基础 RAM 和布局，由平台加载客户机、设置启动寄存器和中断控制器。`start` 启动执行，`poll_event` 返回 I/O、关机或轮询错误；无事件返回 `None`。I/O 的完成凭据由平台定义，库处理设备后调用 `complete_io`，平台回填寄存器并推进指令。平台与设备后端不要求 `Send` / `Sync`，线程约束由平台内部处理。
+
+`Mapper::map/unmap` 单次失败必须不留部分变更。映射借用分配，不能提前释放；`pause` 成功必须表示全部 vCPU 已静止。动态映射成功或回滚成功后恢复，回滚失败直接进入停止流程。`stop` 必须停止并回收所有 vCPU，支持部分启动和重复调用；VM 析构也必须支持重复清理。清理顺序为停止 vCPU、尝试刷新每块磁盘、撤销映射、销毁 VM，最后释放基础 RAM、动态 RAM 和回滚保留分配。
+
+`memory::VirtioMem` 封装私有设备，库根的 `VirtioMem` / `MemoryControl` / `MemoryStatus` / `MemoryLifecycle` 导出保持兼容。当前 guest 兼容约束仍要求容量和目标值为 128 MiB 的倍数、区域按 128 MiB 对齐，virtio-mem 协议块仍为 2 MiB；平台不推断或配置 guest 热插拔块大小。多架构接口不保证任意 guest 内核的热插拔兼容性。

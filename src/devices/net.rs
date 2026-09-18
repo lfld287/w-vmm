@@ -7,7 +7,7 @@ use vm_memory::{Bytes, GuestMemoryMmap};
 const HEADER: usize = 12; // VERSION_1 includes num_buffers even without MRG_RXBUF.
 const BUDGET: usize = 64;
 
-pub struct Net<ND: NetDevice> {
+pub(crate) struct Net<ND: NetDevice> {
     backend: ND,
     config: [u8; 12],
     rx: Vec<u8>,
@@ -15,7 +15,7 @@ pub struct Net<ND: NetDevice> {
 }
 
 impl<ND: NetDevice> Net<ND> {
-    pub fn new(backend: ND) -> Result<Self> {
+    pub(crate) fn new(backend: ND) -> Result<Self> {
         let max = backend.max_frame_len();
         ensure!(
             ND::MTU >= 68 && max >= ND::MTU as usize + 14 && max <= u16::MAX as usize + 18,

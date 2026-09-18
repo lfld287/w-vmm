@@ -7,7 +7,7 @@ use vm_memory::{Bytes, GuestMemoryMmap};
 
 const MAX_REQUEST: usize = 1024 * 1024;
 
-pub struct Block<BS: BlockStorage> {
+pub(crate) struct Block<BS: BlockStorage> {
     disk: BS,
     name: String,
     id: [u8; 20],
@@ -57,7 +57,7 @@ impl<BS: BlockStorage> VirtioDevice for Block<BS> {
 }
 
 impl<BS: BlockStorage> Block<BS> {
-    pub fn new(name: String, disk: BS) -> Result<Self> {
+    pub(crate) fn new(name: String, disk: BS) -> Result<Self> {
         ensure!(
             !name.is_empty()
                 && name.len() <= 20

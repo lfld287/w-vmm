@@ -1,7 +1,7 @@
-pub mod block;
-pub mod memory;
-pub mod mmio;
-pub mod net;
+pub(crate) mod block;
+pub(crate) mod memory;
+pub(crate) mod mmio;
+pub(crate) mod net;
 
 use crate::{net::NetDevice, storage::BlockStorage};
 use anyhow::Result;
@@ -9,7 +9,7 @@ use mmio::{Queues, VirtioDevice};
 use vm_memory::GuestMemoryMmap;
 
 /// Different device types share a transport without erasing backend types.
-pub enum Device<BS: BlockStorage, ND: NetDevice> {
+pub(crate) enum Device<BS: BlockStorage, ND: NetDevice> {
     Block(block::Block<BS>),
     Net(net::Net<ND>),
     Mem(memory::VirtioMem),

@@ -5,9 +5,9 @@ use virtio_bindings::bindings::virtio_config::VIRTIO_F_VERSION_1;
 use virtio_queue::{Queue, QueueOwnedT, QueueT, desc::split::Descriptor};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
-pub const MAX_QUEUE: u16 = 128;
+pub(crate) const MAX_QUEUE: u16 = 128;
 
-pub trait VirtioDevice {
+pub(crate) trait VirtioDevice {
     fn required_features(&self) -> u64 {
         0
     }
@@ -39,19 +39,19 @@ pub trait VirtioDevice {
     }
 }
 
-pub struct Chain {
-    pub head: u16,
-    pub descriptors: Vec<Descriptor>,
+pub(crate) struct Chain {
+    pub(crate) head: u16,
+    pub(crate) descriptors: Vec<Descriptor>,
 }
 
-pub struct Queues {
+pub(crate) struct Queues {
     pub(crate) rings: Vec<Queue>,
-    pub negotiated: u64,
+    pub(crate) negotiated: u64,
     interrupt: u32,
 }
 
 impl Queues {
-    pub fn pinned(&self, mem: &GuestMemoryMmap) -> Result<Vec<(u64, u64)>> {
+    pub(crate) fn pinned(&self, mem: &GuestMemoryMmap) -> Result<Vec<(u64, u64)>> {
         let mut pins = Vec::new();
         for q in self.rings.iter().filter(|q| q.ready()) {
             ensure!(q.is_valid(mem), "invalid live queue");
@@ -93,7 +93,7 @@ impl Queues {
         Ok(pins)
     }
 
-    pub fn available(&self, index: usize, mem: &GuestMemoryMmap) -> Result<u16> {
+    pub(crate) fn available(&self, index: usize, mem: &GuestMemoryMmap) -> Result<u16> {
         let q = &self.rings[index];
         ensure!(q.is_valid(mem), "invalid virtqueue");
         let count = q
@@ -104,7 +104,7 @@ impl Queues {
         Ok(count)
     }
 
-    pub fn pop(&mut self, index: usize, mem: &GuestMemoryMmap) -> Result<Option<Chain>> {
+    pub(crate) fn pop(&mut self, index: usize, mem: &GuestMemoryMmap) -> Result<Option<Chain>> {
         if self.available(index, mem)? == 0 {
             return Ok(None);
         }
@@ -139,7 +139,7 @@ impl Queues {
         anyhow::bail!("cyclic descriptor chain")
     }
 
-    pub fn complete(
+    pub(crate) fn complete(
         &mut self,
         index: usize,
         mem: &GuestMemoryMmap,
@@ -153,7 +153,7 @@ impl Queues {
     }
 }
 
-pub struct Mmio<D: VirtioDevice> {
+pub(crate) struct Mmio<D: VirtioDevice> {
     pub(crate) device: D,
     pub(crate) queues: Queues,
     feature_sel: u32,
@@ -164,7 +164,7 @@ pub struct Mmio<D: VirtioDevice> {
 }
 
 impl<D: VirtioDevice> Mmio<D> {
-    pub fn new(device: D) -> Self {
+    pub(crate) fn new(device: D) -> Self {
         let features = device.features() | (1 << VIRTIO_F_VERSION_1);
         let rings = (0..device.queue_count())
             .map(|_| Queue::new(MAX_QUEUE).unwrap())
@@ -184,15 +184,15 @@ impl<D: VirtioDevice> Mmio<D> {
         }
     }
 
-    pub fn interrupt_pending(&self) -> bool {
+    pub(crate) fn interrupt_pending(&self) -> bool {
         self.queues.interrupt != 0
     }
 
-    pub fn config_changed(&mut self) {
+    pub(crate) fn config_changed(&mut self) {
         self.queues.interrupt |= 2;
     }
 
-    pub fn flush(&self) -> Result<()> {
+    pub(crate) fn flush(&self) -> Result<()> {
         self.device.flush()
     }
 
@@ -200,14 +200,14 @@ impl<D: VirtioDevice> Mmio<D> {
         self.status & 0xcf == 0xf
     }
 
-    pub fn poll(&mut self, mem: &GuestMemoryMmap) -> Result<()> {
+    pub(crate) fn poll(&mut self, mem: &GuestMemoryMmap) -> Result<()> {
         if self.active() {
             self.device.poll(&mut self.queues, mem)?;
         }
         Ok(())
     }
 
-    pub fn read(&self, offset: u64, width: usize) -> u64 {
+    pub(crate) fn read(&self, offset: u64, width: usize) -> u64 {
         if !matches!(width, 1 | 2 | 4 | 8) {
             return 0;
         }
@@ -241,7 +241,7 @@ impl<D: VirtioDevice> Mmio<D> {
         }
     }
 
-    pub fn write(&mut self, offset: u64, value: u32, mem: &GuestMemoryMmap) -> Result<()> {
+    pub(crate) fn write(&mut self, offset: u64, value: u32, mem: &GuestMemoryMmap) -> Result<()> {
         match offset {
             0x14 => self.feature_sel = value,
             0x24 => self.driver_sel = value,
@@ -326,7 +326,7 @@ impl<D: VirtioDevice> Mmio<D> {
 }
 
 /// Copy a read-only device configuration, zero-filling unimplemented fields.
-pub fn read_config(config: &[u8], offset: usize, data: &mut [u8]) {
+pub(crate) fn read_config(config: &[u8], offset: usize, data: &mut [u8]) {
     for (i, byte) in data.iter_mut().enumerate() {
         *byte = config.get(offset + i).copied().unwrap_or(0);
     }
@@ -336,7 +336,7 @@ pub fn read_config(config: &[u8], offset: usize, data: &mut [u8]) {
 pub(crate) mod tests {
     use super::*;
 
-    pub fn initialize<D: VirtioDevice>(device: &mut Mmio<D>, mem: &GuestMemoryMmap) {
+    pub(crate) fn initialize<D: VirtioDevice>(device: &mut Mmio<D>, mem: &GuestMemoryMmap) {
         for (offset, value) in [
             (0x70, 1),
             (0x70, 3),

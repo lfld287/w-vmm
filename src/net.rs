@@ -8,9 +8,9 @@ pub mod macos;
 /// All methods are called on the VMM thread. Implementations need not be Send/Sync.
 pub trait NetDevice {
     const MTU: u16;
-    
+
     fn mac_address(&self) -> [u8; 6];
-    
+
     /// Maximum complete frame length; receive buffers are at least this large.
     fn max_frame_len(&self) -> usize;
 

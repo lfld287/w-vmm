@@ -13,8 +13,6 @@ resolver = "3"
 anyhow = "1"
 libc = "0.2"
 vm-memory = { version = "0.18", features = ["backend-mmap"] }
-linux-loader = "0.14"
-vm-fdt = "0.3"
 virtio-queue = "0.18"
 virtio-bindings = "0.2"
 vm-superio = "0.8"
@@ -23,6 +21,10 @@ imago = { version = "=0.2.5", default-features = false, features = ["sync"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6.2"
 dispatch2 = { version = "0.3.1", default-features = false, features = ["std"] }
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+linux-loader = "0.14"
+vm-fdt = "0.3"
 
 [profile.release]
 lto = "thin"

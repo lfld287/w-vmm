@@ -1,8 +1,8 @@
 //! Thin HVF binding, authored against Apple's SDK. See THIRD_PARTY.md for libkrun reference.
-use crate::{boot, devices::memory::Mapper};
+use crate::{boot, memory::Mapper};
 use anyhow::{Result, ensure};
 use std::{ffi::c_void, marker::PhantomData, rc::Rc};
-use vm_memory::{Address, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion};
+use vm_memory::{Address, GuestMemoryRegion};
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -106,50 +106,20 @@ pub fn kick(id: u64) {
 
 // !Send and !Sync: HVF VM/vCPU operations have owning-thread requirements.
 pub struct Vm {
-    base: GuestMemoryMmap,
-    pub view: GuestMemoryMmap,
-    mapped: bool,
     _thread: PhantomData<Rc<()>>,
 }
 
 impl Vm {
-    pub fn new(mem: GuestMemoryMmap) -> Result<Self> {
+    pub fn new() -> Result<Self> {
         unsafe {
             check(
                 hv_vm_create(std::ptr::null()),
-                "create VM (check ad-hoc hypervisor entitlement)",
+                "create VM (check hypervisor entitlement)",
             )?;
         }
-        let mut vm = Self {
-            view: mem.clone(),
-            base: mem,
-            mapped: false,
+        Ok(Self {
             _thread: PhantomData,
-        };
-        let region = vm.base.iter().next().unwrap();
-        let ptr = region.as_ptr();
-        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-        ensure!(
-            (ptr as usize).is_multiple_of(page) && (region.len() as usize).is_multiple_of(page),
-            "HVF host-page alignment"
-        );
-        unsafe {
-            check(
-                hv_vm_map(
-                    ptr.cast(),
-                    region.start_addr().raw_value(),
-                    region.len() as usize,
-                    7,
-                ),
-                "map RAM",
-            )?;
-        }
-        vm.mapped = true;
-        Ok(vm)
-    }
-
-    pub fn memory(&self) -> &GuestMemoryMmap {
-        &self.view
+        })
     }
 
     pub fn gic(&self) -> Result<(u64, [u32; 2])> {
@@ -186,9 +156,6 @@ impl Vm {
 impl Drop for Vm {
     fn drop(&mut self) {
         unsafe {
-            if self.mapped {
-                hv_vm_unmap(boot::RAM, self.base.iter().next().unwrap().len() as usize);
-            }
             hv_vm_destroy();
         }
     }
@@ -214,10 +181,16 @@ pub fn max_vcpus() -> Result<u32> {
     Ok(count)
 }
 
-pub struct Mapping;
-
-impl Mapper for Mapping {
+impl Mapper for Vm {
     fn map(&mut self, region: &vm_memory::GuestRegionMmap) -> Result<()> {
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        ensure!(
+            (region.as_ptr() as u64).is_multiple_of(page)
+                && region.len().is_multiple_of(page)
+                && region.start_addr().raw_value().is_multiple_of(page),
+            "HVF host-page alignment"
+        );
+        boot::validate_ipa_range(region.start_addr().raw_value(), region.len(), ipa_bits()?)?;
         unsafe {
             check(
                 hv_vm_map(

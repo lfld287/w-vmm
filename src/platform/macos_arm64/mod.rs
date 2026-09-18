@@ -1,200 +1,172 @@
-//! HVF workers own vCPUs; the caller exclusively owns all device backends.
+//! HVF workers retain vCPU thread ownership and PSCI handling.
 mod cpus;
 mod hvf;
-use super::VmRuntime;
-use crate::{
-    VirtioMem, VmConfig, boot,
-    devices::{Device, block::Block, mmio::Mmio, net::Net},
-    net::NetDevice,
-    serial::{SerialIo, poll_input},
-    storage::BlockStorage,
-};
-use anyhow::{Result, bail, ensure};
-use std::{collections::BTreeMap, sync::mpsc, time::Duration};
-use vm_memory::{GuestAddress, GuestMemoryMmap};
-use vm_superio::{Serial, Trigger};
+use super::*;
+use crate::boot;
+use std::sync::mpsc;
+use vm_memory::GuestRegionMmap;
 
-pub(super) struct Backend;
-
-impl VmRuntime for Backend {
-    fn run<BS: BlockStorage, ND: NetDevice, SI: SerialIo>(
-        config: &VmConfig,
-        blocks: BTreeMap<String, BS>,
-        net: Option<ND>,
-        mut memory: Option<VirtioMem>,
-        serial: SI,
-    ) -> Result<()> {
-        let layout = boot::Layout::new(config.memory_mib, boot::KERNEL, boot::INITRD.len())?;
+/// Built-in Apple Silicon platform using the bundled ARM64 guest.
+pub struct Hvf;
+pub struct Vm {
+    cpus: Option<cpus::Cpus>,
+    rx: Option<mpsc::Receiver<cpus::Event>>,
+    inner: hvf::Vm,
+    config: VmConfig,
+    boot: Option<boot::Layout>,
+}
+impl Platform for Hvf {
+    type Vm = Vm;
+    fn layout(&self, config: &VmConfig, devices: &DeviceRequirements) -> Result<MachineLayout> {
+        let boot = boot::Layout::new(config.memory_mib, boot::KERNEL, boot::INITRD.len())?;
         ensure!(
             (1..=hvf::max_vcpus()?).contains(&config.vcpu_count),
             "vCPU count outside HVF supported range"
         );
-        let ipa_bits = hvf::ipa_bits()?;
-        boot::validate_ipa_range(boot::RAM, u64::try_from(layout.size)?, ipa_bits)?;
-        if let Some(d) = &mut memory {
-            d.attach(config.memory_mib)?;
-            d.validate_ipa(ipa_bits)?;
+        let ram = MemoryRange {
+            address: boot::RAM,
+            size: boot.size as u64,
+        };
+        let hotplug = devices
+            .hotplug
+            .as_ref()
+            .map(|n| -> Result<_> {
+                let address = ram
+                    .address
+                    .checked_add(ram.size)
+                    .and_then(|a| a.checked_next_multiple_of(n.alignment))
+                    .ok_or_else(|| anyhow::anyhow!("hotplug overflow"))?;
+                Ok(MemoryRange {
+                    address,
+                    size: n.capacity,
+                })
+            })
+            .transpose()?;
+        for r in std::iter::once(&ram).chain(hotplug.iter()) {
+            boot::validate_ipa_range(r.address, r.size, hvf::ipa_bits()?)?;
         }
-        let has_memory = memory.is_some();
-        let regions = boot::virtio_regions(
-            blocks.len() + usize::from(net.is_some()) + usize::from(has_memory),
-        )?;
-        let mut devices: Vec<Mmio<Device<BS, ND>>> = blocks
-            .into_iter()
-            .map(|(name, disk)| Block::new(name, disk).map(|b| Mmio::new(Device::Block(b))))
-            .collect::<Result<_>>()?;
-        if let Some(net) = net {
-            devices.push(Mmio::new(Device::Net(Net::new(net)?)));
-        }
-        if let Some(memory) = memory {
-            devices.push(Mmio::new(Device::Mem(memory)));
-        }
-        // All failures from VM setup onward still attempt every backend flush.
-        let mut vm_slot = None;
-        let result = (|| -> Result<()> {
-            let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(boot::RAM), layout.size)])?;
-            vm_slot = Some(hvf::Vm::new(mem)?);
-            let vm = vm_slot.as_mut().unwrap();
-            let (redist, timers) = vm.gic()?;
-            hvf::validate_irqs(&regions)?;
-            let dtb = boot::fdt(
-                &layout,
-                &regions,
-                redist,
-                timers,
-                config.vcpu_count,
-                has_memory,
-            )?;
-            boot::load(vm.memory(), &layout, &dtb)?;
-            let (tx, rx) = mpsc::channel();
-            let cpus = cpus::Cpus::create(config.vcpu_count, tx)?;
-            for device in &devices {
-                if let Device::Mem(d) = &device.device {
-                    d.start();
-                }
-            }
-            cpus.start(layout.entry, layout.dtb);
-            let mut serial = Serial::new(Irq, serial);
-            loop {
-                if poll_input(&mut serial)? {
-                    break;
-                }
-                hvf::spi(
-                    boot::UART_IRQ,
-                    serial.state().interrupt_identification & 1 == 0,
-                )?;
-                for device in &mut devices {
-                    device.poll(vm.memory())?;
-                }
-                if has_memory {
-                    let last = devices.len() - 1;
-                    let active = devices[last].active();
-                    if let Device::Mem(d) = &mut devices[last].device
-                        && d.sync_target(active)
-                    {
-                        devices[last].config_changed();
-                    }
-                    if active && devices[last].queues.available(0, vm.memory())? != 0 {
-                        let _pause = cpus.shared.pause()?;
-                        let pinned = devices
-                            .iter()
-                            .map(|d| d.queues.pinned(vm.memory()))
-                            .collect::<Result<Vec<_>>>()?
-                            .into_iter()
-                            .flatten()
-                            .collect::<Vec<_>>();
-                        let device = &mut devices[last];
-                        if let Device::Mem(d) = &mut device.device {
-                            d.process(
-                                &mut device.queues,
-                                &mut hvf::Mapping,
-                                &mut vm.view,
-                                &pinned,
-                            )?;
-                        }
-                    }
-                }
-                for (device, region) in devices.iter().zip(&regions) {
-                    hvf::spi(region.irq, device.interrupt_pending())?;
-                }
-                match rx.recv_timeout(Duration::from_millis(2)) {
-                    Ok(cpus::Event::Failed(error)) => return Err(error),
-                    Ok(cpus::Event::Shutdown) => break,
-                    Ok(cpus::Event::Access(a)) => {
-                        let value =
-                            if (boot::UART..boot::UART + 8).contains(&a.addr) && a.width == 1 {
-                                let offset = (a.addr - boot::UART) as u8;
-                                if a.write {
-                                    serial.write(offset, a.value as u8)?;
-                                    0
-                                } else {
-                                    serial.read(offset) as u64
-                                }
-                            } else if let Some(slot) = a
-                                .addr
-                                .checked_sub(boot::VIRTIO_BASE)
-                                .and_then(|o| usize::try_from(o / boot::VIRTIO_STRIDE).ok())
-                                .filter(|&s| s < devices.len())
-                            {
-                                let offset = a.addr - regions[slot].address;
-                                if a.write {
-                                    ensure!(a.width == 4, "virtio MMIO writes must be 32 bit");
-                                    devices[slot].write(offset, a.value as u32, vm.memory())?;
-                                    0
-                                } else {
-                                    devices[slot].read(offset, a.width)
-                                }
-                            } else {
-                                bail!("unmapped MMIO {:#x}, size {}", a.addr, a.width);
-                            };
-                        let _ = a.reply.send(value);
-                    }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        bail!("all vCPU event senders disconnected")
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        if cpus.stopping() {
-                            // Worker posts the failure/shutdown event before finishing.
-                            if let Ok(cpus::Event::Failed(e)) = rx.try_recv() {
-                                return Err(e);
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-            Ok(())
-        })();
-        // The closure has joined all vCPUs, including on startup/runtime errors.
-        let mut flushed = Ok(());
-        for device in &devices {
-            if let Err(e) = device.flush() {
-                eprintln!("final device flush: {e:#}");
-                if flushed.is_ok() {
-                    flushed = Err(e);
-                }
-            }
-        }
-        if vm_slot.is_some() {
-            for device in &devices {
-                if let Device::Mem(d) = &device.device {
-                    d.stop(&mut hvf::Mapping);
-                }
-            }
-        }
-        // HVF destruction must precede release of device-owned rollback allocations.
-        drop(vm_slot);
-        drop(devices);
-        result.and(flushed)
+        Ok(MachineLayout {
+            ram: vec![ram],
+            hotplug,
+            uart: IoRegion {
+                space: IoSpace::Mmio,
+                address: boot::UART,
+                size: 8,
+                irq: boot::UART_IRQ,
+            },
+            virtio: boot::virtio_regions(devices.devices.len())?
+                .iter()
+                .map(|r| IoRegion {
+                    space: IoSpace::Mmio,
+                    address: r.address,
+                    size: boot::VIRTIO_STRIDE,
+                    irq: r.irq,
+                })
+                .collect(),
+        })
+    }
+    fn create(&self, config: &VmConfig) -> Result<Vm> {
+        Ok(Vm {
+            cpus: None,
+            rx: None,
+            inner: hvf::Vm::new()?,
+            config: config.clone(),
+            boot: None,
+        })
     }
 }
-
-struct Irq;
-
-impl Trigger for Irq {
-    type E = std::io::Error;
-
-    fn trigger(&self) -> std::io::Result<()> {
+impl Mapper for Vm {
+    fn map(&mut self, region: &GuestRegionMmap) -> Result<()> {
+        self.inner.map(region)
+    }
+    fn unmap(&mut self, region: &GuestRegionMmap) -> Result<()> {
+        self.inner.unmap(region)
+    }
+}
+impl VirtualMachine for Vm {
+    type Completion = mpsc::SyncSender<u64>;
+    fn prepare(&mut self, memory: &GuestMemoryMmap, layout: &MachineLayout) -> Result<()> {
+        let boot = boot::Layout::new(self.config.memory_mib, boot::KERNEL, boot::INITRD.len())?;
+        let regions = layout
+            .virtio
+            .iter()
+            .map(|r| boot::VirtioRegion {
+                address: r.address,
+                irq: r.irq,
+            })
+            .collect::<Vec<_>>();
+        let (redist, timers) = self.inner.gic()?;
+        hvf::validate_irqs(&regions)?;
+        let dtb = boot::fdt(
+            &boot,
+            &regions,
+            redist,
+            timers,
+            self.config.vcpu_count,
+            layout.hotplug.is_some(),
+        )?;
+        boot::load(memory, &boot, &dtb)?;
+        let (tx, rx) = mpsc::channel();
+        self.cpus = Some(cpus::Cpus::create(self.config.vcpu_count, tx)?);
+        self.rx = Some(rx);
+        self.boot = Some(boot);
         Ok(())
+    }
+    fn start(&mut self) -> Result<()> {
+        let b = self
+            .boot
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("VM not prepared"))?;
+        self.cpus.as_ref().unwrap().start(b.entry, b.dtb);
+        Ok(())
+    }
+    fn poll_event(&mut self, timeout: Duration) -> Result<Option<Event<Self::Completion>>> {
+        match self.rx.as_ref().unwrap().recv_timeout(timeout) {
+            Ok(cpus::Event::Shutdown) => Ok(Some(Event::Shutdown)),
+            Ok(cpus::Event::Failed(e)) => Err(e),
+            Ok(cpus::Event::Access(a)) => Ok(Some(Event::Io(IoAccess {
+                space: IoSpace::Mmio,
+                address: a.addr,
+                width: a.width,
+                write: a.write,
+                value: a.value,
+                completion: a.reply,
+            }))),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("all vCPU event senders disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if self.cpus.as_ref().unwrap().stopping() {
+                    if let Ok(cpus::Event::Failed(e)) = self.rx.as_ref().unwrap().try_recv() {
+                        return Err(e);
+                    }
+                    Ok(Some(Event::Shutdown))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    }
+    fn complete_io(&mut self, completion: Self::Completion, value: u64) -> Result<()> {
+        let _ = completion.send(value);
+        Ok(())
+    }
+    fn set_irq(&mut self, irq: u32, level: bool) -> Result<()> {
+        hvf::spi(irq, level)
+    }
+    fn pause(&mut self) -> Result<()> {
+        self.cpus.as_ref().unwrap().shared.pause()
+    }
+    fn resume(&mut self) -> Result<()> {
+        self.cpus.as_ref().unwrap().shared.resume();
+        Ok(())
+    }
+    fn stop(&mut self) {
+        self.cpus.take();
+    }
+}
+impl Drop for Vm {
+    fn drop(&mut self) {
+        self.stop();
     }
 }

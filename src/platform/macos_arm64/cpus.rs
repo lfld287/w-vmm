@@ -115,7 +115,7 @@ impl Shared {
         }
     }
 
-    pub fn pause(&self) -> Result<Pause<'_>> {
+    pub fn pause(&self) -> Result<()> {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         s.paused = true;
         while s.running.iter().any(|r| *r) && !s.stop {
@@ -127,17 +127,15 @@ impl Shared {
                 .0;
         }
         ensure!(!s.stop, "VM stopped during memory transaction");
-        Ok(Pause(self))
+        Ok(())
     }
 }
 
-pub struct Pause<'a>(&'a Shared);
-
-impl Drop for Pause<'_> {
-    fn drop(&mut self) {
-        let mut s = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+impl Shared {
+    pub fn resume(&self) {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         s.paused = false;
-        self.0.changed.notify_all();
+        self.changed.notify_all();
     }
 }
 
@@ -409,9 +407,10 @@ mod tests {
             worker.changed.notify_all();
         });
         {
-            let _p = s.pause().unwrap();
+            s.pause().unwrap();
             assert!(s.state.lock().unwrap_or_else(|e| e.into_inner()).paused);
         }
+        s.resume();
         t.join().unwrap();
         assert!(!s.state.lock().unwrap_or_else(|e| e.into_inner()).paused);
         s.stop();

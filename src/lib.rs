@@ -1,10 +1,11 @@
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-compile_error!("w-vmm requires Apple Silicon macOS 15+");
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub mod boot;
 mod devices;
+pub mod memory;
 pub mod net;
-mod platform;
-pub use devices::memory::{MemoryControl, MemoryLifecycle, MemoryStatus, VirtioMem};
+pub mod platform;
+mod runtime;
+pub use memory::{MemoryControl, MemoryLifecycle, MemoryStatus, VirtioMem};
 pub mod serial;
 pub mod storage;
 use anyhow::Result;
@@ -37,6 +38,23 @@ impl Vmm {
         Self { config }
     }
 
+    /// Run using a caller-provided platform and the built-in devices.
+    pub fn run_with_platform<
+        P: platform::Platform,
+        BS: BlockStorage,
+        ND: NetDevice,
+        SI: SerialIo,
+    >(
+        self,
+        platform: P,
+        blocks: BTreeMap<String, BS>,
+        net: Option<ND>,
+        memory: Option<VirtioMem>,
+        serial: SI,
+    ) -> Result<()> {
+        runtime::run(&self.config, platform, blocks, net, memory, serial)
+    }
+
     /// Run with named disks, optional Ethernet and memory devices, and a serial backend.
     /// Disk names (1..20 ASCII letters, digits, '.', '_' or '-') become virtio serials.
     /// Devices are attached in name order; Linux assigns its own /dev/vd* names.
@@ -53,7 +71,7 @@ impl Vmm {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
 
