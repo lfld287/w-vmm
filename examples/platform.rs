@@ -177,15 +177,15 @@ impl NetDevice for NoNet {
 }
 
 fn main() -> Result<()> {
-    Vmm::new(VmConfig {
-        memory_mib: 2,
-        vcpu_count: 1,
-    })
-    .run_with_platform(
-        InProcess,
+    Vmm::new(
+        VmConfig {
+            memory_mib: 2,
+            vcpu_count: 1,
+        },
         BTreeMap::<String, Disk>::new(),
         None::<NoNet>,
         None,
         Console,
     )
+    .run_with_platform(InProcess)
 }

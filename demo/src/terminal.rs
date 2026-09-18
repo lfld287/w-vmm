@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use signal_hook::{
     SigId,
     consts::{SIGHUP, SIGINT, SIGTERM},
@@ -26,17 +26,19 @@ pub struct TerminalGuard {
     notify: UnixStream,
     closing: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    read: Option<UnixStream>,
 }
 
 impl TerminalGuard {
-    fn new(control: VmControl) -> Result<Self> {
-        let (mut read, notify) = UnixStream::pair()?;
+    fn new() -> Result<Self> {
+        let (read, notify) = UnixStream::pair()?;
         notify.set_nonblocking(true)?;
         let mut guard = Self {
             signals: vec![],
             notify,
             closing: Arc::new(AtomicBool::new(false)),
             thread: None,
+            read: Some(read),
         };
         for sig in [SIGINT, SIGTERM, SIGHUP] {
             guard.signals.push(signal_hook::low_level::pipe::register(
@@ -44,8 +46,14 @@ impl TerminalGuard {
                 guard.notify.try_clone()?,
             )?);
         }
-        let closing = guard.closing.clone();
-        guard.thread = Some(thread::Builder::new().name("terminal-stop".into()).spawn(
+        Ok(guard)
+    }
+
+    pub fn bind(&mut self, control: VmControl) -> Result<()> {
+        ensure!(self.thread.is_none(), "terminal guard is already bound");
+        let mut read = self.read.as_ref().unwrap().try_clone()?;
+        let closing = self.closing.clone();
+        self.thread = Some(thread::Builder::new().name("terminal-stop".into()).spawn(
             move || {
                 let mut byte = [0];
                 loop {
@@ -62,7 +70,8 @@ impl TerminalGuard {
                 }
             },
         )?);
-        Ok(guard)
+        self.read.take();
+        Ok(())
     }
 }
 
@@ -81,8 +90,8 @@ impl Drop for TerminalGuard {
 }
 
 impl Terminal {
-    pub fn new(control: VmControl) -> Result<(Self, TerminalGuard)> {
-        let guard = TerminalGuard::new(control)?;
+    pub fn new() -> Result<(Self, TerminalGuard)> {
+        let guard = TerminalGuard::new()?;
         let flags = unsafe { libc::fcntl(0, libc::F_GETFL) };
         let mut t = Self {
             saved: None,
@@ -139,10 +148,7 @@ impl SerialIo for Terminal {
                     if matches!(
                         e.kind(),
                         io::ErrorKind::WouldBlock | io::ErrorKind::BrokenPipe
-                    ) =>
-                {
-                    ()
-                }
+                    ) => {}
                 Err(e) => return Err(e),
             }
             return Ok(p);
@@ -161,5 +167,35 @@ impl Drop for Terminal {
                 libc::fcntl(0, libc::F_SETFL, self.flags);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn notification_before_bind_is_retained_and_binding_is_once() {
+        let mut guard = TerminalGuard::new().unwrap();
+        guard.notify.write_all(&[1]).unwrap();
+        let vm = crate::control::tests::test_vm(Some(w_vmm::VirtioMem::new(128).unwrap()));
+        let control = vm.control();
+        guard.bind(control.clone()).unwrap();
+        assert!(guard.bind(control.clone()).is_err());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while control.status().lifecycle != w_vmm::VmLifecycle::Stopped {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            control.memory_status().unwrap().lifecycle,
+            w_vmm::MemoryLifecycle::Stopped
+        );
+        assert!(control.set_requested_mib(0).is_err());
+        drop(vm);
+        drop(guard);
+    }
+    #[test]
+    fn unbound_guard_can_be_dropped() {
+        drop(TerminalGuard::new().unwrap());
     }
 }

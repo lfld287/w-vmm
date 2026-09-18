@@ -1,4 +1,5 @@
 //! Synchronous, thread-safe control of a VM owned by another thread.
+use crate::memory::{MemoryControl, MemoryLifecycle, MemoryStatus};
 use anyhow::{Result, bail, ensure};
 use std::{
     collections::VecDeque,
@@ -32,6 +33,7 @@ pub struct VmControl(Arc<Shared>);
 struct Shared {
     state: Mutex<State>,
     changed: Condvar,
+    memory: Option<MemoryControl>,
 }
 
 struct State {
@@ -60,7 +62,7 @@ fn result(error: &Option<String>) -> Result<()> {
 }
 
 impl VmControl {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(memory: Option<MemoryControl>) -> Self {
         Self(Arc::new(Shared {
             state: Mutex::new(State {
                 status: VmStatus {
@@ -72,7 +74,39 @@ impl VmControl {
                 cleanup_error: None,
             }),
             changed: Condvar::new(),
+            memory,
         }))
+    }
+
+    /// Whether virtio-mem was configured, independent of driver readiness.
+    pub fn supports_memory(&self) -> bool {
+        self.0.memory.is_some()
+    }
+
+    fn memory(&self) -> Result<&MemoryControl> {
+        self.0
+            .memory
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("virtio-mem is not configured"))
+    }
+
+    /// Read the current or final memory state; errors if virtio-mem is absent.
+    pub fn memory_status(&self) -> Result<MemoryStatus> {
+        Ok(self.memory()?.status())
+    }
+
+    /// Accept a target before startup, while running, or while paused.
+    /// The guest reaches it asynchronously while running. Stopped VMs reject it.
+    pub fn set_requested_mib(&self, requested: u64) -> Result<()> {
+        self.memory()?.set_requested_mib(requested)
+    }
+
+    fn stop_memory(&self) {
+        if let Some(memory) = &self.0.memory {
+            let mut state = memory.lock();
+            state.lifecycle = MemoryLifecycle::Stopped;
+            state.driver_ready = false;
+        }
     }
 
     pub fn status(&self) -> VmStatus {
@@ -114,6 +148,8 @@ impl VmControl {
 
     /// Wait for workers, disk flushing and resource destruction. Repeated calls
     /// return the saved cleanup result. Calling before run cancels this VM.
+    /// In that case memory stops immediately; devices remain owned by `Vmm`
+    /// until it is consumed or dropped.
     pub fn stop(&self) -> Result<()> {
         let mut s = self.0.state.lock().unwrap();
         ensure!(
@@ -121,6 +157,7 @@ impl VmControl {
             "blocking VM control on the VMM thread"
         );
         if s.status.lifecycle == VmLifecycle::Created {
+            self.stop_memory();
             s.status.lifecycle = VmLifecycle::Stopped;
         } else if s.status.lifecycle != VmLifecycle::Stopped {
             s.status.lifecycle = VmLifecycle::Stopping;
@@ -197,6 +234,7 @@ impl VmControl {
     }
 
     pub(crate) fn finish(&self, outcome: &Result<()>) {
+        self.stop_memory();
         let mut s = self.0.state.lock().unwrap();
         s.status.lifecycle = VmLifecycle::Stopped;
         s.status.final_error = outcome.as_ref().err().map(|e| format!("{e:#}"));
@@ -221,26 +259,23 @@ impl VmControl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{VmConfig, Vmm};
 
     #[test]
     fn unused_cancelled_and_owner_thread() {
         fn thread_safe<T: Clone + Send + Sync>() {}
         thread_safe::<VmControl>();
-        let vm = Vmm::new(VmConfig::default());
-        let c = vm.control();
+        let c = VmControl::new(None);
         assert!(c.pause().is_err());
         assert!(c.resume().is_err());
         c.stop().unwrap();
         c.stop().unwrap();
         assert!(c.begin().is_err());
-        drop(vm);
+        c.dropped();
         assert_eq!(c.status().lifecycle, VmLifecycle::Stopped);
-        let vm = Vmm::new(VmConfig::default());
-        let c = vm.control();
-        drop(vm);
+        let c = VmControl::new(None);
+        c.dropped();
         assert_eq!(c.status().lifecycle, VmLifecycle::Stopped);
-        let c = VmControl::new();
+        let c = VmControl::new(None);
         c.begin().unwrap();
         c.running();
         for r in [c.pause(), c.resume(), c.stop()] {
@@ -251,7 +286,7 @@ mod tests {
     #[test]
     fn paused_wait_ignores_spurious_notifications_and_keeps_queued_wakes() {
         use std::time::Duration;
-        let c = VmControl::new();
+        let c = VmControl::new(None);
         c.0.state.lock().unwrap().status.lifecycle = VmLifecycle::Paused;
         let (done, rx) = mpsc::channel();
         let waiter = c.clone();
@@ -283,7 +318,7 @@ mod tests {
 
     #[test]
     fn stop_cancels_queue_and_waits_for_saved_cleanup_result() {
-        let c = VmControl::new();
+        let c = VmControl::new(None);
         c.begin().unwrap();
         c.running();
         let other = c.clone();

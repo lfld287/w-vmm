@@ -385,37 +385,40 @@ impl NetDevice for NoNet {
 fn run(fault: Fault, port: bool, base: u64) -> Shared {
     let state = Shared::default();
     let memory = VirtioMem::new(128).unwrap();
-    let control = memory.control();
-    control.set_requested_mib(128).unwrap();
     let blocks = [
         ("z".into(), Disk(state.clone(), fault == Fault::Flush)),
         ("a".into(), Disk(state.clone(), fault == Fault::Flush)),
     ]
     .into_iter()
     .collect::<BTreeMap<_, _>>();
-    let result = Vmm::new(VmConfig {
-        memory_mib: 2,
-        vcpu_count: 1,
-    })
-    .run_with_platform(
-        TestPlatform {
-            state: state.clone(),
-            fault,
-            port,
-            base,
+    let vm = Vmm::new(
+        VmConfig {
+            memory_mib: 2,
+            vcpu_count: 1,
         },
         blocks,
         None::<NoNet>,
         Some(memory),
         Serial(state.clone()),
     );
+    let control = vm.control();
+    control.set_requested_mib(128).unwrap();
+    let result = vm.run_with_platform(TestPlatform {
+        state: state.clone(),
+        fault,
+        port,
+        base,
+    });
     assert_eq!(
         result.is_ok(),
         matches!(fault, Fault::None | Fault::Map),
         "{fault:?}: {result:?}"
     );
-    assert_eq!(control.status().lifecycle, MemoryLifecycle::Stopped);
-    assert!(!control.status().driver_ready);
+    assert_eq!(
+        control.memory_status().unwrap().lifecycle,
+        MemoryLifecycle::Stopped
+    );
+    assert!(!control.memory_status().unwrap().driver_ready);
     assert!(control.set_requested_mib(0).is_err());
     let s = state.borrow();
     assert!(
@@ -447,7 +450,7 @@ fn run(fault: Fault, port: bool, base: u64) -> Shared {
         assert_eq!(s.log.contains(&"resume".into()), fault != Fault::Rollback);
         if fault == Fault::None {
             assert!(s.irqs.contains(&(12, true)));
-            assert_eq!(control.status().plugged_size_mib, 4);
+            assert_eq!(control.memory_status().unwrap().plugged_size_mib, 4);
         }
     }
     if fault == Fault::Pause {
@@ -493,7 +496,17 @@ fn errors_and_transaction_rollback_cleanup() {
 #[test]
 fn dropping_unused_memory_stops_control() {
     let m = VirtioMem::new(128).unwrap();
-    let c = m.control();
-    drop(m);
-    assert_eq!(c.status().lifecycle, MemoryLifecycle::Stopped);
+    let vm = Vmm::new(
+        VmConfig::default(),
+        BTreeMap::<String, Disk>::new(),
+        None::<NoNet>,
+        Some(m),
+        Serial(Shared::default()),
+    );
+    let c = vm.control();
+    drop(vm);
+    assert_eq!(
+        c.memory_status().unwrap().lifecycle,
+        MemoryLifecycle::Stopped
+    );
 }

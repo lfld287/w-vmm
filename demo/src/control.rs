@@ -18,7 +18,7 @@ use std::{
     thread::JoinHandle,
     time::Duration,
 };
-use w_vmm::{MemoryControl, VmControl};
+use w_vmm::VmControl;
 const LIMIT: usize = 4096;
 const TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -33,9 +33,11 @@ pub enum Request {
     MemorySet { requested_mib: u64 },
 }
 
-fn status(control: &MemoryControl) -> Value {
-    let s = control.status();
-    json!({"region_size_mib": s.region_size_mib, "requested_size_mib": s.requested_size_mib, "plugged_size_mib": s.plugged_size_mib, "driver_ready": s.driver_ready, "lifecycle": format!("{:?}", s.lifecycle)})
+fn status(control: &VmControl) -> Result<Value> {
+    let s = control.memory_status()?;
+    Ok(
+        json!({"region_size_mib": s.region_size_mib, "requested_size_mib": s.requested_size_mib, "plugged_size_mib": s.plugged_size_mib, "driver_ready": s.driver_ready, "lifecycle": format!("{:?}", s.lifecycle)}),
+    )
 }
 
 fn line(stream: &mut UnixStream) -> Result<Vec<u8>> {
@@ -69,7 +71,7 @@ fn line(stream: &mut UnixStream) -> Result<Vec<u8>> {
     }
 }
 
-fn serve(mut stream: UnixStream, vm: &VmControl, memory: Option<&MemoryControl>) -> Result<()> {
+fn serve(mut stream: UnixStream, vm: &VmControl) -> Result<()> {
     stream
         .set_write_timeout(Some(TIMEOUT))
         .context("set write timeout")?;
@@ -77,12 +79,11 @@ fn serve(mut stream: UnixStream, vm: &VmControl, memory: Option<&MemoryControl>)
         let request = serde_json::from_slice::<Request>(&line(&mut stream)?)?;
         match request {
             Request::MemoryStatus | Request::MemorySet { .. } => {
-                let control =
-                    memory.ok_or_else(|| anyhow::anyhow!("virtio-mem is not configured"))?;
+                let control = vm;
                 if let Request::MemorySet { requested_mib } = request {
                     control.set_requested_mib(requested_mib)?;
                 }
-                Ok(json!({"ok": true, "status": status(control)}))
+                Ok(json!({"ok": true, "status": status(control)?}))
             }
             _ => {
                 match request {
@@ -112,7 +113,7 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn bind(path: &Path, control: VmControl, memory: Option<MemoryControl>) -> Result<Self> {
+    pub fn bind(path: &Path, control: VmControl) -> Result<Self> {
         // bind atomically refuses any existing file, symlink or socket.
         let listener = UnixListener::bind(path)?;
         let meta = fs::symlink_metadata(path)?;
@@ -146,11 +147,10 @@ impl Server {
                         match listener.accept() {
                             Ok((stream, _)) => {
                                 let control = control.clone();
-                                let memory = memory.clone();
                                 match std::thread::Builder::new()
                                     .name("vm-control-client".into())
                                     .spawn(move || {
-                                        let _ = serve(stream, &control, memory.as_ref());
+                                        let _ = serve(stream, &control);
                                     }) {
                                     Ok(t) => connections.push(t),
                                     Err(_) => break,
@@ -204,17 +204,42 @@ pub fn request(path: &Path, request: Request) -> Result<Value> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use w_vmm::VirtioMem;
+    pub(crate) fn test_vm(
+        memory: Option<VirtioMem>,
+    ) -> w_vmm::Vmm<w_vmm::storage::Disk, w_vmm::net::macos::Vmnet, TestSerial> {
+        w_vmm::Vmm::new(
+            w_vmm::VmConfig::default(),
+            Default::default(),
+            None,
+            memory,
+            TestSerial,
+        )
+    }
+    pub(crate) struct TestSerial;
+    impl std::io::Write for TestSerial {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl w_vmm::serial::SerialIo for TestSerial {
+        fn recv(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
 
     #[test]
     fn vm_only_concurrent_clients_and_stop_response() {
         let dir = std::env::temp_dir().join(format!("w-vmm-lifecycle-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("control.sock");
-        let vm = w_vmm::Vmm::new(w_vmm::VmConfig::default());
-        let server = Server::bind(&path, vm.control(), None).unwrap();
+        let vm = test_vm(None);
+        let server = Server::bind(&path, vm.control()).unwrap();
         // A client sending no newline must not block status or stop clients.
         let idle = UnixStream::connect(&path).unwrap();
         let clients: Vec<_> = (0..8)
@@ -250,14 +275,13 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("control.sock");
         let memory = VirtioMem::new(128).unwrap();
-        let control = memory.control();
-        let vm = w_vmm::Vmm::new(w_vmm::VmConfig::default());
-        let server = Server::bind(&path, vm.control(), Some(control.clone())).unwrap();
+        let vm = test_vm(Some(memory));
+        let server = Server::bind(&path, vm.control()).unwrap();
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        assert!(Server::bind(&path, vm.control(), Some(control)).is_err());
+        assert!(Server::bind(&path, vm.control()).is_err());
         assert_eq!(
             request(&path, Request::MemorySet { requested_mib: 128 }).unwrap()["status"]["requested_size_mib"],
             128
@@ -273,7 +297,7 @@ mod tests {
             serde_json::from_slice::<Value>(&line(&mut long).unwrap()).unwrap()["ok"],
             false
         );
-        drop(memory);
+        drop(vm);
         assert_eq!(
             request(&path, Request::MemorySet { requested_mib: 0 }).unwrap()["ok"],
             false

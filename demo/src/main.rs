@@ -119,23 +119,24 @@ fn run(command: Command) -> Result<()> {
             net.ipv4()
         );
     }
-    let vmm = Vmm::new(VmConfig {
-        memory_mib,
-        vcpu_count: vcpus,
-    });
     let memory = virtio_mem_size_mib.map(VirtioMem::new).transpose()?;
-    let (terminal, _terminal_guard) = Terminal::new(vmm.control())?;
+    let (terminal, mut terminal_guard) = Terminal::new()?;
+    let vmm = Vmm::new(
+        VmConfig {
+            memory_mib,
+            vcpu_count: vcpus,
+        },
+        disks,
+        network,
+        memory,
+        terminal,
+    );
+    terminal_guard.bind(vmm.control())?;
     let _control = control_socket
-        .map(|path| {
-            Server::bind(
-                &path,
-                vmm.control(),
-                memory.as_ref().map(VirtioMem::control),
-            )
-        })
+        .map(|path| Server::bind(&path, vmm.control()))
         .transpose()?;
     eprintln!("w-vmm: {vcpus} vCPU, {memory_mib} MiB; Ctrl-] exits");
-    vmm.run(disks, network, memory, terminal)
+    vmm.run()
 }
 
 fn control_command(socket: &Path, req: Request) -> Result<()> {

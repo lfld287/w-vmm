@@ -44,7 +44,7 @@ pub struct MemoryStatus {
 }
 
 #[derive(Debug, Clone)]
-pub struct MemoryControl(Arc<Mutex<MemoryStatus>>);
+pub(crate) struct MemoryControl(Arc<Mutex<MemoryStatus>>);
 
 impl MemoryControl {
     pub(crate) fn new(region_size_mib: u64) -> Self {
@@ -88,7 +88,7 @@ impl VirtioMem {
         )?))
     }
 
-    pub fn control(&self) -> MemoryControl {
+    pub(crate) fn control(&self) -> MemoryControl {
         self.0.control()
     }
 }

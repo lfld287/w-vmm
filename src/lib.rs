@@ -7,7 +7,7 @@ pub mod net;
 pub mod platform;
 mod runtime;
 pub use control::{VmControl, VmLifecycle, VmStatus};
-pub use memory::{MemoryControl, MemoryLifecycle, MemoryStatus, VirtioMem};
+pub use memory::{MemoryLifecycle, MemoryStatus, VirtioMem};
 pub mod serial;
 pub mod storage;
 use anyhow::Result;
@@ -31,39 +31,57 @@ impl Default for VmConfig {
     }
 }
 
-pub struct Vmm {
+/// Owns all devices from construction through shutdown.
+pub struct Vmm<BS, ND, SI> {
     config: VmConfig,
     control: VmControl,
+    devices: Option<Devices<BS, ND, SI>>,
 }
 
-impl Vmm {
-    pub fn new(config: VmConfig) -> Self {
-        Self {
-            config,
-            control: VmControl::new(),
-        }
-    }
+struct Devices<BS, ND, SI> {
+    blocks: BTreeMap<String, BS>,
+    net: Option<ND>,
+    memory: Option<VirtioMem>,
+    serial: SI,
+}
 
-    /// Obtain a cloneable handle for use from a control thread.
-    pub fn control(&self) -> VmControl {
-        self.control.clone()
-    }
-
-    /// Run using a caller-provided platform and the built-in devices.
-    pub fn run_with_platform<
-        P: platform::Platform,
-        BS: BlockStorage,
-        ND: NetDevice,
-        SI: SerialIo,
-    >(
-        self,
-        platform: P,
+impl<BS: BlockStorage, ND: NetDevice, SI: SerialIo> Vmm<BS, ND, SI> {
+    /// Disk names become virtio serials; devices attach in name order.
+    /// Use an empty map for no disks and a typed None for no network.
+    pub fn new(
+        config: VmConfig,
         blocks: BTreeMap<String, BS>,
         net: Option<ND>,
         memory: Option<VirtioMem>,
         serial: SI,
-    ) -> Result<()> {
+    ) -> Self {
+        let control = VmControl::new(memory.as_ref().map(VirtioMem::control));
+        Self {
+            config,
+            control,
+            devices: Some(Devices {
+                blocks,
+                net,
+                memory,
+                serial,
+            }),
+        }
+    }
+
+    /// Obtain a cloneable handle for VM and dynamic memory control.
+    pub fn control(&self) -> VmControl {
+        self.control.clone()
+    }
+
+    /// Run using a caller-provided platform and the owned devices.
+    pub fn run_with_platform<P: platform::Platform>(mut self, platform: P) -> Result<()> {
         self.control.begin()?;
+        let Devices {
+            blocks,
+            net,
+            memory,
+            serial,
+        } = self.devices.take().unwrap();
         let result = runtime::run(
             &self.config,
             &self.control,
@@ -77,19 +95,15 @@ impl Vmm {
         result
     }
 
-    /// Run with named disks, optional Ethernet and memory devices, and a serial backend.
-    /// Disk names (1..20 ASCII letters, digits, '.', '_' or '-') become virtio serials.
-    /// Devices are attached in name order; Linux assigns its own /dev/vd* names.
-    /// Pass an empty map for no disks and a typed None for no network.
-    /// Serial I/O runs on the calling thread; the caller owns terminal/signal policy.
-    pub fn run<BS: BlockStorage, ND: NetDevice, SI: SerialIo>(
-        self,
-        blocks: BTreeMap<String, BS>,
-        net: Option<ND>,
-        memory: Option<VirtioMem>,
-        serial: SI,
-    ) -> Result<()> {
+    /// Run with the default platform. Serial I/O stays on the calling thread.
+    pub fn run(mut self) -> Result<()> {
         self.control.begin()?;
+        let Devices {
+            blocks,
+            net,
+            memory,
+            serial,
+        } = self.devices.take().unwrap();
         let result = platform::run(&self.config, &self.control, blocks, net, memory, serial);
         self.control.finish(&result);
         result
@@ -121,25 +135,30 @@ mod tests {
     #[test]
     fn startup_failure_stops_memory_device() {
         let memory = VirtioMem::new(128).unwrap();
-        let control = memory.control();
-        let result = Vmm::new(VmConfig {
-            memory_mib: 0,
-            vcpu_count: 1,
-        })
-        .run(
+        let vm = Vmm::new(
+            VmConfig {
+                memory_mib: 0,
+                vcpu_count: 1,
+            },
             BTreeMap::<String, storage::Disk>::new(),
             None::<net::macos::Vmnet>,
             Some(memory),
             Serial,
         );
+        let control = vm.control();
+        let result = vm.run();
         assert!(result.is_err());
-        assert_eq!(control.status().lifecycle, MemoryLifecycle::Stopped);
+        assert_eq!(
+            control.memory_status().unwrap().lifecycle,
+            MemoryLifecycle::Stopped
+        );
         assert!(control.set_requested_mib(2).is_err());
     }
 }
 
-impl Drop for Vmm {
+impl<BS, ND, SI> Drop for Vmm<BS, ND, SI> {
     fn drop(&mut self) {
+        drop(self.devices.take());
         self.control.dropped();
     }
 }

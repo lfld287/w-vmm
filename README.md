@@ -84,7 +84,7 @@ impl SerialIo for Console {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    Vmm::new(VmConfig::default()).run::<Disk, Vmnet, _>(BTreeMap::new(), None, None, Console)?;
+    Vmm::new(VmConfig::default(), BTreeMap::<String, Disk>::new(), None::<Vmnet>, None, Console).run()?;
     Ok(())
 }
 ```
@@ -112,7 +112,7 @@ fn run(serial: impl SerialIo) -> Result<(), Box<dyn std::error::Error>> {
         ("sda".into(), Disk::open(Path::new("system.qcow2"), true)?),
         ("sdb".into(), Disk::open(Path::new("data.qcow2"), false)?),
     ]);
-    Vmm::new(VmConfig::default()).run(blocks, None::<Vmnet>, None, serial)?;
+    Vmm::new(VmConfig::default(), blocks, None::<Vmnet>, None, serial).run()?;
     Ok(())
 }
 ```
@@ -125,9 +125,9 @@ fn run(serial: impl SerialIo) -> Result<(), Box<dyn std::error::Error>> {
 
 `serial::SerialIo: std::io::Write` 是必传的串口后端。`recv(&mut [u8])` 非阻塞读取发往客户机的数据，返回长度不得超过缓冲区；`0`（含 EOF）、`WouldBlock` 和 `Interrupted` 表示暂无输入。每轮只读取 UART FIFO 剩余容量，满时不读取。暂停期间不调用 `recv()`，输入留在宿主缓冲区，恢复后继续按 FIFO 容量读取。所有调用在 VMM 线程执行，无需 `Send` / `Sync`，支持 `Box<dyn SerialIo>`。
 
-客户机输出使用同步 `write_all` / `flush`，没有额外输出队列。输入的其他错误及输出错误会终止运行，并尝试刷新全部磁盘。库不解释 `0x1d` 等控制字节；终端 raw mode、stdin/stdout、Ctrl-]、信号和恢复由 `demo/src/terminal.rs` 的 `Terminal` 实现负责。`Terminal::new(vm.control())` 返回 `(Terminal, TerminalGuard)`，调用方必须保留 guard 直到 `run()` 返回。信号和 Ctrl-] 通过本地通知通道唤醒独立线程，再调用同步 `VmControl::stop()`；串口销毁只恢复终端，guard 注销信号并回收线程。自定义后端需要退出时也应通知其他线程调用 `VmControl::stop()`，不可在 VMM 回调内调用阻塞控制方法。
+客户机输出使用同步 `write_all` / `flush`，没有额外输出队列。输入的其他错误及输出错误会终止运行，并尝试刷新全部磁盘。库不解释 `0x1d` 等控制字节；终端 raw mode、stdin/stdout、Ctrl-]、信号和恢复由 `demo/src/terminal.rs` 的 `Terminal` 实现负责。`Terminal::new()` 返回 `(Terminal, TerminalGuard)`，调用方必须保留 guard 直到 `run()` 返回。信号和 Ctrl-] 通过本地通知通道唤醒独立线程，再调用同步 `VmControl::stop()`；串口销毁只恢复终端，guard 注销信号并回收线程。自定义后端需要退出时也应通知其他线程调用 `VmControl::stop()`，不可在 VMM 回调内调用阻塞控制方法。
 
-内核和 initramfs 仍由库提供；调用程序需附加相同的 Hypervisor entitlement 本地签名。`run` 已改为必须传入四个参数（磁盘、网络、内存设备、串口），不再隐式创建终端。
+内核和 initramfs 仍由库提供；调用程序需附加相同的 Hypervisor entitlement 本地签名。磁盘、网络、内存设备和串口在构造时传入，`run()` 不再接收设备参数，也不隐式创建终端。
 
 ## 多核与动态内存
 
@@ -144,20 +144,27 @@ fn run(serial: impl SerialIo) -> Result<(), Box<dyn std::error::Error>> {
 
 `memory_mib` 是不可移除的基础 RAM；virtio-mem 的区域容量和目标容量都是**额外**内存。基础 RAM、动态区域和合计容量均无 16 GiB 固定上限；完整地址范围（含对齐间隙）必须落在当前 VM 的 HVF IPA 位宽内，容量换算与地址计算也必须可表示。区域容量必须为 Linux 热插拔块大小的正整数倍，起点位于基础 RAM 后并按该块大小向上对齐；目标默认 0，必须为零或该块大小的整数倍且不超过区域容量。内部常量 `HOTPLUG_BLOCK_SIZE` 与当前内核对应的值为 128 MiB，不自动探测客户机。virtio-mem 协议和底层映射仍以 2 MiB 为单位，因此异步调整中的实际插入量可以小于 Linux 热插拔块大小。未启用时保持原有默认启动行为。
 
-库可在 `run` 前取得控制句柄，然后移交给其他线程：
+库可在 `run` 前取得控制句柄，然后移交给其他线程。
+
+所有设备在 `Vmm::new(config, blocks, net, memory, serial)` 时交付，随后使用 `run()` 或 `run_with_platform(platform)`。内存控制统一使用 `VmControl`；`MemoryControl` 和 `VirtioMem::control()` 仅供内部使用。
+
+`supports_memory()` 表示是否配置 virtio-mem，创建后即确定，停止后保持不变；客户机驱动就绪情况由 `driver_ready` 表示。未配置时，`memory_status()` 和 `set_requested_mib()` 均返回 `virtio-mem is not configured`。启动前调用 `stop()` 会取消运行并立即将内存标记为停止；设备在 Vmm 被消费或丢弃时释放。停止后仍可查询最终内存状态，但不能修改目标。
+
+终端先调用 `Terminal::new()` 取得串口与 guard；创建 VM 后调用 `guard.bind(vm.control())?`，仅允许绑定一次。绑定前收到的退出通知会保留，guard 必须保留到运行结束。控制服务使用 `Server::bind(path, vm.control())`。
 
 ```rust,no_run
 use w_vmm::{VmConfig, Vmm, VirtioMem};
 let memory = VirtioMem::new(1024)?;
-let control = memory.control();
+let vm = Vmm::new(VmConfig { vcpu_count: 4, ..VmConfig::default() }, blocks, net, Some(memory), serial);
+let control = vm.control();
+assert!(control.supports_memory());
 control.set_requested_mib(512)?;
-let vm = Vmm::new(VmConfig { vcpu_count: 4, ..VmConfig::default() });
-println!("{:?}", control.status());
-// 将 control.clone() 交给控制线程，再调用 vm.run(blocks, net, Some(memory), serial)。
+println!("{:?}", control.memory_status()?);
+// 将 control.clone() 交给控制线程，再调用 vm.run()。
 # Ok::<(), anyhow::Error>(())
 ```
 
-调节成功表示目标已接受，客户机异步完成扩缩容。`status()` 包含 `region_size_mib`、`requested_size_mib`、`plugged_size_mib`、`driver_ready` 和 `Created / Running / Stopped` 生命周期。启动前允许调节；退出或丢弃未运行的 VirtioMem 后拒绝调节，句柄保留最终状态。
+调节成功表示目标已接受，客户机异步完成扩缩容。`memory_status()?` 包含 `region_size_mib`、`requested_size_mib`、`plugged_size_mib`、`driver_ready` 和 `Created / Running / Stopped` 生命周期。启动前允许调节；退出或丢弃未运行的 Vmm 后拒绝调节，句柄保留最终状态。
 
 驱动必须协商 `VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE`。未插入块不映射到 HVF，也不在设备 DMA 内存视图中。变更映射时暂停所有 vCPU，保护有效队列和待处理缓冲区；失败则回滚，回滚失败终止 VM。普通设备 reset 保留已插入内存及数据，`UNPLUG_ALL` 才移除全部块。
 
@@ -169,9 +176,9 @@ println!("{:?}", control.status());
 
 ```rust,no_run
 use w_vmm::{VmConfig, Vmm};
-let vm = Vmm::new(VmConfig::default());
+let vm = Vmm::new(VmConfig::default(), blocks, net, None, serial);
 let control = vm.control();
-// 将 control.clone() 交给控制线程，然后在当前线程调用 vm.run(...)。
+// 将 control.clone() 交给控制线程，然后在当前线程调用 vm.run()。
 // VM 进入 Running 后，控制线程可以调用：
 // control.pause()?;
 // control.resume()?;
@@ -179,7 +186,7 @@ let control = vm.control();
 println!("{:?}", control.status());
 ```
 
-`pause()` 等待全部 vCPU（含异常处理和 MMIO 回写）与设备处理暂停；`resume()` 等待解除暂停并恢复调度。重复暂停、恢复幂等。暂停期间不处理 guest MMIO、块设备、网络设备或动态内存映射；串口不读取输入，普通输入和 Ctrl-] 留在宿主缓冲区，恢复后才处理。暂停等待仅由控制通知唤醒，没有定时轮询；demo 的 SIGINT、SIGTERM、SIGHUP 和控制停止命令在暂停期间仍有效。内部动态映射使用的短暂暂停不改变对外生命周期。`MemoryControl::set_requested_mib` 在启动前和暂停期间均可设置，仍只确认宿主目标值，客户机在运行后异步扩缩容。
+`pause()` 等待全部 vCPU（含异常处理和 MMIO 回写）与设备处理暂停；`resume()` 等待解除暂停并恢复调度。重复暂停、恢复幂等。暂停期间不处理 guest MMIO、块设备、网络设备或动态内存映射；串口不读取输入，普通输入和 Ctrl-] 留在宿主缓冲区，恢复后才处理。暂停等待仅由控制通知唤醒，没有定时轮询；demo 的 SIGINT、SIGTERM、SIGHUP 和控制停止命令在暂停期间仍有效。内部动态映射使用的短暂暂停不改变对外生命周期。`VmControl::set_requested_mib` 在启动前和暂停期间均可设置，仍只确认宿主目标值，客户机在运行后异步扩缩容。
 
 `stop()` 等待 vCPU 停止、全部磁盘刷新和资源释放，重复调用返回保存的清理结果。它不是客户机正常关机，不包含内存转储或快照恢复。三个阻塞方法均不设超时；从 VMM 运行线程（包括设备回调）调用会立即报错，`status()` 随时可读。
 
@@ -350,7 +357,7 @@ sudo env "PATH=$PATH" python3 scripts/smoke-net.py \
 - `src/storage.rs`：imago 原生同步 qcow2、同 inode 文件锁、范围校验、内部缓存 flush 与宿主 sync/fsync。
 - `src/serial.rs`：`SerialIo` trait、Box 转发和 FIFO 输入轮询。
 - `demo/src/terminal.rs`：原始终端、非阻塞输入、Ctrl-] 与信号恢复，CLI 和网络示例共用。
-- `src/lib.rs`：`VmConfig` / `Vmm::new(...).run(blocks, net, memory, serial)`，委托 `platform::run`。
+- `src/lib.rs`：`VmConfig` / `Vmm::new(config, blocks, net, memory, serial).run()`，委托 `platform::run`。
 - `demo/src/main.rs`：CLI、错误输出，通过路径依赖调用根库。
 
 设备 MMIO：GIC distributor `0x08000000`，16550 `0x09000000`（SPI 33），virtio 设备从 `0x0a000000` 开始，每个占 `0x1000`，中断从 SPI 34 递增。先按名称排列磁盘，再放置可选网卡和 virtio-mem，每个设备使用独立 MMIO 和中断。GIC redistributor 位于 `0x10000000`，RAM 位于 `0x40000000`。实际可用 SPI 范围、定时器 INTID 和 redistributor 空间大小查询 HVF；设备超出范围时启动报错。
@@ -377,4 +384,4 @@ cargo run -p w-vmm --example platform
 
 `Mapper::map/unmap` 单次失败必须不留部分变更。映射借用分配，不能提前释放；`pause` 成功必须表示全部 vCPU 已静止。动态映射成功或回滚成功后恢复，回滚失败直接进入停止流程。`stop` 必须停止并回收所有 vCPU，支持部分启动和重复调用；VM 析构也必须支持重复清理。清理顺序为停止 vCPU、尝试刷新每块磁盘、撤销映射、销毁 VM，最后释放基础 RAM、动态 RAM 和回滚保留分配。
 
-`memory::VirtioMem` 封装私有设备，库根的 `VirtioMem` / `MemoryControl` / `MemoryStatus` / `MemoryLifecycle` 导出保持兼容。当前 guest 兼容约束仍要求容量和目标值为 128 MiB 的倍数、区域按 128 MiB 对齐，virtio-mem 协议块仍为 2 MiB；平台不推断或配置 guest 热插拔块大小。多架构接口不保证任意 guest 内核的热插拔兼容性。
+`memory::VirtioMem` 封装私有设备，库根的 `VirtioMem` / `MemoryStatus` / `MemoryLifecycle` 导出保持兼容。当前 guest 兼容约束仍要求容量和目标值为 128 MiB 的倍数、区域按 128 MiB 对齐，virtio-mem 协议块仍为 2 MiB；平台不推断或配置 guest 热插拔块大小。多架构接口不保证任意 guest 内核的热插拔兼容性。

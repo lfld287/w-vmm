@@ -238,20 +238,27 @@ impl NetDevice for NoNet {
     }
 }
 
-fn run(vm: Vmm, state: Arc<State>, fault: Fault, memory: VirtioMem) -> Result<()> {
+fn new_vm(state: Arc<State>, fault: Fault, memory: Option<VirtioMem>) -> Vmm<Disk, NoNet, Serial> {
+    Vmm::new(
+        VmConfig {
+            memory_mib: 1,
+            vcpu_count: 4,
+        },
+        BTreeMap::from([("disk".into(), Disk(state.clone(), fault))]),
+        None::<NoNet>,
+        memory,
+        Serial(state),
+    )
+}
+
+fn run(vm: Vmm<Disk, NoNet, Serial>, state: Arc<State>, fault: Fault) -> Result<()> {
     let platform = Machine {
-        state: state.clone(),
+        state,
         fault,
         control: vm.control(),
         _local: Rc::new(()),
     };
-    vm.run_with_platform(
-        platform,
-        BTreeMap::from([("disk".into(), Disk(state.clone(), fault))]),
-        None::<NoNet>,
-        Some(memory),
-        Serial(state),
-    )
+    vm.run_with_platform(platform)
 }
 
 fn wait(mut predicate: impl FnMut() -> bool) {
@@ -268,16 +275,12 @@ fn wait(mut predicate: impl FnMut() -> bool) {
 #[test]
 fn pause_resume_memory_and_stop_are_synchronous() {
     for fault in [Fault::None, Fault::Pause, Fault::Resume, Fault::Flush] {
-        let vm = Vmm::new(VmConfig {
-            memory_mib: 1,
-            vcpu_count: 4,
-        });
+        let state = Arc::new(State::default());
+        let vm = new_vm(state.clone(), fault, Some(VirtioMem::new(128).unwrap()));
         let c = vm.control();
         let final_control = c.clone();
-        let state = Arc::new(State::default());
         let other = state.clone();
-        let memory = VirtioMem::new(128).unwrap();
-        let mem = memory.control();
+        let mem = c.clone();
         let t = std::thread::spawn(move || {
             wait(|| other.output.load(Ordering::SeqCst) > 10);
             let paused = c.pause();
@@ -295,7 +298,7 @@ fn pause_resume_memory_and_stop_are_synchronous() {
                 assert_eq!(other.ticks.load(Ordering::SeqCst), ticks);
                 assert_eq!(other.output.load(Ordering::SeqCst), output);
                 assert_eq!(other.reads.load(Ordering::SeqCst), reads);
-                assert_eq!(mem.status().plugged_size_mib, 0);
+                assert_eq!(mem.memory_status().unwrap().plugged_size_mib, 0);
                 let resumed = c.resume();
                 if fault == Fault::Resume {
                     assert!(resumed.is_err());
@@ -317,7 +320,10 @@ fn pause_resume_memory_and_stop_are_synchronous() {
                 assert_eq!(t.join().unwrap().is_err(), fault == Fault::Flush);
             }
             assert_eq!(c.status().lifecycle, VmLifecycle::Stopped);
-            assert_eq!(mem.status().lifecycle, MemoryLifecycle::Stopped);
+            assert_eq!(
+                mem.memory_status().unwrap().lifecycle,
+                MemoryLifecycle::Stopped
+            );
             let log = other.log.lock().unwrap();
             let pos = |s| log.iter().position(|v| *v == s).unwrap();
             assert!(pos("stop") < pos("flush"));
@@ -325,7 +331,7 @@ fn pause_resume_memory_and_stop_are_synchronous() {
             assert!(pos("unmap") < pos("destroy"));
             assert!(pos("destroy") < pos("disk-drop"));
         });
-        assert_eq!(run(vm, state, fault, memory).is_err(), fault != Fault::None);
+        assert_eq!(run(vm, state, fault).is_err(), fault != Fault::None);
         t.join().unwrap();
         assert_eq!(
             final_control.status().final_error.is_some(),
@@ -337,26 +343,26 @@ fn pause_resume_memory_and_stop_are_synchronous() {
 #[test]
 fn startup_failure_and_cancelled_run() {
     for cancel in [false, true] {
-        let vm = Vmm::new(VmConfig {
-            memory_mib: 1,
-            vcpu_count: 1,
-        });
+        let state = Arc::new(State::default());
+        let vm = new_vm(
+            state.clone(),
+            Fault::Prepare,
+            Some(VirtioMem::new(128).unwrap()),
+        );
         let control = vm.control();
         if cancel {
             control.stop().unwrap();
         }
-        assert!(
-            run(
-                vm,
-                Arc::new(State::default()),
-                Fault::Prepare,
-                VirtioMem::new(128).unwrap()
-            )
-            .is_err()
-        );
+        assert!(run(vm, state.clone(), Fault::Prepare).is_err());
         assert_eq!(control.status().lifecycle, VmLifecycle::Stopped);
         assert_eq!(control.status().final_error.is_some(), !cancel);
         control.stop().unwrap();
+        assert_eq!(
+            control.memory_status().unwrap().lifecycle,
+            MemoryLifecycle::Stopped
+        );
+        assert!(control.set_requested_mib(0).is_err());
+        assert!(state.log.lock().unwrap().contains(&"disk-drop"));
     }
 }
 
@@ -379,12 +385,9 @@ fn stop_during_startup_waits_for_cleanup() {
             self.0.create(c)
         }
     }
-    let vm = Vmm::new(VmConfig {
-        memory_mib: 1,
-        vcpu_count: 1,
-    });
-    let c = vm.control();
     let state = Arc::new(State::default());
+    let vm = new_vm(state.clone(), Fault::None, None);
+    let c = vm.control();
     let (entered, entering) = mpsc::channel();
     let (release, gate) = mpsc::channel();
     let other = c.clone();
@@ -413,13 +416,66 @@ fn stop_during_startup_waits_for_cleanup() {
         entered,
         gate,
     );
-    vm.run_with_platform(
-        platform,
-        BTreeMap::from([("disk".into(), Disk(state.clone(), Fault::None))]),
-        None::<NoNet>,
-        None,
-        Serial(state),
-    )
-    .unwrap();
+    vm.run_with_platform(platform).unwrap();
     t.join().unwrap();
+}
+
+#[test]
+fn memory_capability_targets_and_device_ownership() {
+    for configured in [false, true] {
+        for cancel in [false, true] {
+            let state = Arc::new(State::default());
+            let vm = new_vm(
+                state.clone(),
+                Fault::None,
+                configured.then(|| VirtioMem::new(256).unwrap()),
+            );
+            let c = vm.control();
+            let other = c.clone();
+            assert_eq!(c.supports_memory(), configured);
+            if configured {
+                assert_eq!(
+                    c.memory_status().unwrap().lifecycle,
+                    MemoryLifecycle::Created
+                );
+                assert!(!c.memory_status().unwrap().driver_ready);
+                other.set_requested_mib(128).unwrap();
+                assert_eq!(c.memory_status().unwrap().requested_size_mib, 128);
+                for invalid in [1, 384, u64::MAX] {
+                    assert!(c.set_requested_mib(invalid).is_err());
+                }
+                assert_eq!(c.memory_status().unwrap().requested_size_mib, 128);
+            } else {
+                assert_eq!(
+                    c.memory_status().unwrap_err().to_string(),
+                    "virtio-mem is not configured"
+                );
+                assert_eq!(
+                    c.set_requested_mib(0).unwrap_err().to_string(),
+                    "virtio-mem is not configured"
+                );
+            }
+            if cancel {
+                c.stop().unwrap();
+                assert!(!state.log.lock().unwrap().contains(&"disk-drop"));
+                if configured {
+                    assert_eq!(
+                        c.memory_status().unwrap().lifecycle,
+                        MemoryLifecycle::Stopped
+                    );
+                }
+                assert!(c.set_requested_mib(0).is_err());
+            }
+            drop(vm);
+            assert!(state.log.lock().unwrap().contains(&"disk-drop"));
+            assert_eq!(c.status().lifecycle, VmLifecycle::Stopped);
+            assert_eq!(c.supports_memory(), configured);
+            assert!(other.set_requested_mib(0).is_err());
+            if configured {
+                let status = other.memory_status().unwrap();
+                assert_eq!(status.lifecycle, MemoryLifecycle::Stopped);
+                assert_eq!(status.requested_size_mib, 128);
+            }
+        }
+    }
 }

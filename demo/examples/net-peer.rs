@@ -120,21 +120,16 @@ fn main() -> Result<()> {
         ..VmConfig::default()
     };
     eprintln!("w-vmm: {} vCPU, 512 MiB; Ctrl-] exits", config.vcpu_count);
-    let vmm = Vmm::new(config);
-    let (terminal, _terminal_guard) = Terminal::new(vmm.control())?;
+    let (terminal, mut terminal_guard) = Terminal::new()?;
     let memory = std::env::var("W_VMM_MEMORY_SOCKET")
         .ok()
         .map(|_| w_vmm::VirtioMem::new(1024))
         .transpose()?;
+    let vmm = Vmm::new(config, blocks, Some(Peer::default()), memory, terminal);
+    terminal_guard.bind(vmm.control())?;
     let _control = std::env::var("W_VMM_MEMORY_SOCKET")
         .ok()
-        .map(|path| {
-            w_vmm_demo::control::Server::bind(
-                Path::new(&path),
-                vmm.control(),
-                memory.as_ref().map(w_vmm::VirtioMem::control),
-            )
-        })
+        .map(|path| w_vmm_demo::control::Server::bind(Path::new(&path), vmm.control()))
         .transpose()?;
-    vmm.run(blocks, Some(Peer::default()), memory, terminal)
+    vmm.run()
 }
