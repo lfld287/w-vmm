@@ -1,5 +1,4 @@
 //! Exercise synchronous control through the public runtime with !Send backends.
-use anyhow::{Result, ensure};
 use std::{
     collections::BTreeMap,
     io,
@@ -11,6 +10,8 @@ use std::{
     time::Duration,
 };
 use vm_memory::{GuestMemoryMmap, GuestRegionMmap};
+use w_vmm::Result;
+use w_vmm::error::{MemoryError, NetError, PlatformError, StorageError};
 use w_vmm::{
     memory::Mapper, net::NetDevice, platform::*, serial::SerialIo, storage::BlockStorage, *,
 };
@@ -48,7 +49,11 @@ struct Machine {
 impl Platform for Machine {
     type Vm = Self;
 
-    fn layout(&self, _: &VmConfig, needs: &DeviceRequirements) -> Result<MachineLayout> {
+    fn layout(
+        &self,
+        _: &VmConfig,
+        needs: &DeviceRequirements,
+    ) -> std::result::Result<MachineLayout, PlatformError> {
         Ok(MachineLayout {
             ram: vec![MemoryRange {
                 address: 0x100000,
@@ -78,7 +83,7 @@ impl Platform for Machine {
         })
     }
 
-    fn create(&self, _: &VmConfig) -> Result<Self> {
+    fn create(&self, _: &VmConfig) -> std::result::Result<Self, PlatformError> {
         Ok(Self {
             state: self.state.clone(),
             fault: self.fault,
@@ -89,11 +94,11 @@ impl Platform for Machine {
 }
 
 impl Mapper for Machine {
-    fn map(&mut self, _: &GuestRegionMmap) -> Result<()> {
+    fn map(&mut self, _: &GuestRegionMmap) -> std::result::Result<(), MemoryError> {
         Ok(())
     }
 
-    fn unmap(&mut self, _: &GuestRegionMmap) -> Result<()> {
+    fn unmap(&mut self, _: &GuestRegionMmap) -> std::result::Result<(), MemoryError> {
         self.state.log("unmap");
         Ok(())
     }
@@ -102,16 +107,24 @@ impl Mapper for Machine {
 impl VirtualMachine for Machine {
     type Completion = ();
 
-    fn prepare(&mut self, _: &GuestMemoryMmap, _: &MachineLayout) -> Result<()> {
-        ensure!(self.fault != Fault::Prepare, "prepare failed");
+    fn prepare(
+        &mut self,
+        _: &GuestMemoryMmap,
+        _: &MachineLayout,
+    ) -> std::result::Result<(), PlatformError> {
+        if self.fault == Fault::Prepare {
+            return Err(PlatformError::Backend(
+                io::Error::other("prepare failed").into(),
+            ));
+        }
         Ok(())
     }
 
-    fn start(&mut self) -> Result<()> {
+    fn start(&mut self) -> std::result::Result<(), PlatformError> {
         Ok(())
     }
 
-    fn poll_event(&mut self, _: Duration) -> Result<Option<Event<()>>> {
+    fn poll_event(&mut self, _: Duration) -> std::result::Result<Option<Event<()>>, PlatformError> {
         self.state.ticks.fetch_add(1, Ordering::SeqCst);
         // A callback must fail immediately, never wait on its own runtime.
         assert!(
@@ -133,23 +146,31 @@ impl VirtualMachine for Machine {
         })))
     }
 
-    fn complete_io(&mut self, _: (), _: u64) -> Result<()> {
+    fn complete_io(&mut self, _: (), _: u64) -> std::result::Result<(), PlatformError> {
         Ok(())
     }
 
-    fn set_irq(&mut self, _: u32, _: bool) -> Result<()> {
+    fn set_irq(&mut self, _: u32, _: bool) -> std::result::Result<(), PlatformError> {
         Ok(())
     }
 
-    fn pause(&mut self) -> Result<()> {
+    fn pause(&mut self) -> std::result::Result<(), PlatformError> {
         self.state.log("pause");
-        ensure!(self.fault != Fault::Pause, "pause failed");
+        if self.fault == Fault::Pause {
+            return Err(PlatformError::Backend(
+                io::Error::other("pause failed").into(),
+            ));
+        }
         Ok(())
     }
 
-    fn resume(&mut self) -> Result<()> {
+    fn resume(&mut self) -> std::result::Result<(), PlatformError> {
         self.state.log("resume");
-        ensure!(self.fault != Fault::Resume, "resume failed");
+        if self.fault == Fault::Resume {
+            return Err(PlatformError::Backend(
+                io::Error::other("resume failed").into(),
+            ));
+        }
         Ok(())
     }
 
@@ -175,17 +196,21 @@ impl BlockStorage for Disk {
         false
     }
 
-    fn read(&self, _: u64, _: &mut [u8]) -> Result<()> {
+    fn read(&self, _: u64, _: &mut [u8]) -> std::result::Result<(), StorageError> {
         Ok(())
     }
 
-    fn write(&self, _: u64, _: &[u8]) -> Result<()> {
+    fn write(&self, _: u64, _: &[u8]) -> std::result::Result<(), StorageError> {
         Ok(())
     }
 
-    fn flush(&self) -> Result<()> {
+    fn flush(&self) -> std::result::Result<(), StorageError> {
         self.0.log("flush");
-        ensure!(self.1 != Fault::Flush, "flush failed");
+        if self.1 == Fault::Flush {
+            return Err(StorageError::Backend(
+                io::Error::other("flush failed").into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -229,11 +254,11 @@ impl NetDevice for NoNet {
         1514
     }
 
-    fn send(&mut self, _: &[u8]) -> Result<bool> {
+    fn send(&mut self, _: &[u8]) -> std::result::Result<bool, NetError> {
         Ok(true)
     }
 
-    fn recv(&mut self, _: &mut [u8]) -> Result<Option<usize>> {
+    fn recv(&mut self, _: &mut [u8]) -> std::result::Result<Option<usize>, NetError> {
         Ok(None)
     }
 }
@@ -375,11 +400,15 @@ fn stop_during_startup_waits_for_cleanup() {
     impl Platform for Starting {
         type Vm = Machine;
 
-        fn layout(&self, c: &VmConfig, d: &DeviceRequirements) -> Result<MachineLayout> {
+        fn layout(
+            &self,
+            c: &VmConfig,
+            d: &DeviceRequirements,
+        ) -> std::result::Result<MachineLayout, PlatformError> {
             self.0.layout(c, d)
         }
 
-        fn create(&self, c: &VmConfig) -> Result<Machine> {
+        fn create(&self, c: &VmConfig) -> std::result::Result<Machine, PlatformError> {
             self.1.send(()).unwrap();
             self.2.recv().unwrap();
             self.0.create(c)

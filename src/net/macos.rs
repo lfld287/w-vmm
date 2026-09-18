@@ -1,6 +1,6 @@
 //! Minimal vmnet.framework bindings authored against the Apple SDK.
 use super::NetDevice;
-use anyhow::{Context, Result, bail, ensure};
+use crate::error::NetError;
 use block2::{Block, RcBlock};
 use dispatch2::{DispatchQueue, DispatchRetained};
 use std::{
@@ -9,6 +9,8 @@ use std::{
     sync::mpsc,
     time::Duration,
 };
+
+type Result<T> = std::result::Result<T, NetError>;
 
 const SUCCESS: u32 = 1000;
 const BUFFER_EXHAUSTED: u32 = 1007;
@@ -68,20 +70,28 @@ unsafe extern "C" {
 fn check(status: u32, operation: &str) -> Result<()> {
     match status {
         SUCCESS => Ok(()),
-        1005 | 1010 => bail!(
-            "{operation}: vmnet permission denied ({status}); run with root privileges or an Apple-approved com.apple.vm.networking entitlement"
-        ),
-        _ => bail!("{operation}: vmnet error {status}"),
+        1005 | 1010 => Err(NetError::PermissionDenied {
+            operation: operation.to_owned(),
+            status,
+        }),
+        _ => Err(NetError::Vmnet {
+            operation: operation.to_owned(),
+            status,
+        }),
     }
 }
 
 fn parse_mac(value: &str) -> Result<[u8; 6]> {
     let parts: Vec<_> = value.split(':').collect();
-    ensure!(parts.len() == 6, "invalid vmnet MAC address");
+    if parts.len() != 6 {
+        return Err(NetError::InvalidVmnetMacAddress);
+    }
     let mut mac = [0; 6];
     for (byte, part) in mac.iter_mut().zip(parts) {
-        ensure!(part.len() == 2, "invalid vmnet MAC address");
-        *byte = u8::from_str_radix(part, 16).context("invalid vmnet MAC address")?;
+        if part.len() != 2 {
+            return Err(NetError::InvalidVmnetMacAddress);
+        }
+        *byte = u8::from_str_radix(part, 16).map_err(NetError::MacParse)?;
     }
     Ok(mac)
 }
@@ -110,19 +120,22 @@ pub struct SharedIpv4 {
 }
 
 unsafe fn parameters(dict: Xpc) -> Result<Parameters> {
-    ensure!(!dict.is_null(), "missing vmnet interface parameters");
+    if dict.is_null() {
+        return Err(NetError::MissingVmnetInterfaceParameters);
+    }
     // SAFETY: Apple's successful completion passes a live XPC dictionary. Copy every
     // value here; no borrowed XPC object or C string escapes the callback.
     unsafe {
-        let mac = parse_mac(&string(dict, vmnet_mac_address_key)?.context("missing vmnet MAC")?)?;
+        let mac = parse_mac(&string(dict, vmnet_mac_address_key)?.ok_or(NetError::MissingMac)?)?;
         let mtu = u16::try_from(xpc_dictionary_get_uint64(dict, vmnet_mtu_key))?;
         let max_frame =
             usize::try_from(xpc_dictionary_get_uint64(dict, vmnet_max_packet_size_key))?;
-        ensure!(mtu == Vmnet::MTU, "vmnet returned unexpected MTU {mtu}");
-        ensure!(
-            mtu >= 68 && max_frame >= mtu as usize + 14 && max_frame <= u16::MAX as usize + 18,
-            "invalid vmnet frame capacity"
-        );
+        if mtu != Vmnet::MTU {
+            return Err(NetError::UnexpectedMtu { mtu });
+        }
+        if !(mtu >= 68 && max_frame >= mtu as usize + 14 && max_frame <= u16::MAX as usize + 18) {
+            return Err(NetError::InvalidVmnetFrameCapacity);
+        }
         Ok(Parameters {
             mac,
             max_frame,
@@ -157,13 +170,14 @@ impl Vmnet {
         });
         let interface = unsafe {
             let desc = xpc_dictionary_create(std::ptr::null(), std::ptr::null(), 0);
-            ensure!(!desc.is_null(), "create vmnet description");
+            if desc.is_null() {
+                return Err(NetError::CreateVmnetDescription);
+            }
             xpc_dictionary_set_uint64(desc, vmnet_operation_mode_key, 1001);
             xpc_dictionary_set_uint64(desc, vmnet_mtu_key, Self::MTU as u64);
             let interface = vmnet_start_interface(desc, &queue, &callback);
             xpc_release(desc);
-            NonNull::new(interface)
-                .context("start vmnet returned no interface (check root/networking entitlement)")?
+            NonNull::new(interface).ok_or(NetError::MissingInterface)?
         };
         // Establish ownership before waiting/parsing, so every later failure stops it.
         let mut backend = Self {
@@ -175,8 +189,11 @@ impl Vmnet {
         };
         let params = receiver
             .recv_timeout(TIMEOUT)
-            .context("waiting for vmnet start")?
-            .context("create vmnet shared interface (requires root or an Apple-approved networking entitlement)")?;
+            .map_err(|source| NetError::Wait {
+                operation: "waiting for vmnet start",
+                source,
+            })?
+            .map_err(|source| NetError::Start(Box::new(source)))?;
         backend.mac = params.mac;
         backend.max_frame = params.max_frame;
         backend.ipv4 = params.ipv4;
@@ -201,16 +218,16 @@ impl Vmnet {
         check(
             receiver
                 .recv_timeout(TIMEOUT)
-                .context("waiting for vmnet stop")?,
+                .map_err(|source| NetError::Wait {
+                    operation: "waiting for vmnet stop",
+                    source,
+                })?,
             "stop vmnet completion",
         )
     }
 
     fn interface(&self) -> Result<Interface> {
-        Ok(self
-            .interface
-            .context("vmnet interface is closed")?
-            .as_ptr())
+        Ok(self.interface.ok_or(NetError::Closed)?.as_ptr())
     }
 }
 
@@ -226,10 +243,12 @@ impl NetDevice for Vmnet {
     }
 
     fn send(&mut self, frame: &[u8]) -> Result<bool> {
-        ensure!(
-            (14..=self.max_frame).contains(&frame.len()),
-            "invalid vmnet TX frame size"
-        );
+        if !(14..=self.max_frame).contains(&frame.len()) {
+            return Err(NetError::InvalidVmnetTxFrameSize {
+                length: frame.len(),
+                capacity: self.max_frame,
+            });
+        }
         // vmnet_write only reads the iovec despite its C API taking mutable pointers.
         let mut iov = libc::iovec {
             iov_base: frame.as_ptr().cast_mut().cast(),
@@ -247,12 +266,19 @@ impl NetDevice for Vmnet {
             return Ok(false);
         }
         check(status, "vmnet write")?;
-        ensure!((0..=1).contains(&count), "invalid vmnet TX count");
+        if !(0..=1).contains(&count) {
+            return Err(NetError::InvalidVmnetTxCount { count });
+        }
         Ok(count == 1)
     }
 
     fn recv(&mut self, buffer: &mut [u8]) -> Result<Option<usize>> {
-        ensure!(buffer.len() >= self.max_frame, "vmnet RX buffer too small");
+        if buffer.len() < self.max_frame {
+            return Err(NetError::VmnetRxBufferTooSmall {
+                length: buffer.len(),
+                capacity: self.max_frame,
+            });
+        }
         let mut iov = libc::iovec {
             iov_base: buffer.as_mut_ptr().cast(),
             iov_len: buffer.len(),
@@ -268,14 +294,18 @@ impl NetDevice for Vmnet {
             unsafe { vmnet_read(self.interface()?, &mut packet, &mut count) },
             "vmnet read",
         )?;
-        ensure!((0..=1).contains(&count), "invalid vmnet RX count");
+        if !(0..=1).contains(&count) {
+            return Err(NetError::InvalidVmnetRxCount { count });
+        }
         if count == 0 {
             return Ok(None);
         }
-        ensure!(
-            (14..=self.max_frame).contains(&packet.size),
-            "invalid vmnet RX frame size"
-        );
+        if !(14..=self.max_frame).contains(&packet.size) {
+            return Err(NetError::InvalidVmnetRxFrameSize {
+                length: packet.size,
+                capacity: self.max_frame,
+            });
+        }
         Ok(Some(packet.size))
     }
 }
@@ -283,7 +313,7 @@ impl NetDevice for Vmnet {
 impl Drop for Vmnet {
     fn drop(&mut self) {
         if let Err(error) = self.close() {
-            eprintln!("final vmnet stop: {error:#}");
+            eprintln!("final vmnet stop: {}", crate::error::diagnostic(&error));
         }
     }
 }

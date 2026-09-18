@@ -1,7 +1,21 @@
 //! Local test peer demonstrating NetDevice injection. No host network or privileges.
 //! Run the signed binary as: net-peer run [disk.qcow2 ...]
 //! Guest: ip link set eth0 up; ip addr add 192.0.2.2/24 dev eth0; ping 192.0.2.1
-use anyhow::{Result, ensure};
+use w_vmm::error::NetError;
+use w_vmm_demo::{Result, error::ArgumentError};
+
+#[derive(Debug, thiserror::Error)]
+enum PeerError {
+    #[error("invalid test-peer IPv4 length {length}")]
+    Length { length: usize },
+    #[error("test peer does not reassemble fragments")]
+    Fragment,
+    #[error("invalid guest packet checksum")]
+    Checksum,
+    #[error("test peer RX buffer too small: {capacity}, need {length}")]
+    Buffer { capacity: usize, length: usize },
+}
+
 use std::{
     collections::{BTreeMap, VecDeque},
     path::Path,
@@ -39,7 +53,7 @@ impl NetDevice for Peer {
         1514
     }
 
-    fn send(&mut self, frame: &[u8]) -> Result<bool> {
+    fn send(&mut self, frame: &[u8]) -> std::result::Result<bool, NetError> {
         if self.replies.len() == 128 {
             return Ok(false);
         }
@@ -62,18 +76,17 @@ impl NetDevice for Peer {
                     && frame[34..36] == [8, 0] =>
             {
                 let total = u16::from_be_bytes([frame[16], frame[17]]) as usize;
-                ensure!(
-                    total >= 28 && total + 14 <= frame.len(),
-                    "invalid test-peer IPv4 length"
-                );
-                ensure!(
-                    u16::from_be_bytes([frame[20], frame[21]]) & 0x3fff == 0,
-                    "test peer does not reassemble fragments"
-                );
-                ensure!(
-                    checksum(&frame[14..34]) == 0 && checksum(&frame[34..14 + total]) == 0,
-                    "invalid guest packet checksum"
-                );
+                if !(total >= 28 && total + 14 <= frame.len()) {
+                    return Err(NetError::Backend(Box::new(PeerError::Length {
+                        length: total,
+                    })));
+                }
+                if u16::from_be_bytes([frame[20], frame[21]]) & 0x3fff != 0 {
+                    return Err(NetError::Backend(Box::new(PeerError::Fragment)));
+                }
+                if !(checksum(&frame[14..34]) == 0 && checksum(&frame[34..14 + total]) == 0) {
+                    return Err(NetError::Backend(Box::new(PeerError::Checksum)));
+                }
                 reply.truncate(total + 14);
                 reply[26..30].copy_from_slice(&PEER_IP);
                 reply[30..34].copy_from_slice(&frame[26..30]);
@@ -91,11 +104,16 @@ impl NetDevice for Peer {
         Ok(true)
     }
 
-    fn recv(&mut self, buffer: &mut [u8]) -> Result<Option<usize>> {
+    fn recv(&mut self, buffer: &mut [u8]) -> std::result::Result<Option<usize>, NetError> {
         let Some(frame) = self.replies.pop_front() else {
             return Ok(None);
         };
-        ensure!(buffer.len() >= frame.len(), "test peer RX buffer too small");
+        if buffer.len() < frame.len() {
+            return Err(NetError::Backend(Box::new(PeerError::Buffer {
+                capacity: buffer.len(),
+                length: frame.len(),
+            })));
+        }
         buffer[..frame.len()].copy_from_slice(&frame);
         Ok(Some(frame.len()))
     }
@@ -103,19 +121,19 @@ impl NetDevice for Peer {
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    ensure!(
-        args.next().as_deref() == Some("run"),
-        "usage: net-peer run [disk.qcow2 ...]"
-    );
+    if args.next().as_deref() != Some("run") {
+        return Err(ArgumentError::PeerUsage.into());
+    }
     let blocks = args
         .enumerate()
         .map(|(i, path)| Disk::open(Path::new(&path), false).map(|d| (format!("disk{i}"), d)))
-        .collect::<Result<BTreeMap<_, _>>>()?;
+        .collect::<std::result::Result<BTreeMap<_, _>, w_vmm::error::StorageError>>()?;
     let config = VmConfig {
         vcpu_count: std::env::var("W_VMM_VCPUS")
             .ok()
             .map(|s| s.parse())
-            .transpose()?
+            .transpose()
+            .map_err(ArgumentError::CpuCount)?
             .unwrap_or(1),
         ..VmConfig::default()
     };
@@ -131,5 +149,5 @@ fn main() -> Result<()> {
         .ok()
         .map(|path| w_vmm_demo::control::Server::bind(Path::new(&path), vmm.control()))
         .transpose()?;
-    vmm.run()
+    Ok(vmm.run()?)
 }

@@ -21,7 +21,7 @@ impl<T: SerialIo + ?Sized> SerialIo for Box<T> {
 /// Poll once, respecting UART FIFO backpressure.
 pub(crate) fn poll_input<T: Trigger<E = io::Error>, SI: SerialIo>(
     serial: &mut Serial<T, vm_superio::serial::NoEvents, SI>,
-) -> anyhow::Result<()> {
+) -> Result<(), crate::error::SerialError> {
     let capacity = serial.fifo_capacity();
     if capacity != 0 {
         let mut buffer = vec![0; capacity];
@@ -38,11 +38,10 @@ pub(crate) fn poll_input<T: Trigger<E = io::Error>, SI: SerialIo>(
             Err(error) => return Err(error.into()),
         };
         if count > buffer.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "serial recv returned more bytes than buffer capacity",
-            )
-            .into());
+            return Err(crate::error::SerialError::InvalidReceiveLength {
+                count,
+                capacity: buffer.len(),
+            });
         }
         if count != 0 {
             serial.enqueue_raw_bytes(&buffer[..count])?;
@@ -148,23 +147,13 @@ mod tests {
             poll_input(&mut serial).unwrap();
         }
         serial.writer_mut().read_error = Some(io::ErrorKind::BrokenPipe);
-        assert_eq!(
-            poll_input(&mut serial)
-                .unwrap_err()
-                .downcast_ref::<io::Error>()
-                .unwrap()
-                .kind(),
-            io::ErrorKind::BrokenPipe
+        assert!(
+            matches!(poll_input(&mut serial), Err(crate::error::SerialError::Io(e)) if e.kind() == io::ErrorKind::BrokenPipe)
         );
         serial.writer_mut().read_error = None;
         serial.writer_mut().invalid_length = true;
-        assert_eq!(
-            poll_input(&mut serial)
-                .unwrap_err()
-                .downcast_ref::<io::Error>()
-                .unwrap()
-                .kind(),
-            io::ErrorKind::InvalidData
+        assert!(
+            matches!(poll_input(&mut serial), Err(crate::error::SerialError::InvalidReceiveLength { count, capacity }) if count == capacity + 1)
         );
     }
 

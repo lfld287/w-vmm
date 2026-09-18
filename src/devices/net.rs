@@ -1,8 +1,10 @@
 use super::mmio::{Queues, VirtioDevice, read_config};
+use crate::error::DeviceError;
 use crate::net::NetDevice;
-use anyhow::{Result, ensure};
 use virtio_bindings::bindings::virtio_net::{VIRTIO_NET_F_MAC, VIRTIO_NET_F_MTU};
 use vm_memory::{Bytes, GuestMemoryMmap};
+
+type Result<T> = std::result::Result<T, DeviceError>;
 
 const HEADER: usize = 12; // VERSION_1 includes num_buffers even without MRG_RXBUF.
 const BUDGET: usize = 64;
@@ -17,15 +19,16 @@ pub(crate) struct Net<ND: NetDevice> {
 impl<ND: NetDevice> Net<ND> {
     pub(crate) fn new(backend: ND) -> Result<Self> {
         let max = backend.max_frame_len();
-        ensure!(
-            ND::MTU >= 68 && max >= ND::MTU as usize + 14 && max <= u16::MAX as usize + 18,
-            "invalid network MTU/frame capacity"
-        );
+        if !(ND::MTU >= 68 && max >= ND::MTU as usize + 14 && max <= u16::MAX as usize + 18) {
+            return Err(DeviceError::InvalidNetworkMtuFrameCapacity {
+                mtu: ND::MTU,
+                capacity: max,
+            });
+        }
         let mac = backend.mac_address();
-        ensure!(
-            mac[0] & 1 == 0 && mac != [0; 6],
-            "network MAC must be nonzero unicast"
-        );
+        if !(mac[0] & 1 == 0 && mac != [0; 6]) {
+            return Err(DeviceError::NetworkMacMustBeNonzeroUnicast);
+        }
         let mut config = [0; 12];
         config[..6].copy_from_slice(&mac);
         config[10..12].copy_from_slice(&ND::MTU.to_le_bytes());
@@ -45,19 +48,20 @@ impl<ND: NetDevice> Net<ND> {
                 let Some(chain) = queues.pop(1, mem)? else {
                     break;
                 };
-                ensure!(
-                    chain.descriptors.iter().all(|d| !d.is_write_only()),
-                    "TX descriptor must be readable"
-                );
+                if !chain.descriptors.iter().all(|d| !d.is_write_only()) {
+                    return Err(DeviceError::TxDescriptorMustBeReadable);
+                }
                 let total = chain
                     .descriptors
                     .iter()
                     .try_fold(0usize, |n, d| n.checked_add(d.len() as usize))
-                    .ok_or_else(|| anyhow::anyhow!("TX length overflow"))?;
-                ensure!(
-                    (HEADER + 14..=self.rx.len()).contains(&total),
-                    "invalid TX packet size"
-                );
+                    .ok_or_else(|| DeviceError::TxLengthOverflow)?;
+                if !(HEADER + 14..=self.rx.len()).contains(&total) {
+                    return Err(DeviceError::InvalidTxPacketSize {
+                        length: total,
+                        capacity: self.rx.len(),
+                    });
+                }
                 let mut packet = vec![0; total];
                 let mut offset = 0;
                 for d in &chain.descriptors {
@@ -65,10 +69,9 @@ impl<ND: NetDevice> Net<ND> {
                     mem.read_slice(&mut packet[offset..end], d.addr())?;
                     offset = end;
                 }
-                ensure!(
-                    packet[0] == 0 && packet[1] == 0,
-                    "unnegotiated TX checksum/GSO offload"
-                );
+                if !(packet[0] == 0 && packet[1] == 0) {
+                    return Err(DeviceError::UnnegotiatedTxChecksumGsoOffload);
+                }
                 // Ignore unused header fields; never forward virtio metadata to the backend.
                 (chain.head, packet[HEADER..].to_vec())
             };
@@ -89,22 +92,23 @@ impl<ND: NetDevice> Net<ND> {
             let Some(len) = self.backend.recv(&mut self.rx[HEADER..])? else {
                 break;
             };
-            ensure!(
-                (14..=self.rx.len() - HEADER).contains(&len),
-                "invalid backend RX packet size"
-            );
+            if !(14..=self.rx.len() - HEADER).contains(&len) {
+                return Err(DeviceError::InvalidBackendRxPacketSize {
+                    length: len,
+                    capacity: self.rx.len() - HEADER,
+                });
+            }
             let chain = queues
                 .pop(0, mem)?
-                .ok_or_else(|| anyhow::anyhow!("missing RX chain"))?;
-            ensure!(
-                chain.descriptors.iter().all(|d| d.is_write_only()),
-                "RX descriptor must be writable"
-            );
+                .ok_or_else(|| DeviceError::MissingRxChain)?;
+            if !chain.descriptors.iter().all(|d| d.is_write_only()) {
+                return Err(DeviceError::RxDescriptorMustBeWritable);
+            }
             let capacity = chain
                 .descriptors
                 .iter()
                 .try_fold(0usize, |n, d| n.checked_add(d.len() as usize))
-                .ok_or_else(|| anyhow::anyhow!("RX length overflow"))?;
+                .ok_or_else(|| DeviceError::RxLengthOverflow)?;
             let total = len + HEADER;
             if capacity < total {
                 // One receive buffer (possibly a chain) must hold the entire packet.
@@ -191,9 +195,13 @@ mod tests {
             1514
         }
 
-        fn send(&mut self, frame: &[u8]) -> Result<bool> {
+        fn send(&mut self, frame: &[u8]) -> std::result::Result<bool, crate::error::NetError> {
             let mut backend = self.borrow_mut();
-            ensure!(!backend.fail, "injected send failure");
+            if backend.fail {
+                return Err(crate::error::NetError::Backend(
+                    std::io::Error::other("injected send failure").into(),
+                ));
+            }
             if backend.blocked {
                 return Ok(false);
             }
@@ -201,9 +209,16 @@ mod tests {
             Ok(true)
         }
 
-        fn recv(&mut self, buffer: &mut [u8]) -> Result<Option<usize>> {
+        fn recv(
+            &mut self,
+            buffer: &mut [u8],
+        ) -> std::result::Result<Option<usize>, crate::error::NetError> {
             let mut backend = self.borrow_mut();
-            ensure!(!backend.fail, "injected receive failure");
+            if backend.fail {
+                return Err(crate::error::NetError::Backend(
+                    std::io::Error::other("injected receive failure").into(),
+                ));
+            }
             let Some(frame) = backend.received.pop_front() else {
                 return Ok(None);
             };
@@ -227,11 +242,14 @@ mod tests {
                 self.0
             }
 
-            fn send(&mut self, _: &[u8]) -> Result<bool> {
+            fn send(&mut self, _: &[u8]) -> std::result::Result<bool, crate::error::NetError> {
                 unreachable!()
             }
 
-            fn recv(&mut self, _: &mut [u8]) -> Result<Option<usize>> {
+            fn recv(
+                &mut self,
+                _: &mut [u8],
+            ) -> std::result::Result<Option<usize>, crate::error::NetError> {
                 unreachable!()
             }
         }
@@ -398,7 +416,9 @@ mod tests {
         let (mut net, mem, backend) = setup();
         tx(&net, &mem);
         backend.borrow_mut().fail = true;
-        assert!(net.poll(&mem).is_err());
+        assert!(
+            matches!(net.poll(&mem), Err(DeviceError::Net(crate::error::NetError::Backend(source))) if source.downcast_ref::<std::io::Error>().is_some())
+        );
         assert_eq!(used(&mem, 1), (0, 0));
     }
 }

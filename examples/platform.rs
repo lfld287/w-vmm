@@ -1,12 +1,13 @@
 //! A complete in-process platform example. No hypervisor or guest image needed.
 //! Run: cargo run -p w-vmm --example platform
-use anyhow::{Result, ensure};
 use std::{
     collections::BTreeMap,
     io::{self, Write},
     time::Duration,
 };
 use vm_memory::{GuestMemoryMmap, GuestMemoryRegion, GuestRegionMmap};
+use w_vmm::Result;
+use w_vmm::error::{MemoryError, NetError, PlatformError};
 use w_vmm::{
     VmConfig, Vmm, memory::Mapper, net::NetDevice, platform::*, serial::SerialIo, storage::Disk,
 };
@@ -22,15 +23,20 @@ struct Vm {
 impl Platform for InProcess {
     type Vm = Vm;
 
-    fn layout(&self, config: &VmConfig, needs: &DeviceRequirements) -> Result<MachineLayout> {
-        ensure!(
-            needs.devices.is_empty() && needs.hotplug.is_none(),
-            "example supports only UART"
-        );
+    fn layout(
+        &self,
+        config: &VmConfig,
+        needs: &DeviceRequirements,
+    ) -> std::result::Result<MachineLayout, PlatformError> {
+        if !(needs.devices.is_empty() && needs.hotplug.is_none()) {
+            return Err(PlatformError::Backend(
+                io::Error::other("example supports only UART").into(),
+            ));
+        }
         let size = config
             .memory_mib
             .checked_mul(1 << 20)
-            .ok_or_else(|| anyhow::anyhow!("RAM overflow"))?;
+            .ok_or_else(|| PlatformError::Backend(io::Error::other("RAM overflow").into()))?;
         Ok(MachineLayout {
             ram: vec![MemoryRange {
                 address: 0x100000,
@@ -47,8 +53,12 @@ impl Platform for InProcess {
         })
     }
 
-    fn create(&self, config: &VmConfig) -> Result<Vm> {
-        ensure!(config.vcpu_count == 1, "example supports one CPU");
+    fn create(&self, config: &VmConfig) -> std::result::Result<Vm, PlatformError> {
+        if config.vcpu_count != 1 {
+            return Err(PlatformError::Backend(
+                io::Error::other("example supports one CPU").into(),
+            ));
+        }
         Ok(Vm {
             mappings: BTreeMap::new(),
             running: false,
@@ -58,17 +68,29 @@ impl Platform for InProcess {
 }
 
 impl Mapper for Vm {
-    fn map(&mut self, region: &GuestRegionMmap) -> Result<()> {
-        ensure!(!self.running, "mapping requires quiescence");
+    fn map(&mut self, region: &GuestRegionMmap) -> std::result::Result<(), MemoryError> {
+        if self.running {
+            return Err(MemoryError::Backend(
+                io::Error::other("mapping requires quiescence").into(),
+            ));
+        }
         let address = region.start_addr().0;
-        ensure!(!self.mappings.contains_key(&address), "already mapped");
+        if self.mappings.contains_key(&address) {
+            return Err(MemoryError::Backend(
+                io::Error::other("already mapped").into(),
+            ));
+        }
         // A real hypervisor maps region.as_ptr() here, borrowing its allocation.
         self.mappings.insert(address, region.len());
         Ok(())
     }
 
-    fn unmap(&mut self, region: &GuestRegionMmap) -> Result<()> {
-        ensure!(!self.running, "unmapping requires quiescence");
+    fn unmap(&mut self, region: &GuestRegionMmap) -> std::result::Result<(), MemoryError> {
+        if self.running {
+            return Err(MemoryError::Backend(
+                io::Error::other("unmapping requires quiescence").into(),
+            ));
+        }
         self.mappings.remove(&region.start_addr().0);
         Ok(())
     }
@@ -77,18 +99,25 @@ impl Mapper for Vm {
 impl VirtualMachine for Vm {
     type Completion = usize;
 
-    fn prepare(&mut self, _: &GuestMemoryMmap, _: &MachineLayout) -> Result<()> {
+    fn prepare(
+        &mut self,
+        _: &GuestMemoryMmap,
+        _: &MachineLayout,
+    ) -> std::result::Result<(), PlatformError> {
         // Real platforms load their image, initialize registers and interrupt
         // controllers, and create parked vCPUs here. No CPU may execute yet.
         Ok(())
     }
 
-    fn start(&mut self) -> Result<()> {
+    fn start(&mut self) -> std::result::Result<(), PlatformError> {
         self.running = true;
         Ok(())
     }
 
-    fn poll_event(&mut self, _: Duration) -> Result<Option<Event<usize>>> {
+    fn poll_event(
+        &mut self,
+        _: Duration,
+    ) -> std::result::Result<Option<Event<usize>>, PlatformError> {
         let message = b"Hello from a custom platform!\n";
         if self.next == message.len() {
             return Ok(Some(Event::Shutdown));
@@ -103,23 +132,27 @@ impl VirtualMachine for Vm {
         })))
     }
 
-    fn complete_io(&mut self, completion: usize, _: u64) -> Result<()> {
-        ensure!(completion == self.next, "unexpected completion");
+    fn complete_io(&mut self, completion: usize, _: u64) -> std::result::Result<(), PlatformError> {
+        if completion != self.next {
+            return Err(PlatformError::Backend(
+                io::Error::other("unexpected completion").into(),
+            ));
+        }
         // A real platform writes back the read value and advances the guest PC.
         self.next += 1;
         Ok(())
     }
 
-    fn set_irq(&mut self, _: u32, _: bool) -> Result<()> {
+    fn set_irq(&mut self, _: u32, _: bool) -> std::result::Result<(), PlatformError> {
         Ok(())
     }
 
-    fn pause(&mut self) -> Result<()> {
+    fn pause(&mut self) -> std::result::Result<(), PlatformError> {
         self.running = false;
         Ok(())
     }
 
-    fn resume(&mut self) -> Result<()> {
+    fn resume(&mut self) -> std::result::Result<(), PlatformError> {
         self.running = true;
         Ok(())
     }
@@ -167,11 +200,11 @@ impl NetDevice for NoNet {
         1514
     }
 
-    fn send(&mut self, _: &[u8]) -> Result<bool> {
+    fn send(&mut self, _: &[u8]) -> std::result::Result<bool, NetError> {
         Ok(true)
     }
 
-    fn recv(&mut self, _: &mut [u8]) -> Result<Option<usize>> {
+    fn recv(&mut self, _: &mut [u8]) -> std::result::Result<Option<usize>, NetError> {
         Ok(None)
     }
 }

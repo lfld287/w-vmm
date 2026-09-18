@@ -1,10 +1,12 @@
 //! virtio-mem 1.2 and transactional, sparse guest-memory mappings.
 use super::mmio::{self, Queues, VirtioDevice};
-use anyhow::{Result, ensure};
+use crate::error::MemoryError;
 use std::{collections::BTreeMap, sync::Arc};
 use vm_memory::{
     Address, Bytes, GuestAddress, GuestMemoryMmap, GuestMemoryRegion, GuestRegionMmap,
 };
+
+type Result<T> = std::result::Result<T, MemoryError>;
 
 // virtio-mem protocol/mapping granularity, independent of Linux hotplug blocks.
 const BLOCK: u64 = 2 << 20;
@@ -75,14 +77,19 @@ impl VirtioMem {
             } else {
                 mapper.unmap(region)
             };
-            if result.is_err() {
-                let mut failed = false;
+            if let Err(source) = result {
+                let mut rollback = None;
                 for r in regions[..done].iter().rev() {
-                    failed |= if plug { mapper.unmap(r) } else { mapper.map(r) }.is_err();
+                    if let Err(error) = if plug { mapper.unmap(r) } else { mapper.map(r) } {
+                        rollback.get_or_insert(error);
+                    }
                 }
-                if failed {
+                if let Some(rollback) = rollback {
                     self.retained.extend(regions);
-                    anyhow::bail!("memory mapping rollback failed; stopping VM");
+                    return Err(MemoryError::RollbackFailed {
+                        source: Box::new(source),
+                        rollback: Box::new(rollback),
+                    });
                 }
                 return Ok(false);
             }
@@ -101,12 +108,13 @@ impl VirtioMem {
 
 impl VirtioMem {
     pub(crate) fn new(region_size_mib: u64) -> Result<Self> {
-        ensure!(
-            region_size_mib > 0
-                && region_size_mib.is_multiple_of(HOTPLUG_BLOCK_SIZE / crate::memory::MIB),
-            "virtio-mem region must be a positive multiple of {} MiB",
-            HOTPLUG_BLOCK_SIZE / crate::memory::MIB
-        );
+        if !(region_size_mib > 0
+            && region_size_mib.is_multiple_of(HOTPLUG_BLOCK_SIZE / crate::memory::MIB))
+        {
+            return Err(MemoryError::InvalidRegionSize {
+                mib: region_size_mib,
+            });
+        }
         let capacity = crate::memory::mib_bytes(region_size_mib)?;
         Ok(Self {
             start: 0,
@@ -125,13 +133,12 @@ impl VirtioMem {
     }
 
     pub(crate) fn attach_at(&mut self, start: u64) -> Result<()> {
-        ensure!(
-            start.is_multiple_of(HOTPLUG_BLOCK_SIZE),
-            "hotplug alignment"
-        );
+        if !start.is_multiple_of(HOTPLUG_BLOCK_SIZE) {
+            return Err(MemoryError::HotplugAlignment { address: start });
+        }
         start
             .checked_add(self.capacity)
-            .ok_or_else(|| anyhow::anyhow!("hotplug overflow"))?;
+            .ok_or_else(|| MemoryError::HotplugOverflow)?;
         self.start = start;
         self.requested = crate::memory::mib_bytes(self.control.status().requested_size_mib)?;
         Ok(())
@@ -142,18 +149,19 @@ impl VirtioMem {
         let end = 0x4000_0000u64
             .checked_add(crate::memory::mib_bytes(base_mib)?)
             .and_then(|v| v.checked_next_multiple_of(HOTPLUG_BLOCK_SIZE))
-            .ok_or_else(|| anyhow::anyhow!("hotplug overflow"))?;
+            .ok_or_else(|| MemoryError::HotplugOverflow)?;
         self.attach_at(end)
     }
 
     #[cfg(test)]
     fn validate_ipa(&self, bits: u32) -> Result<()> {
-        ensure!(
-            self.start
-                .checked_add(self.capacity)
-                .is_some_and(|e| bits == 64 || e <= 1u64 << bits),
-            "IPA overflow"
-        );
+        if !self
+            .start
+            .checked_add(self.capacity)
+            .is_some_and(|e| bits == 64 || e <= 1u64 << bits)
+        {
+            return Err(MemoryError::IpaOverflow);
+        }
         Ok(())
     }
 
@@ -173,7 +181,7 @@ impl VirtioMem {
         }
         for region in regions.values() {
             if let Err(e) = mapper.unmap(region) {
-                eprintln!("final hotplug unmap: {e:#}");
+                eprintln!("final hotplug unmap: {}", crate::error::diagnostic(&e));
             }
         }
     }
@@ -267,7 +275,7 @@ impl VirtioMem {
         mapper: &mut M,
         view: &mut GuestMemoryMmap,
         pinned: &[(u64, u64)],
-    ) -> Result<()> {
+    ) -> std::result::Result<(), crate::error::DeviceError> {
         // Bound work so host stop/input requests remain responsive.
         for _ in 0..128 {
             let Some(chain) = queues.pop(0, view)? else {
@@ -285,10 +293,9 @@ impl VirtioMem {
                 .filter(|d| d.is_write_only())
                 .map(|d| d.len() as usize)
                 .sum();
-            ensure!(
-                read == 24 && write >= 10,
-                "invalid virtio-mem request buffers"
-            );
+            if !(read == 24 && write >= 10) {
+                return Err(MemoryError::InvalidVirtioMemRequestBuffers { read, write }.into());
+            }
             let mut req = [0; 24];
             let mut offset = 0;
             let mut writable = false;
@@ -298,7 +305,9 @@ impl VirtioMem {
                 if d.is_write_only() {
                     writable = true;
                 } else {
-                    ensure!(!writable, "readable descriptor after writable descriptor");
+                    if writable {
+                        return Err(MemoryError::ReadableDescriptorAfterWritableDescriptor.into());
+                    }
                     view.read_slice(&mut req[offset..offset + d.len() as usize], d.addr())?;
                     offset += d.len() as usize;
                 }
@@ -358,11 +367,16 @@ impl VirtioDevice for VirtioMem {
         mmio::read_config(&config, offset, data);
     }
 
-    fn notify(&mut self, _: usize, _: &mut Queues, _: &GuestMemoryMmap) -> Result<()> {
+    fn notify(
+        &mut self,
+        _: usize,
+        _: &mut Queues,
+        _: &GuestMemoryMmap,
+    ) -> std::result::Result<(), crate::error::DeviceError> {
         Ok(())
     }
 
-    fn reset(&mut self) -> Result<()> {
+    fn reset(&mut self) -> std::result::Result<(), crate::error::DeviceError> {
         self.control.lock().driver_ready = false;
         Ok(())
     }
@@ -393,14 +407,22 @@ mod tests {
     impl Mapper for Fake {
         fn map(&mut self, r: &GuestRegionMmap) -> Result<()> {
             self.calls += 1;
-            ensure!(!self.fail.contains(&self.calls), "injected map failure");
+            if self.fail.contains(&self.calls) {
+                return Err(MemoryError::Backend(
+                    std::io::Error::other("injected map failure").into(),
+                ));
+            }
             assert!(self.mapped.insert(r.start_addr().0));
             Ok(())
         }
 
         fn unmap(&mut self, r: &GuestRegionMmap) -> Result<()> {
             self.calls += 1;
-            ensure!(!self.fail.contains(&self.calls), "injected unmap failure");
+            if self.fail.contains(&self.calls) {
+                return Err(MemoryError::Backend(
+                    std::io::Error::other("injected unmap failure").into(),
+                ));
+            }
             assert!(self.mapped.remove(&r.start_addr().0));
             Ok(())
         }
@@ -427,7 +449,13 @@ mod tests {
                 lifecycle: MemoryLifecycle::Created,
             }
         );
-        assert!(c.set_requested_mib(3).is_err());
+        assert!(matches!(
+            c.set_requested_mib(3),
+            Err(MemoryError::InvalidTarget {
+                requested: 3,
+                capacity: H
+            })
+        ));
         assert!(c.set_requested_mib(2 * H).is_err());
         std::thread::scope(|s| {
             for n in 0..32 {
@@ -445,7 +473,7 @@ mod tests {
         assert_eq!(c.status().lifecycle, MemoryLifecycle::Running);
         d.stop(&mut Fake::default());
         assert_eq!(c.status().lifecycle, MemoryLifecycle::Stopped);
-        assert!(c.set_requested_mib(0).is_err());
+        assert!(matches!(c.set_requested_mib(0), Err(MemoryError::Stopped)));
         let unused = VirtioMem::new(HOTPLUG_BLOCK_SIZE / crate::memory::MIB).unwrap();
         let c = unused.control();
         drop(unused);

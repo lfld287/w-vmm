@@ -1,11 +1,13 @@
 //! vCPU ownership, PSCI power state and cancellable quiescence.
 use super::hvf;
-use anyhow::{Result, bail, ensure};
+use crate::error::PlatformError;
 use std::{
     sync::{Arc, Condvar, Mutex, mpsc},
     thread::JoinHandle,
     time::Duration,
 };
+
+type Result<T> = std::result::Result<T, PlatformError>;
 
 pub struct Access {
     pub addr: u64,
@@ -17,7 +19,7 @@ pub struct Access {
 
 pub enum Event {
     Access(Access),
-    Failed(anyhow::Error),
+    Failed(PlatformError),
     Shutdown,
 }
 
@@ -144,7 +146,9 @@ impl Shared {
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
         }
-        ensure!(!s.stop, "VM stopped during memory transaction");
+        if s.stop {
+            return Err(PlatformError::VmStoppedDuringMemoryTransaction);
+        }
         Ok(())
     }
 }
@@ -189,14 +193,14 @@ impl Cpus {
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                             || -> Result<()> {
                                 tx.send(Ok(()))
-                                    .map_err(|_| anyhow::anyhow!("startup cancelled"))?;
+                                    .map_err(|_| PlatformError::StartupCancelled)?;
                                 worker(&cpu, index, &shared, &events)
                             },
                         ));
                         let error = match result {
                             Ok(Ok(())) => None,
                             Ok(Err(e)) => Some(e),
-                            Err(_) => Some(anyhow::anyhow!("vCPU thread panicked")),
+                            Err(_) => Some(PlatformError::VcpuThreadPanicked),
                         };
                         if let Some(error) = error {
                             let _ = events.send(Event::Failed(error));
@@ -221,7 +225,7 @@ impl Cpus {
                     })?,
             );
             rx.recv()
-                .map_err(|_| anyhow::anyhow!("vCPU initialization thread failed"))??;
+                .map_err(|_| PlatformError::VcpuInitializationThreadFailed)??;
         }
         Ok(cpus)
     }
@@ -305,7 +309,9 @@ fn worker(
                             0x84000004 | 0xc4000004 => shared.affinity(arg(1)?, arg(2)?),
                             0x84000006 => 2, // MIGRATE_INFO_TYPE: no trusted OS.
                             0x84000008 | 0x84000009 => {
-                                events.send(Event::Shutdown)?;
+                                events
+                                    .send(Event::Shutdown)
+                                    .map_err(|_| PlatformError::EventChannelDisconnected)?;
                                 shared.stop();
                                 return Ok(());
                             }
@@ -314,21 +320,25 @@ fn worker(
                         cpu.set(0, value as u64)?;
                     }
                     0x24 => {
-                        ensure!(
-                            esr & (1 << 24) != 0 && esr & ((1 << 7) | (1 << 8)) == 0,
-                            "unsupported data abort: {e:?}"
-                        );
+                        if !(esr & (1 << 24) != 0 && esr & ((1 << 7) | (1 << 8)) == 0) {
+                            return Err(PlatformError::UnsupportedDataAbort {
+                                syndrome: e.syndrome,
+                                address: e.physical_address,
+                            });
+                        }
                         let width = 1usize << ((esr >> 22) & 3);
                         let reg = ((esr >> 16) & 31) as u32;
                         let write = esr & (1 << 6) != 0;
                         let (reply, rx) = mpsc::sync_channel(1);
-                        events.send(Event::Access(Access {
-                            addr: e.physical_address,
-                            width,
-                            write,
-                            value: if write && reg != 31 { cpu.get(reg)? } else { 0 },
-                            reply,
-                        }))?;
+                        events
+                            .send(Event::Access(Access {
+                                addr: e.physical_address,
+                                width,
+                                write,
+                                value: if write && reg != 31 { cpu.get(reg)? } else { 0 },
+                                reply,
+                            }))
+                            .map_err(|_| PlatformError::EventChannelDisconnected)?;
                         // A queued access owns its reply channel; it remains pending
                         // across pause. No guest register work occurs while waiting.
                         shared.wait_io(index);
@@ -370,10 +380,9 @@ fn worker(
                             | (((esr >> 10) & 15) << 7)
                             | (((esr >> 1) & 15) << 3)
                             | ((esr >> 17) & 7);
-                        ensure!(
-                            matches!(sysreg, 0x8084 | 0x808c | 0x809c),
-                            "unsupported sysreg {sysreg:#x}, ESR={esr:#x}"
-                        );
+                        if !matches!(sysreg, 0x8084 | 0x808c | 0x809c) {
+                            return Err(PlatformError::UnsupportedSysreg { sysreg, esr });
+                        }
                         let rt = ((esr >> 5) & 31) as u32;
                         if esr & 1 != 0 && rt != 31 {
                             cpu.set(rt, 0)?;
@@ -381,10 +390,21 @@ fn worker(
                         cpu.advance()?;
                     }
                     1 => cpu.advance()?,
-                    _ => bail!("unhandled HVF exception {e:?}, PC={:#x}", cpu.get(31)?),
+                    _ => {
+                        return Err(PlatformError::UnhandledException {
+                            syndrome: e.syndrome,
+                            address: e.physical_address,
+                            pc: cpu.get(31)?,
+                        });
+                    }
                 }
             }
-            _ => bail!("unexpected HVF exit {exit:?}"),
+            _ => {
+                return Err(PlatformError::UnexpectedHvfExit {
+                    reason: exit.reason,
+                    syndrome: exit.exception.syndrome,
+                });
+            }
         }
     }
 }

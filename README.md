@@ -92,13 +92,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 `VmConfig` 配置 `memory_mib` 和 `vcpu_count`。后端由调用方创建并交给泛型入口：
 
 ```rust,ignore
-pub fn run<BS: BlockStorage, ND: NetDevice, SI: SerialIo>(
-    self,
-    blocks: BTreeMap<String, BS>,
-    net: Option<ND>,
-    memory: Option<VirtioMem>,
-    serial: SI,
-) -> anyhow::Result<()>;
+impl<BS: BlockStorage, ND: NetDevice, SI: SerialIo> Vmm<BS, ND, SI> {
+    pub fn run(self) -> w_vmm::Result<()>;
+    pub fn run_with_platform<P: Platform>(self, platform: P) -> w_vmm::Result<()>;
+}
 ```
 
 多个磁盘使用 `BTreeMap<String, BS>`，空 map 表示无磁盘；网络使用 `Option<ND>`。例如：
@@ -119,7 +116,7 @@ fn run(serial: impl SerialIo) -> Result<(), Box<dyn std::error::Error>> {
 
 磁盘名允许 1–20 个 ASCII 字母、数字、`.`、`_`、`-`，按名称排序分配设备地址，名称通过 virtio-blk GET_ID 暴露为 serial。客户机使用 `/sys/block/vda/serial` 等识别磁盘；`sda` 是注册名，不会把 virtio 磁盘改名为 `/dev/sda`。Linux 分配 `/dev/vda`、`/dev/vdb` 等名称，添加/删除排序靠前的设备可能改变这些名称。
 
-同一 map 可用 `Box<dyn BlockStorage>` 混合不同存储实现；已提供 `Box<T>` 的 trait 转发。`BlockStorage` 本身保持原有接口。`Vmm` 接管后端所有权，退出时尝试刷新全部磁盘；即使一块盘刷新失败也继续处理其余磁盘。
+同一 map 可用 `Box<dyn BlockStorage>` 混合不同存储实现；已提供 `Box<T>` 的 trait 转发。`BlockStorage` 的可失败方法返回 `Result<T, StorageError>`。`Vmm` 接管后端所有权，退出时尝试刷新全部磁盘；即使一块盘刷新失败也继续处理其余磁盘。
 
 `net::NetDevice` 提供 `mac_address`、必填关联常量 `MTU: u16`、`max_frame_len` 和非阻塞 `send` / `recv`，传输完整以太网帧，不含 FCS 或 virtio 头。`send` 返回 `false` 表示未消费该帧、稍后重试；`recv` 返回 `None` 表示没有数据。trait 不涉及 DHCP、IP、路由或 NAT；这些服务由具体后端决定。实现不需要 `Send` / `Sync`，可用 `Box<T>` 包装具体后端，关联常量会转发给 `T`。
 
@@ -128,6 +125,36 @@ fn run(serial: impl SerialIo) -> Result<(), Box<dyn std::error::Error>> {
 客户机输出使用同步 `write_all` / `flush`，没有额外输出队列。输入的其他错误及输出错误会终止运行，并尝试刷新全部磁盘。库不解释 `0x1d` 等控制字节；终端 raw mode、stdin/stdout、Ctrl-]、信号和恢复由 `demo/src/terminal.rs` 的 `Terminal` 实现负责。`Terminal::new()` 返回 `(Terminal, TerminalGuard)`，调用方必须保留 guard 直到 `run()` 返回。信号和 Ctrl-] 通过本地通知通道唤醒独立线程，再调用同步 `VmControl::stop()`；串口销毁只恢复终端，guard 注销信号并回收线程。自定义后端需要退出时也应通知其他线程调用 `VmControl::stop()`，不可在 VMM 回调内调用阻塞控制方法。
 
 内核和 initramfs 仍由库提供；调用程序需附加相同的 Hypervisor entitlement 本地签名。磁盘、网络、内存设备和串口在构造时传入，`run()` 不再接收设备参数，也不隐式创建终端。
+
+## 错误类型（公开 API 变更）
+
+工作区使用 `thiserror = "2"`。根模块导出 `Error` 和 `Result<T>`（即 `std::result::Result<T, w_vmm::Error>`）；`error` 模块按业务边界定义错误，顶层 `Error` 提供各模块的 `From` 转换。
+
+| 接口 | 错误类型（位于 `w_vmm::error`） |
+| --- | --- |
+| `BlockStorage`、`Disk`、存储校验 | `StorageError` |
+| `NetDevice`、`Vmnet` | `NetError` |
+| `Mapper`、`VirtioMem` | `MemoryError` |
+| `Platform`、`VirtualMachine` | `PlatformError` |
+| `boot` 辅助函数 | `BootError` |
+| `VmControl` 可失败方法 | `ControlError` |
+| `Vmm::run`、`run_with_platform` | `Error` |
+
+`SerialIo` 和标准读写接口仍返回 `std::io::Result`，内部 UART 边界转换为 `SerialError`。设备协议与运行时错误分别为 `DeviceError`、`RuntimeError`。demo 独立定义参数、终端和控制协议错误。
+
+自定义后端需更新 trait 方法的返回类型；可以通过 `Backend` 包装自己的错误：
+
+```rust
+use w_vmm::error::StorageError;
+
+fn flush_backend(file: &std::fs::File) -> Result<(), StorageError> {
+    file.sync_all().map_err(|source| StorageError::Backend(Box::new(source)))
+}
+```
+
+`StorageError`、`NetError`、`MemoryError`、`PlatformError` 的 `Backend` 接受 `Box<dyn std::error::Error + Send + Sync + 'static>`；这些约束只作用于错误，后端对象仍无需 `Send` / `Sync`。外部项目可选用 `thiserror 2` 定义自己的错误。
+
+错误变体保留容量、地址、请求长度、状态码等字段，I/O 上下文保留操作、路径及原始 `source`。可以匹配具体变体，使用标准 `Error::source()` 遍历原因，或用 `w_vmm::error::diagnostic(&error)` 输出完整诊断。控制线程回复和 `VmStatus::final_error` 仍为字符串；回复失败与重复 `stop()` 的清理失败分别返回 `ControlError::ReplyFailed`、`ControlError::CleanupFailed`，保留相同诊断。
 
 ## 多核与动态内存
 
@@ -161,7 +188,7 @@ assert!(control.supports_memory());
 control.set_requested_mib(512)?;
 println!("{:?}", control.memory_status()?);
 // 将 control.clone() 交给控制线程，再调用 vm.run()。
-# Ok::<(), anyhow::Error>(())
+# Ok::<(), w_vmm::Error>(())
 ```
 
 调节成功表示目标已接受，客户机异步完成扩缩容。`memory_status()?` 包含 `region_size_mib`、`requested_size_mib`、`plugged_size_mib`、`driver_ready` 和 `Created / Running / Stopped` 生命周期。启动前允许调节；退出或丢弃未运行的 Vmm 后拒绝调节，句柄保留最终状态。
@@ -376,7 +403,7 @@ sudo env "PATH=$PATH" python3 scripts/smoke-net.py \
 cargo run -p w-vmm --example platform
 ```
 
-此示例通过端口 UART 输出一行文字后关机，无需虚拟化权限。外部项目需要 `anyhow = "1"`、`vm-memory = { version = "0.18", features = ["backend-mmap"] }` 和 `w-vmm`。覆盖多个 RAM 区间、virtio 队列、动态内存映射及故障注入的完整实现见 [`tests/platform.rs`](tests/platform.rs)，它仅使用公开 API。
+此示例通过端口 UART 输出一行文字后关机，无需虚拟化权限。外部项目需要 `vm-memory = { version = "0.18", features = ["backend-mmap"] }` 和 `w-vmm`。覆盖多个 RAM 区间、virtio 队列、动态内存映射及故障注入的完整实现见 [`tests/platform.rs`](tests/platform.rs)，它仅使用公开 API。
 
 实现 `platform::Platform` 的 `layout` 和 `create`，关联的 VM 实现 `memory::Mapper` 与 `platform::VirtualMachine`。布局需求按磁盘名称排序，然后是网络、动态内存；返回相同顺序的 virtio-MMIO 区间。库校验地址溢出、区间重叠、RAM 总容量、设备数量与热插拔容量/对齐。端口与 MMIO 属于不同地址空间；UART 使用八个连续的字节寄存器。平台还须校验自身支持的 CPU 数量、映射粒度和 IRQ 范围。
 

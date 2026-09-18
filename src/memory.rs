@@ -1,13 +1,15 @@
 //! Public memory control and platform mapping contract.
-use anyhow::{Result, ensure};
+use crate::error::MemoryError;
 use std::sync::{Arc, Mutex, MutexGuard};
 use vm_memory::GuestRegionMmap;
+
+type Result<T> = std::result::Result<T, MemoryError>;
 pub(crate) const MIB: u64 = 1 << 20;
 pub(crate) const HOTPLUG_BLOCK_SIZE: u64 = 128 << 20;
 
 pub(crate) fn mib_bytes(mib: u64) -> Result<u64> {
     mib.checked_mul(MIB)
-        .ok_or_else(|| anyhow::anyhow!("memory capacity overflow"))
+        .ok_or_else(|| MemoryError::CapacityOverflow { mib })
 }
 
 /// Each operation must be atomic on error. Mappings borrow the region until
@@ -19,11 +21,12 @@ pub trait Mapper {
 }
 
 fn validate_target(target: u64, capacity: u64) -> Result<()> {
-    ensure!(
-        target.is_multiple_of(HOTPLUG_BLOCK_SIZE / crate::memory::MIB) && target <= capacity,
-        "requested memory must be a multiple of {} MiB within region capacity",
-        HOTPLUG_BLOCK_SIZE / crate::memory::MIB
-    );
+    if !(target.is_multiple_of(HOTPLUG_BLOCK_SIZE / MIB) && target <= capacity) {
+        return Err(MemoryError::InvalidTarget {
+            requested: target,
+            capacity,
+        });
+    }
     Ok(())
 }
 
@@ -64,10 +67,9 @@ impl MemoryControl {
     /// Accept a desired extra-memory size. The guest may not reach it immediately.
     pub fn set_requested_mib(&self, requested: u64) -> Result<()> {
         let mut state = self.lock();
-        ensure!(
-            state.lifecycle != MemoryLifecycle::Stopped,
-            "VM has stopped"
-        );
+        if state.lifecycle == MemoryLifecycle::Stopped {
+            return Err(MemoryError::Stopped);
+        }
         validate_target(requested, state.region_size_mib)?;
         state.requested_size_mib = requested;
         Ok(())

@@ -1,4 +1,5 @@
-use anyhow::{Context, Result, ensure};
+use crate::error::TerminalError;
+type Result<T> = std::result::Result<T, TerminalError>;
 use signal_hook::{
     SigId,
     consts::{SIGHUP, SIGINT, SIGTERM},
@@ -50,7 +51,9 @@ impl TerminalGuard {
     }
 
     pub fn bind(&mut self, control: VmControl) -> Result<()> {
-        ensure!(self.thread.is_none(), "terminal guard is already bound");
+        if !self.thread.is_none() {
+            return Err(TerminalError::AlreadyBound);
+        }
         let mut read = self.read.as_ref().unwrap().try_clone()?;
         let closing = self.closing.clone();
         self.thread = Some(thread::Builder::new().name("terminal-stop".into()).spawn(
@@ -102,17 +105,32 @@ impl Terminal {
             if libc::isatty(0) == 1 {
                 let mut old = std::mem::zeroed();
                 if libc::tcgetattr(0, &mut old) != 0 {
-                    return Err(io::Error::last_os_error()).context("get terminal mode");
+                    return Err(io::Error::last_os_error()).map_err(|source| {
+                        TerminalError::Operation {
+                            operation: "get terminal mode",
+                            source,
+                        }
+                    });
                 }
                 t.saved = Some(old);
                 let mut raw = old;
                 libc::cfmakeraw(&mut raw);
                 if libc::tcsetattr(0, libc::TCSANOW, &raw) != 0 {
-                    return Err(io::Error::last_os_error()).context("set terminal raw mode");
+                    return Err(io::Error::last_os_error()).map_err(|source| {
+                        TerminalError::Operation {
+                            operation: "set terminal raw mode",
+                            source,
+                        }
+                    });
                 }
             }
             if flags >= 0 && libc::fcntl(0, libc::F_SETFL, flags | libc::O_NONBLOCK) != 0 {
-                return Err(io::Error::last_os_error()).context("set stdin nonblocking");
+                return Err(io::Error::last_os_error()).map_err(|source| {
+                    TerminalError::Operation {
+                        operation: "set stdin nonblocking",
+                        source,
+                    }
+                });
             }
         }
         Ok((t, guard))
@@ -184,7 +202,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while control.status().lifecycle != w_vmm::VmLifecycle::Stopped {
             assert!(std::time::Instant::now() < deadline);
-            std::thread::yield_now();
+            thread::yield_now();
         }
         assert_eq!(
             control.memory_status().unwrap().lifecycle,

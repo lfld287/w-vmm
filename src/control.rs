@@ -1,11 +1,13 @@
 //! Synchronous, thread-safe control of a VM owned by another thread.
+use crate::error::ControlError;
 use crate::memory::{MemoryControl, MemoryLifecycle, MemoryStatus};
-use anyhow::{Result, bail, ensure};
 use std::{
     collections::VecDeque,
     sync::{Arc, Condvar, Mutex, mpsc},
     thread::ThreadId,
 };
+
+type Result<T> = std::result::Result<T, ControlError>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VmLifecycle {
@@ -56,7 +58,9 @@ pub(crate) struct Request {
 
 fn result(error: &Option<String>) -> Result<()> {
     match error {
-        Some(e) => bail!("{e}"),
+        Some(e) => Err(ControlError::CleanupFailed {
+            message: e.to_string(),
+        }),
         None => Ok(()),
     }
 }
@@ -87,7 +91,7 @@ impl VmControl {
         self.0
             .memory
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("virtio-mem is not configured"))
+            .ok_or_else(|| ControlError::MemoryNotConfigured)
     }
 
     /// Read the current or final memory state; errors if virtio-mem is absent.
@@ -98,7 +102,7 @@ impl VmControl {
     /// Accept a target before startup, while running, or while paused.
     /// The guest reaches it asynchronously while running. Stopped VMs reject it.
     pub fn set_requested_mib(&self, requested: u64) -> Result<()> {
-        self.memory()?.set_requested_mib(requested)
+        Ok(self.memory()?.set_requested_mib(requested)?)
     }
 
     fn stop_memory(&self) {
@@ -127,23 +131,21 @@ impl VmControl {
         let (reply, rx) = mpsc::channel();
         {
             let mut s = self.0.state.lock().unwrap();
-            ensure!(
-                s.owner != Some(std::thread::current().id()),
-                "blocking VM control on the VMM thread"
-            );
-            ensure!(
-                matches!(
-                    s.status.lifecycle,
-                    VmLifecycle::Running | VmLifecycle::Paused
-                ),
-                "VM is not running"
-            );
+            if s.owner == Some(std::thread::current().id()) {
+                return Err(ControlError::OwnerThread);
+            }
+            if !matches!(
+                s.status.lifecycle,
+                VmLifecycle::Running | VmLifecycle::Paused
+            ) {
+                return Err(ControlError::NotRunning);
+            }
             s.queue.push_back(Request { operation, reply });
             self.0.changed.notify_all();
         }
         rx.recv()
-            .map_err(|_| anyhow::anyhow!("VM control disconnected"))?
-            .map_err(anyhow::Error::msg)
+            .map_err(|_| ControlError::Disconnected)?
+            .map_err(ControlError::ReplyFailed)
     }
 
     /// Wait for workers, disk flushing and resource destruction. Repeated calls
@@ -152,10 +154,9 @@ impl VmControl {
     /// until it is consumed or dropped.
     pub fn stop(&self) -> Result<()> {
         let mut s = self.0.state.lock().unwrap();
-        ensure!(
-            s.owner != Some(std::thread::current().id()),
-            "blocking VM control on the VMM thread"
-        );
+        if s.owner == Some(std::thread::current().id()) {
+            return Err(ControlError::OwnerThread);
+        }
         if s.status.lifecycle == VmLifecycle::Created {
             self.stop_memory();
             s.status.lifecycle = VmLifecycle::Stopped;
@@ -178,10 +179,9 @@ impl VmControl {
 
     pub(crate) fn begin(&self) -> Result<()> {
         let mut s = self.0.state.lock().unwrap();
-        ensure!(
-            s.status.lifecycle == VmLifecycle::Created,
-            "VM was cancelled before run"
-        );
+        if s.status.lifecycle != VmLifecycle::Created {
+            return Err(ControlError::Cancelled);
+        }
         s.owner = Some(std::thread::current().id());
         s.status.lifecycle = VmLifecycle::Starting;
         Ok(())
@@ -202,7 +202,7 @@ impl VmControl {
         self.0.state.lock().unwrap().queue.pop_front()
     }
 
-    pub(crate) fn complete(&self, request: Request, outcome: &Result<()>) {
+    pub(crate) fn complete(&self, request: Request, outcome: &crate::Result<()>) {
         let mut s = self.0.state.lock().unwrap();
         if outcome.is_ok() && s.status.lifecycle != VmLifecycle::Stopping {
             s.status.lifecycle = match request.operation {
@@ -210,9 +210,12 @@ impl VmControl {
                 Operation::Resume => VmLifecycle::Running,
             };
         }
-        let _ = request
-            .reply
-            .send(outcome.as_ref().map(|_| ()).map_err(|e| format!("{e:#}")));
+        let _ = request.reply.send(
+            outcome
+                .as_ref()
+                .map(|_| ())
+                .map_err(|e| crate::error::diagnostic(e)),
+        );
     }
 
     pub(crate) fn wait(&self) {
@@ -228,16 +231,16 @@ impl VmControl {
         Self::cancel(&mut s);
     }
 
-    pub(crate) fn cleanup_result(&self, outcome: &Result<()>) {
+    pub(crate) fn cleanup_result(&self, outcome: &crate::Result<()>) {
         self.0.state.lock().unwrap().cleanup_error =
-            outcome.as_ref().err().map(|e| format!("{e:#}"));
+            outcome.as_ref().err().map(|e| crate::error::diagnostic(e));
     }
 
-    pub(crate) fn finish(&self, outcome: &Result<()>) {
+    pub(crate) fn finish(&self, outcome: &crate::Result<()>) {
         self.stop_memory();
         let mut s = self.0.state.lock().unwrap();
         s.status.lifecycle = VmLifecycle::Stopped;
-        s.status.final_error = outcome.as_ref().err().map(|e| format!("{e:#}"));
+        s.status.final_error = outcome.as_ref().err().map(|e| crate::error::diagnostic(e));
         s.owner = None;
         Self::cancel(&mut s);
         self.0.changed.notify_all();
@@ -246,7 +249,7 @@ impl VmControl {
     pub(crate) fn dropped(&self) {
         if self.status().lifecycle != VmLifecycle::Stopped {
             if std::thread::panicking() {
-                let error = Err(anyhow::anyhow!("VMM thread panicked"));
+                let error = Err(crate::error::RuntimeError::VmmThreadPanicked.into());
                 self.cleanup_result(&error);
                 self.finish(&error);
             } else {
@@ -265,11 +268,11 @@ mod tests {
         fn thread_safe<T: Clone + Send + Sync>() {}
         thread_safe::<VmControl>();
         let c = VmControl::new(None);
-        assert!(c.pause().is_err());
-        assert!(c.resume().is_err());
+        assert!(matches!(c.pause(), Err(ControlError::NotRunning)));
+        assert!(matches!(c.resume(), Err(ControlError::NotRunning)));
         c.stop().unwrap();
         c.stop().unwrap();
-        assert!(c.begin().is_err());
+        assert!(matches!(c.begin(), Err(ControlError::Cancelled)));
         c.dropped();
         assert_eq!(c.status().lifecycle, VmLifecycle::Stopped);
         let c = VmControl::new(None);
@@ -335,16 +338,54 @@ mod tests {
         while !c.stopping() {
             std::thread::yield_now();
         }
-        assert!(pause.join().unwrap().is_err());
+        assert!(
+            matches!(pause.join().unwrap(), Err(ControlError::ReplyFailed(message)) if message == "VM is stopping")
+        );
         assert!(stops.iter().all(|t| !t.is_finished()));
         assert!(c.next().is_none());
-        let error = Err(anyhow::anyhow!("flush failed"));
+        let error = Err(crate::error::StorageError::Backend(
+            std::io::Error::other("flush failed").into(),
+        )
+        .into());
         c.cleanup_result(&error);
         c.finish(&error);
         for t in stops {
             assert_eq!(t.join().unwrap().unwrap_err().to_string(), "flush failed");
         }
-        assert_eq!(c.stop().unwrap_err().to_string(), "flush failed");
+        assert!(
+            matches!(c.stop(), Err(ControlError::CleanupFailed { message }) if message == "flush failed")
+        );
         assert_eq!(c.status().final_error.as_deref(), Some("flush failed"));
+    }
+    #[test]
+    fn reply_status_and_repeated_stop_keep_full_diagnostics() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("backend cleanup")]
+        struct Failure(#[source] std::io::Error);
+        let c = VmControl::new(None);
+        c.begin().unwrap();
+        c.running();
+        let (reply, receiver) = mpsc::channel();
+        let outcome = Err(crate::error::PlatformError::Backend(Box::new(Failure(
+            std::io::Error::other("host failure"),
+        )))
+        .into());
+        c.complete(
+            Request {
+                operation: Operation::Pause,
+                reply,
+            },
+            &outcome,
+        );
+        let diagnostic = "backend cleanup: host failure";
+        assert_eq!(receiver.recv().unwrap().unwrap_err(), diagnostic);
+        c.cleanup_result(&outcome);
+        c.finish(&outcome);
+        for _ in 0..2 {
+            assert!(
+                matches!(c.stop(), Err(ControlError::CleanupFailed { message }) if message == diagnostic)
+            );
+        }
+        assert_eq!(c.status().final_error.as_deref(), Some(diagnostic));
     }
 }

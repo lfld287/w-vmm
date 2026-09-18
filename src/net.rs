@@ -1,5 +1,7 @@
 //! Host network backends, independent of the virtio transport.
-use anyhow::Result;
+use crate::error::NetError;
+
+type Result<T> = std::result::Result<T, NetError>;
 
 #[cfg(target_os = "macos")]
 pub mod macos;

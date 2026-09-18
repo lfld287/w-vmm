@@ -1,10 +1,13 @@
-use anyhow::{Result, ensure};
 use clap::{Parser, Subcommand};
 use std::{collections::BTreeMap, path::Path};
 use w_vmm::{
     VirtioMem, VmConfig, Vmm,
     net::{NetDevice, macos::Vmnet},
     storage::Disk,
+};
+use w_vmm_demo::{
+    Result,
+    error::{ArgumentError, ProtocolError},
 };
 use w_vmm_demo::{
     control::{self, Request, Server},
@@ -74,8 +77,12 @@ fn disk_paths(disks: Vec<String>) -> Result<BTreeMap<String, String>> {
             Some((name, path)) => (name.to_owned(), path.to_owned()),
             None => (format!("disk{index}"), value),
         };
-        ensure!(!path.is_empty(), "empty path for disk {name}");
-        ensure!(!paths.contains_key(&name), "duplicate disk name: {name}");
+        if path.is_empty() {
+            return Err(ArgumentError::EmptyDiskPath { name }.into());
+        }
+        if paths.contains_key(&name) {
+            return Err(ArgumentError::DuplicateDisk { name }.into());
+        }
         paths.insert(name, path);
     }
     Ok(paths)
@@ -109,7 +116,7 @@ fn run(command: Command) -> Result<()> {
     let disks = disk_paths(disk)?
         .into_iter()
         .map(|(name, path)| Disk::open(Path::new(&path), read_only).map(|disk| (name, disk)))
-        .collect::<Result<BTreeMap<_, _>>>()?;
+        .collect::<std::result::Result<BTreeMap<_, _>, w_vmm::error::StorageError>>()?;
     let network = net.then(Vmnet::shared).transpose()?;
     if let Some(net) = &network {
         let mac = net.mac_address().map(|b| format!("{b:02x}")).join(":");
@@ -136,14 +143,17 @@ fn run(command: Command) -> Result<()> {
         .map(|path| Server::bind(&path, vmm.control()))
         .transpose()?;
     eprintln!("w-vmm: {vcpus} vCPU, {memory_mib} MiB; Ctrl-] exits");
-    vmm.run()
+    Ok(vmm.run()?)
 }
 
 fn control_command(socket: &Path, req: Request) -> Result<()> {
-    let response = control::request(socket, req)
-        .unwrap_or_else(|e| serde_json::json!({"ok": false, "error": e.to_string()}));
+    let response = control::request(socket, req).unwrap_or_else(
+        |e| serde_json::json!({"ok": false, "error": w_vmm::error::diagnostic(&e)}),
+    );
     println!("{response}");
-    ensure!(response["ok"] == true, "control request failed");
+    if response["ok"] != true {
+        return Err(ProtocolError::RequestFailed { response }.into());
+    }
     Ok(())
 }
 
@@ -151,7 +161,7 @@ fn main() -> std::process::ExitCode {
     match run(Cli::parse().command) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("w-vmm: {e:#}");
+            eprintln!("w-vmm: {}", w_vmm::error::diagnostic(&e));
             std::process::ExitCode::FAILURE
         }
     }

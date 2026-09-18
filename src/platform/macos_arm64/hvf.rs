@@ -1,8 +1,10 @@
 //! Thin HVF binding, authored against Apple's SDK. See THIRD_PARTY.md for libkrun reference.
+use crate::error::PlatformError;
 use crate::{boot, memory::Mapper};
-use anyhow::{Result, ensure};
 use std::{ffi::c_void, marker::PhantomData, rc::Rc};
 use vm_memory::{Address, GuestMemoryRegion};
+
+type Result<T> = std::result::Result<T, PlatformError>;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -67,11 +69,12 @@ unsafe extern "C" {
 }
 
 fn check(code: i32, op: &str) -> Result<()> {
-    ensure!(
-        code == 0,
-        "{op}: Hypervisor.framework error {:#x}",
-        code as u32
-    );
+    if code != 0 {
+        return Err(PlatformError::Hypervisor {
+            operation: op.to_owned(),
+            code,
+        });
+    }
     Ok(())
 }
 
@@ -89,12 +92,12 @@ pub fn validate_irqs(regions: &[boot::VirtioRegion]) -> Result<()> {
     }
     let end = base
         .checked_add(count)
-        .ok_or_else(|| anyhow::anyhow!("invalid GIC SPI range"))?;
-    ensure!(
-        (base..end).contains(&boot::UART_IRQ)
-            && regions.iter().all(|r| (base..end).contains(&r.irq)),
-        "too many devices for host GIC SPI range {base}..{end}"
-    );
+        .ok_or_else(|| PlatformError::InvalidGicSpiRange)?;
+    if !((base..end).contains(&boot::UART_IRQ)
+        && regions.iter().all(|r| (base..end).contains(&r.irq)))
+    {
+        return Err(PlatformError::GicSpiRange { base, end });
+    }
     Ok(())
 }
 
@@ -125,7 +128,9 @@ impl Vm {
     pub fn gic(&self) -> Result<(u64, [u32; 2])> {
         unsafe {
             let c = hv_gic_config_create();
-            ensure!(!c.is_null(), "create GIC configuration");
+            if c.is_null() {
+                return Err(PlatformError::CreateGicConfiguration);
+            }
             let result = (|| {
                 check(
                     hv_gic_config_set_distributor_base(c, boot::GIC_DIST),
@@ -141,10 +146,9 @@ impl Vm {
             result?;
             let mut size = 0;
             check(hv_gic_get_redistributor_region_size(&mut size), "GIC size")?;
-            ensure!(
-                boot::GIC_REDIST + size as u64 <= boot::RAM,
-                "GIC overlaps RAM"
-            );
+            if boot::GIC_REDIST + size as u64 > boot::RAM {
+                return Err(PlatformError::GicOverlapsRam);
+            }
             let mut timers = [0; 2];
             check(hv_gic_get_intid(30, &mut timers[0]), "physical timer INTID")?;
             check(hv_gic_get_intid(27, &mut timers[1]), "virtual timer INTID")?;
@@ -182,15 +186,19 @@ pub fn max_vcpus() -> Result<u32> {
 }
 
 impl Mapper for Vm {
-    fn map(&mut self, region: &vm_memory::GuestRegionMmap) -> Result<()> {
+    fn map(
+        &mut self,
+        region: &vm_memory::GuestRegionMmap,
+    ) -> std::result::Result<(), crate::error::MemoryError> {
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
-        ensure!(
-            (region.as_ptr() as u64).is_multiple_of(page)
-                && region.len().is_multiple_of(page)
-                && region.start_addr().raw_value().is_multiple_of(page),
-            "HVF host-page alignment"
-        );
-        boot::validate_ipa_range(region.start_addr().raw_value(), region.len(), ipa_bits()?)?;
+        if !((region.as_ptr() as u64).is_multiple_of(page)
+            && region.len().is_multiple_of(page)
+            && region.start_addr().raw_value().is_multiple_of(page))
+        {
+            return Err(PlatformError::HvfHostPageAlignment.into());
+        }
+        boot::validate_ipa_range(region.start_addr().raw_value(), region.len(), ipa_bits()?)
+            .map_err(PlatformError::from)?;
         unsafe {
             check(
                 hv_vm_map(
@@ -201,15 +209,20 @@ impl Mapper for Vm {
                 ),
                 "map hotplug RAM",
             )
+            .map_err(Into::into)
         }
     }
 
-    fn unmap(&mut self, region: &vm_memory::GuestRegionMmap) -> Result<()> {
+    fn unmap(
+        &mut self,
+        region: &vm_memory::GuestRegionMmap,
+    ) -> std::result::Result<(), crate::error::MemoryError> {
         unsafe {
             check(
                 hv_vm_unmap(region.start_addr().raw_value(), region.len() as usize),
                 "unmap hotplug RAM",
             )
+            .map_err(Into::into)
         }
     }
 }

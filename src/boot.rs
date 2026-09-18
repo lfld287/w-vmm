@@ -1,8 +1,10 @@
-use anyhow::{Result, ensure};
+use crate::error::BootError;
 use linux_loader::loader::{KernelLoader, pe::PE};
 use std::io::Cursor;
 use vm_fdt::FdtWriter;
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+
+type Result<T> = std::result::Result<T, BootError>;
 
 pub const RAM: u64 = 0x4000_0000;
 pub const UART: u64 = 0x0900_0000;
@@ -19,18 +21,19 @@ pub(crate) const MIB: u64 = 1 << 20;
 
 pub(crate) fn mib_bytes(mib: u64) -> Result<u64> {
     mib.checked_mul(MIB)
-        .ok_or_else(|| anyhow::anyhow!("memory capacity conversion overflow"))
+        .ok_or(BootError::MemoryCapacityConversionOverflow { mib })
 }
 
 pub(crate) fn validate_ipa_range(start: u64, size: u64, bits: u32) -> Result<()> {
-    ensure!((1..=64).contains(&bits), "invalid HVF IPA width {bits}");
+    if !(1..=64).contains(&bits) {
+        return Err(BootError::InvalidIpaWidth { bits });
+    }
     let end = start
         .checked_add(size)
-        .ok_or_else(|| anyhow::anyhow!("memory address overflow"))?;
-    ensure!(
-        bits == 64 || end <= (1u64 << bits),
-        "memory range {start:#x}..{end:#x} exceeds HVF {bits}-bit IPA range"
-    );
+        .ok_or(BootError::MemoryAddressOverflow { start, size })?;
+    if !(bits == 64 || end <= (1u64 << bits)) {
+        return Err(BootError::IpaRange { start, end, bits });
+    }
     Ok(())
 }
 
@@ -44,44 +47,46 @@ pub struct Layout {
 
 impl Layout {
     pub fn new(mib: u64, kernel: &[u8], initrd_len: usize) -> Result<Self> {
-        ensure!(mib >= 128, "memory must be at least 128 MiB");
-        ensure!(
-            kernel.len() >= 64 && &kernel[56..60] == b"ARM\x64",
-            "invalid ARM64 Image"
-        );
+        if mib < 128 {
+            return Err(BootError::MemoryMustBeAtLeast128Mib { mib });
+        }
+        if !(kernel.len() >= 64 && &kernel[56..60] == b"ARM\x64") {
+            return Err(BootError::InvalidArm64Image);
+        }
         let word = |p| u64::from_le_bytes(kernel[p..p + 8].try_into().unwrap());
         let image_size = word(16);
-        ensure!(
-            image_size != 0,
-            "legacy Image without image_size is unsupported"
-        );
-        ensure!(word(24) & 1 == 0, "big endian kernel unsupported");
+        if image_size == 0 {
+            return Err(BootError::LegacyImageWithoutImageSizeIsUnsupported);
+        }
+        if word(24) & 1 != 0 {
+            return Err(BootError::BigEndianKernelUnsupported);
+        }
         let offset = word(8);
-        ensure!(offset.is_multiple_of(4096), "unaligned kernel text offset");
+        if !offset.is_multiple_of(4096) {
+            return Err(BootError::UnalignedKernelTextOffset { offset });
+        }
         let entry = RAM
             .checked_add(offset)
-            .ok_or_else(|| anyhow::anyhow!("kernel offset overflow"))?;
+            .ok_or(BootError::KernelOffsetOverflow { offset })?;
         let bytes = mib_bytes(mib)?;
         let size = usize::try_from(bytes)?;
-        ensure!(
-            size <= isize::MAX as usize,
-            "RAM exceeds host allocation size"
-        );
+        if size > isize::MAX as usize {
+            return Err(BootError::RamExceedsHostAllocationSize { size });
+        }
         let end = RAM
             .checked_add(bytes)
-            .ok_or_else(|| anyhow::anyhow!("RAM address overflow"))?;
+            .ok_or(BootError::RamAddressOverflow)?;
         let dtb = end - 0x20_0000;
         let initrd = dtb
             .checked_sub(initrd_len as u64)
-            .ok_or_else(|| anyhow::anyhow!("initrd too large"))?
+            .ok_or(BootError::InitrdTooLarge { length: initrd_len })?
             & !0xffff;
         let kernel_end = entry
             .checked_add(image_size.max(kernel.len() as u64))
-            .ok_or_else(|| anyhow::anyhow!("Image size overflow"))?;
-        ensure!(
-            initrd >= RAM && kernel_end <= initrd,
-            "kernel/initramfs/FDT overlap or exceed RAM"
-        );
+            .ok_or(BootError::ImageSizeOverflow)?;
+        if !(initrd >= RAM && kernel_end <= initrd) {
+            return Err(BootError::KernelInitramfsFdtOverlapOrExceedRam);
+        }
         Ok(Self {
             size,
             entry,
@@ -98,10 +103,9 @@ pub struct VirtioRegion {
 }
 
 pub fn virtio_regions(count: usize) -> Result<Vec<VirtioRegion>> {
-    ensure!(
-        count <= (1020 - VIRTIO_IRQ_BASE) as usize,
-        "too many virtio devices for GIC SPIs"
-    );
+    if count > (1020 - VIRTIO_IRQ_BASE) as usize {
+        return Err(BootError::TooManyVirtioDevicesForGicSpis { count });
+    }
     Ok((0..count)
         .map(|i| VirtioRegion {
             address: VIRTIO_BASE + i as u64 * VIRTIO_STRIDE,
@@ -118,7 +122,9 @@ pub fn fdt(
     vcpu_count: u32,
     virtio_mem: bool,
 ) -> Result<Vec<u8>> {
-    ensure!(vcpu_count > 0, "at least one CPU required");
+    if vcpu_count == 0 {
+        return Err(BootError::AtLeastOneCpuRequired);
+    }
     let mut f = FdtWriter::new()?;
     let root = f.begin_node("")?;
     f.property_string("compatible", "w-vmm,arm64")?;
@@ -202,12 +208,13 @@ pub fn fdt(
 }
 
 pub fn load(mem: &GuestMemoryMmap, l: &Layout, dtb: &[u8]) -> Result<()> {
-    ensure!(dtb.len() <= 0x20_0000, "FDT exceeds reserved space");
+    if dtb.len() > 0x20_0000 {
+        return Err(BootError::FdtExceedsReservedSpace { length: dtb.len() });
+    }
     let result = PE::load(mem, Some(GuestAddress(RAM)), &mut Cursor::new(KERNEL), None)?;
-    ensure!(
-        result.kernel_load.0 == l.entry,
-        "loader/layout disagreement"
-    );
+    if result.kernel_load.0 != l.entry {
+        return Err(BootError::LoaderLayoutDisagreement);
+    }
     mem.write_slice(INITRD, GuestAddress(l.initrd))?;
     mem.write_slice(dtb, GuestAddress(l.dtb))?;
     Ok(())

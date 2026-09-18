@@ -1,8 +1,10 @@
 //! Implement a platform to reuse the device models and runtime on Linux or macOS.
+use crate::error::PlatformError;
 use crate::{VmConfig, memory::Mapper};
-use anyhow::{Result, ensure};
 use std::time::Duration;
 use vm_memory::GuestMemoryMmap;
+
+type Result<T> = std::result::Result<T, PlatformError>;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod macos_arm64;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -58,61 +60,82 @@ pub struct MachineLayout {
 
 impl MachineLayout {
     pub(crate) fn validate(&self, config: &VmConfig, needs: &DeviceRequirements) -> Result<()> {
-        ensure!(config.vcpu_count > 0, "vCPU count must be positive");
-        ensure!(!self.ram.is_empty(), "no base RAM");
-        ensure!(
-            self.virtio.len() == needs.devices.len(),
-            "device count mismatch"
-        );
-        ensure!(self.uart.size >= 8, "UART region too small");
+        if config.vcpu_count == 0 {
+            return Err(PlatformError::InvalidVcpuCount);
+        }
+        if self.ram.is_empty() {
+            return Err(PlatformError::NoBaseRam);
+        }
+        if self.virtio.len() != needs.devices.len() {
+            return Err(PlatformError::DeviceCountMismatch {
+                expected: needs.devices.len(),
+                actual: self.virtio.len(),
+            });
+        }
+        if self.uart.size < 8 {
+            return Err(PlatformError::UartRegionTooSmall {
+                size: self.uart.size,
+            });
+        }
         let mut ranges = Vec::new();
         let mut total = 0u64;
         let mut add = |space, address: u64, size: u64| -> Result<()> {
-            ensure!(size > 0, "empty region");
+            if size == 0 {
+                return Err(PlatformError::EmptyRegion);
+            }
             let end = address
                 .checked_add(size)
-                .ok_or_else(|| anyhow::anyhow!("region overflow"))?;
-            if space == IoSpace::Port {
-                ensure!(end <= 65536, "port range overflow");
+                .ok_or_else(|| PlatformError::RegionOverflow { address, size })?;
+            if space == IoSpace::Port && !(end <= 65536) {
+                return Err(PlatformError::PortRangeOverflow { address, size });
+            };
+            if ranges
+                .iter()
+                .any(|&(s, a, e)| s == space && address < e && a < end)
+            {
+                return Err(PlatformError::OverlappingRegions { address, size });
             }
-            ensure!(
-                !ranges
-                    .iter()
-                    .any(|&(s, a, e)| s == space && address < e && a < end),
-                "overlapping regions"
-            );
             ranges.push((space, address, end));
             Ok(())
         };
         for r in &self.ram {
             usize::try_from(r.size)?;
-            total = total
-                .checked_add(r.size)
-                .ok_or_else(|| anyhow::anyhow!("RAM capacity overflow"))?;
+            total =
+                total
+                    .checked_add(r.size)
+                    .ok_or_else(|| PlatformError::RamCapacityOverflow {
+                        total,
+                        size: r.size,
+                    })?;
             add(IoSpace::Mmio, r.address, r.size)?;
         }
-        ensure!(
-            total == crate::memory::mib_bytes(config.memory_mib)?,
-            "RAM capacity mismatch"
-        );
+        if total != crate::memory::mib_bytes(config.memory_mib)? {
+            return Err(PlatformError::RamCapacityMismatch {
+                expected_mib: config.memory_mib,
+                actual: total,
+            });
+        }
         add(self.uart.space, self.uart.address, self.uart.size)?;
         for r in &self.virtio {
-            ensure!(
-                r.space == IoSpace::Mmio && r.size >= 0x200,
-                "invalid virtio MMIO region"
-            );
+            if !(r.space == IoSpace::Mmio && r.size >= 0x200) {
+                return Err(PlatformError::InvalidVirtioMmioRegion);
+            }
             add(r.space, r.address, r.size)?;
         }
         match (&self.hotplug, &needs.hotplug) {
             (Some(r), Some(n)) => {
-                ensure!(
-                    r.size == n.capacity && r.address.is_multiple_of(n.alignment),
-                    "invalid hotplug capacity/alignment"
-                );
+                if !(r.size == n.capacity && r.address.is_multiple_of(n.alignment)) {
+                    return Err(PlatformError::InvalidHotplugCapacityAlignment {
+                        address: r.address,
+                        size: r.size,
+                        capacity: n.capacity,
+                        alignment: n.alignment,
+                    });
+                }
                 add(IoSpace::Mmio, r.address, r.size)?;
             }
             (None, None) => (),
-            _ => anyhow::bail!("hotplug layout mismatch"),
+            _ => return Err(PlatformError::HotplugLayoutMismatch),
         }
         Ok(())
     }
@@ -181,7 +204,7 @@ pub(crate) fn run<
     net: Option<ND>,
     memory: Option<crate::VirtioMem>,
     serial: SI,
-) -> Result<()> {
+) -> crate::Result<()> {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         crate::runtime::run(config, control, Hvf, blocks, net, memory, serial)
@@ -189,6 +212,6 @@ pub(crate) fn run<
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     {
         let _ = (config, control, blocks, net, memory, serial);
-        anyhow::bail!("no default platform; use Vmm::run_with_platform")
+        return Err(PlatformError::NoDefaultPlatform.into());
     }
 }

@@ -1,9 +1,11 @@
 use super::mmio::{Queues, VirtioDevice, read_config};
+use crate::error::DeviceError;
 use crate::storage::{BlockStorage, bounds};
-use anyhow::{Result, ensure};
 use virtio_bindings::bindings::virtio_blk::*;
 use virtio_queue::desc::split::Descriptor;
 use vm_memory::{Bytes, GuestMemoryMmap};
+
+type Result<T> = std::result::Result<T, DeviceError>;
 
 const MAX_REQUEST: usize = 1024 * 1024;
 
@@ -40,7 +42,7 @@ impl<BS: BlockStorage> VirtioDevice for Block<BS> {
         for _ in 0..count {
             let chain = queues
                 .pop(0, mem)?
-                .ok_or_else(|| anyhow::anyhow!("missing block chain"))?;
+                .ok_or_else(|| DeviceError::MissingBlockChain)?;
             let used = self.request(mem, &chain.descriptors, queues.negotiated)?;
             queues.complete(0, mem, chain.head, used)?;
         }
@@ -48,40 +50,42 @@ impl<BS: BlockStorage> VirtioDevice for Block<BS> {
     }
 
     fn reset(&mut self) -> Result<()> {
-        self.disk.flush()
+        Ok(self.disk.flush()?)
     }
 
     fn flush(&self) -> Result<()> {
-        self.disk.flush()
+        Ok(self.disk.flush()?)
     }
 }
 
 impl<BS: BlockStorage> Block<BS> {
     pub(crate) fn new(name: String, disk: BS) -> Result<Self> {
-        ensure!(
-            !name.is_empty()
-                && name.len() <= 20
-                && name
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)),
-            "block name must be 1..20 ASCII letters, digits, '.', '_' or '-'"
-        );
+        if !(!name.is_empty()
+            && name.len() <= 20
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)))
+        {
+            return Err(DeviceError::InvalidBlockName { name });
+        }
         let mut id = [0; 20];
         id[..name.len()].copy_from_slice(name.as_bytes());
         Ok(Self { disk, name, id })
     }
 
     fn request(&self, mem: &GuestMemoryMmap, desc: &[Descriptor], negotiated: u64) -> Result<u32> {
-        ensure!(desc.len() >= 2, "truncated block descriptor chain");
+        if desc.len() < 2 {
+            return Err(DeviceError::TruncatedBlockDescriptorChain);
+        }
         let header = desc[0];
         let status = desc[desc.len() - 1];
-        ensure!(
-            !header.is_write_only()
-                && header.len() == 16
-                && status.is_write_only()
-                && status.len() == 1,
-            "invalid block header/status"
-        );
+        if !(!header.is_write_only()
+            && header.len() == 16
+            && status.is_write_only()
+            && status.len() == 1)
+        {
+            return Err(DeviceError::InvalidBlockHeaderStatus);
+        }
         let mut h = [0; 16];
         mem.read_slice(&mut h, header.addr())?;
         let kind = u32::from_le_bytes(h[..4].try_into()?);
@@ -90,22 +94,30 @@ impl<BS: BlockStorage> Block<BS> {
         let total = data
             .iter()
             .try_fold(0usize, |sum, d| sum.checked_add(d.len() as usize))
-            .ok_or_else(|| anyhow::anyhow!("request length overflow"))?;
-        ensure!(total <= MAX_REQUEST, "block request exceeds 1 MiB limit");
+            .ok_or_else(|| DeviceError::RequestLengthOverflow)?;
+        if total > MAX_REQUEST {
+            return Err(DeviceError::BlockRequestTooLarge {
+                length: total,
+                limit: MAX_REQUEST,
+            });
+        }
         let mut used = 1;
         let result = (|| -> Result<u8> {
             match kind {
                 VIRTIO_BLK_T_IN | VIRTIO_BLK_T_OUT => {
                     let read = kind == VIRTIO_BLK_T_IN;
-                    ensure!(
-                        data.iter().all(|d| d.is_write_only() == read),
-                        "block descriptor direction mismatch"
-                    );
-                    ensure!(total.is_multiple_of(512), "unaligned block request");
-                    ensure!(read || !self.disk.read_only(), "write to read-only disk");
+                    if !data.iter().all(|d| d.is_write_only() == read) {
+                        return Err(DeviceError::BlockDescriptorDirectionMismatch);
+                    }
+                    if !total.is_multiple_of(512) {
+                        return Err(DeviceError::UnalignedBlockRequest { length: total });
+                    }
+                    if !(read || !self.disk.read_only()) {
+                        return Err(DeviceError::WriteToReadOnlyDisk);
+                    }
                     let offset = sector
                         .checked_mul(512)
-                        .ok_or_else(|| anyhow::anyhow!("sector overflow"))?;
+                        .ok_or_else(|| DeviceError::SectorOverflow { sector })?;
                     bounds(self.disk.size(), offset, total)?;
                     let mut buf = vec![0; total];
                     if read {
@@ -131,17 +143,15 @@ impl<BS: BlockStorage> Block<BS> {
                     }
                 }
                 VIRTIO_BLK_T_FLUSH => {
-                    ensure!(
-                        total == 0 && negotiated & (1 << VIRTIO_BLK_F_FLUSH) != 0,
-                        "invalid FLUSH"
-                    );
+                    if !(total == 0 && negotiated & (1 << VIRTIO_BLK_F_FLUSH) != 0) {
+                        return Err(DeviceError::InvalidFlush);
+                    }
                     self.disk.flush()?;
                 }
                 VIRTIO_BLK_T_GET_ID => {
-                    ensure!(
-                        total >= 20 && data.iter().all(|d| d.is_write_only()),
-                        "invalid GET_ID"
-                    );
+                    if !(total >= 20 && data.iter().all(|d| d.is_write_only())) {
+                        return Err(DeviceError::InvalidGetId);
+                    }
                     let id = &self.id;
                     let mut p = 0;
                     for d in data {
@@ -161,7 +171,11 @@ impl<BS: BlockStorage> Block<BS> {
         let status_value = match result {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("virtio-blk request {kind} ({}): {e:#}", self.name);
+                eprintln!(
+                    "virtio-blk request {kind} ({}): {}",
+                    self.name,
+                    crate::error::diagnostic(&e)
+                );
                 VIRTIO_BLK_S_IOERR as u8
             }
         };
@@ -196,23 +210,39 @@ mod tests {
             self.ro
         }
 
-        fn read(&self, o: u64, d: &mut [u8]) -> Result<()> {
-            ensure!(!self.fail, "injected host I/O error");
+        fn read(
+            &self,
+            o: u64,
+            d: &mut [u8],
+        ) -> std::result::Result<(), crate::error::StorageError> {
+            if self.fail {
+                return Err(crate::error::StorageError::Backend(
+                    std::io::Error::other("injected host I/O error").into(),
+                ));
+            }
             bounds(self.size(), o, d.len())?;
             d.copy_from_slice(&self.data.borrow()[o as usize..o as usize + d.len()]);
             Ok(())
         }
 
-        fn write(&self, o: u64, d: &[u8]) -> Result<()> {
-            ensure!(!self.ro && !self.fail, "read-only/injected host I/O error");
+        fn write(&self, o: u64, d: &[u8]) -> std::result::Result<(), crate::error::StorageError> {
+            if !(!self.ro && !self.fail) {
+                return Err(crate::error::StorageError::Backend(
+                    std::io::Error::other("read-only/injected host I/O error").into(),
+                ));
+            }
             bounds(self.size(), o, d.len())?;
             self.data.borrow_mut()[o as usize..o as usize + d.len()].copy_from_slice(d);
             Ok(())
         }
 
-        fn flush(&self) -> Result<()> {
+        fn flush(&self) -> std::result::Result<(), crate::error::StorageError> {
             self.flushes.set(self.flushes.get() + 1);
-            ensure!(!self.fail, "injected sync error");
+            if self.fail {
+                return Err(crate::error::StorageError::Backend(
+                    std::io::Error::other("injected sync error").into(),
+                ));
+            }
             Ok(())
         }
     }

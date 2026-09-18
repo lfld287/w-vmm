@@ -1,4 +1,6 @@
 //! Architecture-independent device runtime.
+use crate::Result;
+use crate::error::RuntimeError;
 use crate::{
     VirtioMem, VmConfig,
     devices::{Device, block::Block, mmio::Mmio, net::Net},
@@ -7,7 +9,6 @@ use crate::{
     serial::{SerialIo, poll_input},
     storage::BlockStorage,
 };
-use anyhow::{Result, bail, ensure};
 use std::{collections::BTreeMap, time::Duration};
 use vm_memory::{GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 use vm_superio::{Serial, Trigger};
@@ -76,7 +77,7 @@ impl<VM: VirtualMachine, BS: BlockStorage, ND: NetDevice> Runtime<VM, BS, ND> {
         let mut devices: Vec<Mmio<Device<BS, ND>>> = blocks
             .into_iter()
             .map(|(n, b)| Block::new(n, b).map(|d| Mmio::new(Device::Block(d))))
-            .collect::<Result<_>>()?;
+            .collect::<std::result::Result<_, crate::error::DeviceError>>()?;
         if let Some(n) = net {
             devices.push(Mmio::new(Device::Net(Net::new(n)?)));
         }
@@ -105,7 +106,8 @@ impl<VM: VirtualMachine, BS: BlockStorage, ND: NetDevice> Runtime<VM, BS, ND> {
             .iter()
             .map(|r| (GuestAddress(r.address), r.size as usize))
             .collect::<Vec<_>>();
-        self.base = Some(GuestMemoryMmap::from_ranges(&ranges)?);
+        self.base =
+            Some(GuestMemoryMmap::from_ranges(&ranges).map_err(crate::error::MemoryError::from)?);
         let view = self.base.as_ref().unwrap().clone();
         if control.stopping() {
             return Ok(view);
@@ -153,7 +155,8 @@ impl<VM: VirtualMachine, BS: BlockStorage, ND: NetDevice> Runtime<VM, BS, ND> {
                     crate::control::Operation::Pause if !paused => vm.pause(),
                     crate::control::Operation::Resume if paused => vm.resume(),
                     _ => Ok(()),
-                };
+                }
+                .map_err(crate::Error::from);
                 if outcome.is_ok() {
                     paused = matches!(request.operation, crate::control::Operation::Pause);
                 }
@@ -205,7 +208,7 @@ impl<VM: VirtualMachine, BS: BlockStorage, ND: NetDevice> Runtime<VM, BS, ND> {
                 .devices
                 .iter()
                 .map(|d| d.queues.pinned(view))
-                .collect::<Result<Vec<_>>>()?
+                .collect::<std::result::Result<Vec<_>, crate::error::DeviceError>>()?
                 .into_iter()
                 .flatten()
                 .collect::<Vec<_>>();
@@ -224,7 +227,9 @@ impl<VM: VirtualMachine, BS: BlockStorage, ND: NetDevice> Runtime<VM, BS, ND> {
         view: &GuestMemoryMmap,
         serial: &mut Serial<Irq, vm_superio::serial::NoEvents, SI>,
     ) -> Result<()> {
-        ensure!(matches!(a.width, 1 | 2 | 4 | 8), "invalid I/O width");
+        if !matches!(a.width, 1 | 2 | 4 | 8) {
+            return Err(RuntimeError::InvalidIoWidth { width: a.width }.into());
+        }
         let contains = |r: &IoRegion| {
             a.space == r.space
                 && a.address >= r.address
@@ -238,7 +243,9 @@ impl<VM: VirtualMachine, BS: BlockStorage, ND: NetDevice> Runtime<VM, BS, ND> {
         {
             let offset = (a.address - self.layout.uart.address) as u8;
             if a.write {
-                serial.write(offset, a.value as u8)?;
+                serial
+                    .write(offset, a.value as u8)
+                    .map_err(crate::error::SerialError::from)?;
                 0
             } else {
                 serial.read(offset) as u64
@@ -246,14 +253,20 @@ impl<VM: VirtualMachine, BS: BlockStorage, ND: NetDevice> Runtime<VM, BS, ND> {
         } else if let Some(slot) = self.layout.virtio.iter().position(contains) {
             let offset = a.address - self.layout.virtio[slot].address;
             if a.write {
-                ensure!(a.width == 4, "virtio MMIO writes must be 32 bit");
+                if a.width != 4 {
+                    return Err(RuntimeError::InvalidMmioWidth { width: a.width }.into());
+                }
                 self.devices[slot].write(offset, a.value as u32, view)?;
                 0
             } else {
                 self.devices[slot].read(offset, a.width)
             }
         } else {
-            bail!("unmapped I/O {:#x}, size {}", a.address, a.width);
+            return Err(RuntimeError::UnmappedIo {
+                address: a.address,
+                width: a.width,
+            }
+            .into());
         };
         self.vm.as_mut().unwrap().complete_io(a.completion, value)?;
         Ok(())
@@ -269,7 +282,7 @@ impl<VM: VirtualMachine, BS: BlockStorage, ND: NetDevice> Runtime<VM, BS, ND> {
             if let Err(e) = device.flush()
                 && cleanup.is_ok()
             {
-                cleanup = Err(e);
+                cleanup = Err(e.into());
             }
         }
         if let Some(vm) = &mut self.vm {
@@ -283,7 +296,7 @@ impl<VM: VirtualMachine, BS: BlockStorage, ND: NetDevice> Runtime<VM, BS, ND> {
                     if let Err(e) = vm.unmap(r)
                         && cleanup.is_ok()
                     {
-                        cleanup = Err(e);
+                        cleanup = Err(e.into());
                     }
                 }
             }

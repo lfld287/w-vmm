@@ -1,5 +1,4 @@
 //! External platform exercising the real public runtime, without private devices.
-use anyhow::{Result, ensure};
 use std::{
     cell::RefCell,
     collections::{BTreeMap, VecDeque},
@@ -10,6 +9,7 @@ use std::{
 use vm_memory::{
     Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion, GuestRegionMmap,
 };
+use w_vmm::error::{MemoryError, NetError, PlatformError, StorageError};
 use w_vmm::{
     MemoryLifecycle, VirtioMem, VmConfig, Vmm, memory::Mapper, net::NetDevice, platform::*,
     serial::SerialIo, storage::BlockStorage,
@@ -58,7 +58,11 @@ struct TestPlatform {
 impl Platform for TestPlatform {
     type Vm = TestVm;
 
-    fn layout(&self, _: &VmConfig, needs: &DeviceRequirements) -> Result<MachineLayout> {
+    fn layout(
+        &self,
+        _: &VmConfig,
+        needs: &DeviceRequirements,
+    ) -> Result<MachineLayout, PlatformError> {
         assert!(
             matches!(&needs.devices[..], [DeviceKind::Block(a), DeviceKind::Block(b), DeviceKind::Memory] if a == "a" && b == "z")
         );
@@ -111,8 +115,12 @@ impl Platform for TestPlatform {
         Ok(l)
     }
 
-    fn create(&self, _: &VmConfig) -> Result<TestVm> {
-        ensure!(self.fault != Fault::Create, "create failure");
+    fn create(&self, _: &VmConfig) -> Result<TestVm, PlatformError> {
+        if self.fault == Fault::Create {
+            return Err(PlatformError::Backend(
+                io::Error::other("create failure").into(),
+            ));
+        }
         self.state.borrow_mut().log.push("create".into());
         Ok(TestVm {
             state: self.state.clone(),
@@ -137,7 +145,7 @@ struct TestVm {
 }
 
 impl Mapper for TestVm {
-    fn map(&mut self, r: &GuestRegionMmap) -> Result<()> {
+    fn map(&mut self, r: &GuestRegionMmap) -> Result<(), MemoryError> {
         let mut s = self.state.borrow_mut();
         s.allocations
             .push((r.start_addr().0, std::sync::Arc::downgrade(&r.get_mmap())));
@@ -146,28 +154,35 @@ impl Mapper for TestVm {
         if r.start_addr().0 >= 0x8000_0000 {
             assert!(self.paused);
         }
-        ensure!(
-            !(self.fault == Fault::BaseMap && s.calls == 2),
-            "base mapping failure"
-        );
-        ensure!(
-            !(matches!(self.fault, Fault::Map | Fault::Rollback) && s.calls == 4),
-            "dynamic mapping failure"
-        );
+        if self.fault == Fault::BaseMap && s.calls == 2 {
+            return Err(MemoryError::Backend(
+                io::Error::other("base mapping failure").into(),
+            ));
+        }
+        if matches!(self.fault, Fault::Map | Fault::Rollback) && s.calls == 4 {
+            return Err(MemoryError::Backend(
+                io::Error::other("dynamic mapping failure").into(),
+            ));
+        }
         Ok(())
     }
 
-    fn unmap(&mut self, r: &GuestRegionMmap) -> Result<()> {
+    fn unmap(&mut self, r: &GuestRegionMmap) -> Result<(), MemoryError> {
         self.state
             .borrow_mut()
             .log
             .push(format!("unmap:{:x}", r.start_addr().0));
         assert!(self.stopped || self.paused);
-        ensure!(self.fault != Fault::Unmap, "unmap failure");
-        ensure!(
-            !(self.fault == Fault::Rollback && !self.stopped),
-            "rollback failure"
-        );
+        if self.fault == Fault::Unmap {
+            return Err(MemoryError::Backend(
+                io::Error::other("unmap failure").into(),
+            ));
+        }
+        if self.fault == Fault::Rollback && !self.stopped {
+            return Err(MemoryError::Backend(
+                io::Error::other("rollback failure").into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -175,10 +190,18 @@ impl Mapper for TestVm {
 impl VirtualMachine for TestVm {
     type Completion = usize;
 
-    fn prepare(&mut self, memory: &GuestMemoryMmap, layout: &MachineLayout) -> Result<()> {
+    fn prepare(
+        &mut self,
+        memory: &GuestMemoryMmap,
+        layout: &MachineLayout,
+    ) -> Result<(), PlatformError> {
         self.state.borrow_mut().log.push("prepare".into());
         self.memory = Some(memory.clone());
-        ensure!(self.fault != Fault::Prepare, "prepare failure");
+        if self.fault == Fault::Prepare {
+            return Err(PlatformError::Backend(
+                io::Error::other("prepare failure").into(),
+            ));
+        }
         assert_eq!(memory.num_regions(), 2);
         // Populate a real split virtqueue with a two-block plug request.
         let b = self.base;
@@ -190,13 +213,21 @@ impl VirtualMachine for TestVm {
             d[14..].copy_from_slice(&next.to_le_bytes());
             d
         };
-        memory.write_slice(&descriptor(b + 0x8000, 24, 1, 1), GuestAddress(b + 0x1000))?;
-        memory.write_slice(&descriptor(b + 0x9000, 10, 2, 0), GuestAddress(b + 0x1010))?;
+        memory
+            .write_slice(&descriptor(b + 0x8000, 24, 1, 1), GuestAddress(b + 0x1000))
+            .map_err(|e| PlatformError::Backend(Box::new(e)))?;
+        memory
+            .write_slice(&descriptor(b + 0x9000, 10, 2, 0), GuestAddress(b + 0x1010))
+            .map_err(|e| PlatformError::Backend(Box::new(e)))?;
         let mut req = [0u8; 24];
         req[8..16].copy_from_slice(&layout.hotplug.unwrap().address.to_le_bytes());
         req[16..18].copy_from_slice(&2u16.to_le_bytes());
-        memory.write_slice(&req, GuestAddress(b + 0x8000))?;
-        memory.write_obj(1u16, GuestAddress(b + 0x2002))?;
+        memory
+            .write_slice(&req, GuestAddress(b + 0x8000))
+            .map_err(|e| PlatformError::Backend(Box::new(e)))?;
+        memory
+            .write_obj(1u16, GuestAddress(b + 0x2002))
+            .map_err(|e| PlatformError::Backend(Box::new(e)))?;
         let mut io = |space, address, width, write, value| {
             let completion = self.events.len();
             self.events.push_back(Event::Io(IoAccess {
@@ -239,39 +270,62 @@ impl VirtualMachine for TestVm {
         Ok(())
     }
 
-    fn start(&mut self) -> Result<()> {
+    fn start(&mut self) -> Result<(), PlatformError> {
         self.state.borrow_mut().log.push("start".into());
-        ensure!(self.fault != Fault::Start, "start failure");
+        if self.fault == Fault::Start {
+            return Err(PlatformError::Backend(
+                io::Error::other("start failure").into(),
+            ));
+        }
         Ok(())
     }
 
-    fn poll_event(&mut self, _: Duration) -> Result<Option<Event<usize>>> {
-        ensure!(self.fault != Fault::Poll, "poll failure");
+    fn poll_event(
+        &mut self,
+        _: Duration,
+    ) -> Result<Option<Event<usize>>, PlatformError> {
+        if self.fault == Fault::Poll {
+            return Err(PlatformError::Backend(
+                io::Error::other("poll failure").into(),
+            ));
+        }
         Ok(self.events.pop_front())
     }
 
-    fn complete_io(&mut self, completion: usize, value: u64) -> Result<()> {
+    fn complete_io(
+        &mut self,
+        completion: usize,
+        value: u64,
+    ) -> Result<(), PlatformError> {
         let mut s = self.state.borrow_mut();
         assert_eq!(completion, s.replies.len());
         s.replies.push(value);
         Ok(())
     }
 
-    fn set_irq(&mut self, irq: u32, level: bool) -> Result<()> {
+    fn set_irq(&mut self, irq: u32, level: bool) -> Result<(), PlatformError> {
         self.state.borrow_mut().irqs.push((irq, level));
         Ok(())
     }
 
-    fn pause(&mut self) -> Result<()> {
+    fn pause(&mut self) -> Result<(), PlatformError> {
         self.state.borrow_mut().log.push("pause".into());
-        ensure!(self.fault != Fault::Pause, "pause failure");
+        if self.fault == Fault::Pause {
+            return Err(PlatformError::Backend(
+                io::Error::other("pause failure").into(),
+            ));
+        }
         self.paused = true;
         Ok(())
     }
 
-    fn resume(&mut self) -> Result<()> {
+    fn resume(&mut self) -> Result<(), PlatformError> {
         self.state.borrow_mut().log.push("resume".into());
-        ensure!(self.fault != Fault::Resume, "resume failure");
+        if self.fault == Fault::Resume {
+            return Err(PlatformError::Backend(
+                io::Error::other("resume failure").into(),
+            ));
+        }
         self.paused = false;
         Ok(())
     }
@@ -319,18 +373,22 @@ impl BlockStorage for Disk {
         false
     }
 
-    fn read(&self, _: u64, d: &mut [u8]) -> Result<()> {
+    fn read(&self, _: u64, d: &mut [u8]) -> Result<(), StorageError> {
         d.fill(0);
         Ok(())
     }
 
-    fn write(&self, _: u64, _: &[u8]) -> Result<()> {
+    fn write(&self, _: u64, _: &[u8]) -> Result<(), StorageError> {
         Ok(())
     }
 
-    fn flush(&self) -> Result<()> {
+    fn flush(&self) -> Result<(), StorageError> {
         self.0.borrow_mut().log.push("flush".into());
-        ensure!(!self.1, "flush failure");
+        if self.1 {
+            return Err(StorageError::Backend(
+                io::Error::other("flush failure").into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -373,11 +431,11 @@ impl NetDevice for NoNet {
         1514
     }
 
-    fn send(&mut self, _: &[u8]) -> Result<bool> {
+    fn send(&mut self, _: &[u8]) -> Result<bool, NetError> {
         Ok(true)
     }
 
-    fn recv(&mut self, _: &mut [u8]) -> Result<Option<usize>> {
+    fn recv(&mut self, _: &mut [u8]) -> Result<Option<usize>, NetError> {
         Ok(None)
     }
 }
@@ -414,6 +472,40 @@ fn run(fault: Fault, port: bool, base: u64) -> Shared {
         matches!(fault, Fault::None | Fault::Map),
         "{fault:?}: {result:?}"
     );
+    use w_vmm::{Error, error::DeviceError};
+    match (fault, result.as_ref().err()) {
+        (Fault::None | Fault::Map, None) => (),
+        (Fault::Overlap, Some(Error::Platform(PlatformError::OverlappingRegions { .. }))) => (),
+        (Fault::Overflow, Some(Error::Platform(PlatformError::RegionOverflow { .. }))) => (),
+        (Fault::Capacity, Some(Error::Platform(PlatformError::RamCapacityMismatch { .. }))) => (),
+        (Fault::DeviceCount, Some(Error::Platform(PlatformError::DeviceCountMismatch { .. }))) => {}
+        (
+            Fault::Hotplug,
+            Some(Error::Platform(PlatformError::InvalidHotplugCapacityAlignment { .. })),
+        ) => {}
+        (
+            Fault::Create
+            | Fault::Prepare
+            | Fault::Start
+            | Fault::Pause
+            | Fault::Poll
+            | Fault::Resume,
+            Some(Error::Platform(PlatformError::Backend(_))),
+        ) => (),
+        (Fault::BaseMap | Fault::Unmap, Some(Error::Memory(MemoryError::Backend(_)))) => (),
+        (
+            Fault::Rollback,
+            Some(Error::Device(DeviceError::Memory(MemoryError::RollbackFailed {
+                source,
+                rollback,
+            }))),
+        ) => {
+            assert!(matches!(source.as_ref(), MemoryError::Backend(_)));
+            assert!(matches!(rollback.as_ref(), MemoryError::Backend(_)));
+        }
+        (Fault::Flush, Some(Error::Device(DeviceError::Storage(StorageError::Backend(_))))) => (),
+        _ => panic!("unexpected error for {fault:?}: {result:?}"),
+    }
     assert_eq!(
         control.memory_status().unwrap().lifecycle,
         MemoryLifecycle::Stopped

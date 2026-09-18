@@ -1,9 +1,11 @@
 //! Shared modern virtio-mmio transport and checked split-queue access.
-use anyhow::{Result, ensure};
+use crate::error::DeviceError;
 use std::sync::atomic::Ordering;
 use virtio_bindings::bindings::virtio_config::VIRTIO_F_VERSION_1;
 use virtio_queue::{Queue, QueueOwnedT, QueueT, desc::split::Descriptor};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
+
+type Result<T> = std::result::Result<T, DeviceError>;
 
 pub(crate) const MAX_QUEUE: u16 = 128;
 
@@ -54,7 +56,9 @@ impl Queues {
     pub(crate) fn pinned(&self, mem: &GuestMemoryMmap) -> Result<Vec<(u64, u64)>> {
         let mut pins = Vec::new();
         for q in self.rings.iter().filter(|q| q.ready()) {
-            ensure!(q.is_valid(mem), "invalid live queue");
+            if !q.is_valid(mem) {
+                return Err(DeviceError::InvalidLiveQueue);
+            }
             pins.extend([
                 (q.desc_table(), u64::from(q.size()) * 16),
                 (q.avail_ring(), 6 + u64::from(q.size()) * 2),
@@ -64,20 +68,33 @@ impl Queues {
                 .avail_idx(mem, Ordering::Acquire)?
                 .0
                 .wrapping_sub(q.next_avail());
-            ensure!(available <= q.size(), "available ring overrun");
+            if available > q.size() {
+                return Err(DeviceError::AvailableRingOverrun {
+                    count: available,
+                    size: q.size(),
+                });
+            }
             for i in 0..available {
                 let slot = q.next_avail().wrapping_add(i) % q.size();
                 let mut index: u16 =
                     mem.read_obj(GuestAddress(q.avail_ring() + 4 + u64::from(slot) * 2))?;
                 let mut ended = false;
                 for _ in 0..q.size() {
-                    ensure!(index < q.size(), "descriptor index out of range");
+                    if index >= q.size() {
+                        return Err(DeviceError::DescriptorIndexOutOfRange {
+                            index,
+                            size: q.size(),
+                        });
+                    }
                     let d: Descriptor =
                         mem.read_obj(GuestAddress(q.desc_table() + u64::from(index) * 16))?;
-                    ensure!(
-                        d.flags() & !3 == 0 && mem.check_range(d.addr(), d.len() as usize),
-                        "invalid pending descriptor"
-                    );
+                    if !(d.flags() & !3 == 0 && mem.check_range(d.addr(), d.len() as usize)) {
+                        return Err(DeviceError::InvalidPendingDescriptor {
+                            address: d.addr().0,
+                            length: d.len(),
+                            flags: d.flags(),
+                        });
+                    }
                     if d.len() != 0 {
                         pins.push((d.addr().0, u64::from(d.len())));
                     }
@@ -87,7 +104,9 @@ impl Queues {
                     }
                     index = d.next();
                 }
-                ensure!(ended, "cyclic pending descriptor chain");
+                if !ended {
+                    return Err(DeviceError::CyclicPendingDescriptorChain);
+                }
             }
         }
         Ok(pins)
@@ -95,12 +114,19 @@ impl Queues {
 
     pub(crate) fn available(&self, index: usize, mem: &GuestMemoryMmap) -> Result<u16> {
         let q = &self.rings[index];
-        ensure!(q.is_valid(mem), "invalid virtqueue");
+        if !q.is_valid(mem) {
+            return Err(DeviceError::InvalidVirtqueue);
+        }
         let count = q
             .avail_idx(mem, Ordering::Acquire)?
             .0
             .wrapping_sub(q.next_avail());
-        ensure!(count <= q.size(), "available ring overrun");
+        if count > q.size() {
+            return Err(DeviceError::AvailableRingOverrun {
+                count,
+                size: q.size(),
+            });
+        }
         Ok(count)
     }
 
@@ -112,31 +138,38 @@ impl Queues {
         let head = q
             .iter(mem)?
             .next()
-            .ok_or_else(|| anyhow::anyhow!("invalid available descriptor"))?
+            .ok_or_else(|| DeviceError::InvalidAvailableDescriptor)?
             .head_index();
         let mut index = head;
         let mut descriptors = Vec::new();
         // Walk raw links before virtio-queue can expand an unnegotiated indirect table.
         // Bound traversal even for guest-created cycles, and validate before any I/O.
         for _ in 0..q.size() {
-            ensure!(index < q.size(), "descriptor index out of range");
+            if index >= q.size() {
+                return Err(DeviceError::DescriptorIndexOutOfRange {
+                    index,
+                    size: q.size(),
+                });
+            }
             let d: Descriptor =
                 mem.read_obj(GuestAddress(q.desc_table() + u64::from(index) * 16))?;
-            ensure!(
-                !d.refers_to_indirect_table(),
-                "unnegotiated indirect descriptor"
-            );
-            ensure!(
-                d.flags() & !3 == 0 && mem.check_range(d.addr(), d.len() as usize),
-                "invalid descriptor flags/range"
-            );
+            if d.refers_to_indirect_table() {
+                return Err(DeviceError::UnnegotiatedIndirectDescriptor);
+            }
+            if !(d.flags() & !3 == 0 && mem.check_range(d.addr(), d.len() as usize)) {
+                return Err(DeviceError::InvalidDescriptorFlagsRange {
+                    address: d.addr().0,
+                    length: d.len(),
+                    flags: d.flags(),
+                });
+            }
             descriptors.push(d);
             if !d.has_next() {
                 return Ok(Some(Chain { head, descriptors }));
             }
             index = d.next();
         }
-        anyhow::bail!("cyclic descriptor chain")
+        Err(DeviceError::CyclicDescriptorChain)
     }
 
     pub(crate) fn complete(
@@ -265,10 +298,9 @@ impl<D: VirtioDevice> Mmio<D> {
                     self.status = 0;
                     return Ok(());
                 }
-                ensure!(
-                    value & self.status == self.status,
-                    "virtio status bits cannot be cleared without reset"
-                );
+                if value & self.status != self.status {
+                    return Err(DeviceError::StatusBitsCleared);
+                }
                 self.status = value;
                 if value & 8 != 0
                     && (self.queues.negotiated & !self.features != 0
@@ -278,13 +310,12 @@ impl<D: VirtioDevice> Mmio<D> {
                 {
                     self.status &= !8;
                 }
-                if value & 4 != 0 {
-                    ensure!(
-                        self.status & 0xb == 0xb
-                            && self.queues.rings.iter().all(|q| q.is_valid(mem)),
-                        "virtio DRIVER_OK before valid negotiation/queues"
-                    );
-                }
+                if value & 4 != 0
+                    && !(self.status & 0xb == 0xb
+                        && self.queues.rings.iter().all(|q| q.is_valid(mem)))
+                {
+                    return Err(DeviceError::DriverNotReady);
+                };
             }
             0x64 => self.queues.interrupt &= !value,
             0x50 if self.active() && (value as usize) < self.queues.rings.len() => {
@@ -292,22 +323,30 @@ impl<D: VirtioDevice> Mmio<D> {
             }
             0x38 | 0x44 | 0x80 | 0x84 | 0x90 | 0x94 | 0xa0 | 0xa4 => {
                 if let Some(q) = self.queues.rings.get_mut(self.queue_sel as usize) {
-                    ensure!(self.status & 4 == 0, "queue configuration after DRIVER_OK");
-                    ensure!(
-                        !q.ready() || (offset == 0x44 && value == 0),
-                        "queue configuration while ready"
-                    );
+                    if self.status & 4 != 0 {
+                        return Err(DeviceError::QueueConfigurationAfterDriverOk);
+                    }
+                    if !(!q.ready() || (offset == 0x44 && value == 0)) {
+                        return Err(DeviceError::QueueConfigurationWhileReady);
+                    }
                     match offset {
                         0x38 => {
-                            ensure!(value <= MAX_QUEUE as u32, "queue too large");
+                            if value > MAX_QUEUE as u32 {
+                                return Err(DeviceError::QueueTooLarge {
+                                    size: value,
+                                    max: MAX_QUEUE,
+                                });
+                            }
                             q.try_set_size(value as u16)?;
                         }
                         0x44 => {
-                            ensure!(value <= 1, "invalid QueueReady");
-                            q.set_ready(value == 1);
-                            if value == 1 {
-                                ensure!(q.is_valid(mem), "invalid queue memory");
+                            if value > 1 {
+                                return Err(DeviceError::InvalidQueueReady { value });
                             }
+                            q.set_ready(value == 1);
+                            if value == 1 && !q.is_valid(mem) {
+                                return Err(DeviceError::InvalidQueueMemory);
+                            };
                         }
                         0x80 => q.set_desc_table_address(Some(value), None),
                         0x84 => q.set_desc_table_address(None, Some(value)),
@@ -477,14 +516,31 @@ pub(crate) mod tests {
             mem.write_obj(Descriptor::new(addr, 16, flags, next), GuestAddress(0x1000))
                 .unwrap();
             mem.write_obj(1u16, GuestAddress(0x2002)).unwrap();
-            assert!(d.queues.pop(0, &mem).is_err());
+            let error = d.queues.pop(0, &mem).err().unwrap();
+            match (flags, next, addr) {
+                (1, 9, _) => assert!(matches!(
+                    error,
+                    DeviceError::DescriptorIndexOutOfRange { index: 9, size: 8 }
+                )),
+                (1, 0, _) => assert!(matches!(error, DeviceError::CyclicDescriptorChain)),
+                (4, _, _) => assert!(matches!(error, DeviceError::UnnegotiatedIndirectDescriptor)),
+                _ => assert!(
+                    matches!(error, DeviceError::InvalidDescriptorFlagsRange { address, flags: f, .. } if address == addr && f == flags)
+                ),
+            }
         }
         let (mut d, mem) = setup();
         initialize(&mut d, &mem);
         mem.write_obj(9u16, GuestAddress(0x2002)).unwrap();
         assert!(d.queues.available(0, &mem).is_err());
         d.write(0x70, 0, &mem).unwrap();
-        assert!(d.write(0x38, 129, &mem).is_err());
+        assert!(matches!(
+            d.write(0x38, 129, &mem),
+            Err(DeviceError::QueueTooLarge {
+                size: 129,
+                max: 128
+            })
+        ));
         assert!(d.write(0x38, 3, &mem).is_err());
         d.write(0x80, 0xffff_f000, &mem).unwrap();
         assert!(d.write(0x44, 1, &mem).is_err());

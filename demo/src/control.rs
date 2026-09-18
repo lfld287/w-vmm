@@ -1,5 +1,6 @@
 //! Optional local, bounded newline-delimited JSON control server.
-use anyhow::{Context, Result, ensure};
+use crate::error::ProtocolError;
+type Result<T> = std::result::Result<T, ProtocolError>;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::os::fd::AsRawFd;
@@ -46,7 +47,9 @@ fn line(stream: &mut UnixStream) -> Result<Vec<u8>> {
     let mut data = Vec::new();
     loop {
         let remaining = end.saturating_duration_since(std::time::Instant::now());
-        ensure!(!remaining.is_zero(), "control request timeout");
+        if remaining.is_zero() {
+            return Err(ProtocolError::Timeout);
+        }
         let mut fd = libc::pollfd {
             fd: stream.as_raw_fd(),
             events: libc::POLLIN,
@@ -60,13 +63,24 @@ fn line(stream: &mut UnixStream) -> Result<Vec<u8>> {
             }
             return Err(e.into());
         }
-        ensure!(ready > 0, "control request timeout");
+        if ready <= 0 {
+            return Err(ProtocolError::Timeout);
+        }
         let mut byte = [0];
-        ensure!(stream.read(&mut byte)? == 1, "disconnected before newline");
+        if stream.read(&mut byte)? != 1 {
+            return Err(ProtocolError::Disconnected {
+                expected: "newline",
+            });
+        }
         if byte[0] == b'\n' {
             return Ok(data);
         }
-        ensure!(data.len() < LIMIT, "control message too long");
+        if data.len() >= LIMIT {
+            return Err(ProtocolError::TooLong {
+                kind: "message",
+                limit: LIMIT,
+            });
+        }
         data.push(byte[0]);
     }
 }
@@ -74,7 +88,11 @@ fn line(stream: &mut UnixStream) -> Result<Vec<u8>> {
 fn serve(mut stream: UnixStream, vm: &VmControl) -> Result<()> {
     stream
         .set_write_timeout(Some(TIMEOUT))
-        .context("set write timeout")?;
+        .map_err(|source| ProtocolError::Operation {
+            operation: "set write timeout",
+            path: None,
+            source,
+        })?;
     let result = (|| -> Result<Value> {
         let request = serde_json::from_slice::<Request>(&line(&mut stream)?)?;
         match request {
@@ -100,7 +118,8 @@ fn serve(mut stream: UnixStream, vm: &VmControl) -> Result<()> {
             }
         }
     })();
-    let response = result.unwrap_or_else(|e| json!({"ok": false, "error": e.to_string()}));
+    let response =
+        result.unwrap_or_else(|e| json!({"ok": false, "error": w_vmm::error::diagnostic(&e)}));
     writeln!(stream, "{response}")?;
     Ok(())
 }
@@ -184,20 +203,37 @@ impl Drop for Server {
 }
 
 pub fn request(path: &Path, request: Request) -> Result<Value> {
-    let mut stream = UnixStream::connect(path).context("connect control socket")?;
+    let mut stream = UnixStream::connect(path).map_err(|source| ProtocolError::Operation {
+        operation: "connect control socket",
+        path: Some(path.to_owned()),
+        source,
+    })?;
     stream
         .set_write_timeout(Some(TIMEOUT))
-        .context("set write timeout")?;
+        .map_err(|source| ProtocolError::Operation {
+            operation: "set write timeout",
+            path: None,
+            source,
+        })?;
     writeln!(stream, "{}", serde_json::to_string(&request)?)?;
     // Operations have no completion deadline. Keep a bounded response buffer.
     let mut data = Vec::new();
     loop {
         let mut byte = [0];
-        ensure!(stream.read(&mut byte)? == 1, "disconnected before response");
+        if stream.read(&mut byte)? != 1 {
+            return Err(ProtocolError::Disconnected {
+                expected: "response",
+            });
+        }
         if byte[0] == b'\n' {
             break;
         }
-        ensure!(data.len() < LIMIT, "control response too long");
+        if data.len() >= LIMIT {
+            return Err(ProtocolError::TooLong {
+                kind: "response",
+                limit: LIMIT,
+            });
+        }
         data.push(byte[0]);
     }
     Ok(serde_json::from_slice(&data)?)
@@ -219,7 +255,7 @@ pub(crate) mod tests {
         )
     }
     pub(crate) struct TestSerial;
-    impl std::io::Write for TestSerial {
+    impl Write for TestSerial {
         fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
             Ok(b.len())
         }

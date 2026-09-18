@@ -3,10 +3,12 @@ pub(crate) mod memory;
 pub(crate) mod mmio;
 pub(crate) mod net;
 
+use crate::error::DeviceError;
 use crate::{net::NetDevice, storage::BlockStorage};
-use anyhow::Result;
 use mmio::{Queues, VirtioDevice};
 use vm_memory::GuestMemoryMmap;
+
+type Result<T> = std::result::Result<T, DeviceError>;
 
 /// Different device types share a transport without erasing backend types.
 pub(crate) enum Device<BS: BlockStorage, ND: NetDevice> {

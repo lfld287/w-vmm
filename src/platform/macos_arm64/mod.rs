@@ -22,10 +22,9 @@ impl Platform for Hvf {
 
     fn layout(&self, config: &VmConfig, devices: &DeviceRequirements) -> Result<MachineLayout> {
         let boot = boot::Layout::new(config.memory_mib, boot::KERNEL, boot::INITRD.len())?;
-        ensure!(
-            (1..=hvf::max_vcpus()?).contains(&config.vcpu_count),
-            "vCPU count outside HVF supported range"
-        );
+        if !(1..=hvf::max_vcpus()?).contains(&config.vcpu_count) {
+            return Err(PlatformError::UnsupportedVcpuCount);
+        }
         let ram = MemoryRange {
             address: boot::RAM,
             size: boot.size as u64,
@@ -38,7 +37,7 @@ impl Platform for Hvf {
                     .address
                     .checked_add(ram.size)
                     .and_then(|a| a.checked_next_multiple_of(n.alignment))
-                    .ok_or_else(|| anyhow::anyhow!("hotplug overflow"))?;
+                    .ok_or_else(|| PlatformError::HotplugOverflow)?;
                 Ok(MemoryRange {
                     address,
                     size: n.capacity,
@@ -81,11 +80,17 @@ impl Platform for Hvf {
 }
 
 impl Mapper for Vm {
-    fn map(&mut self, region: &GuestRegionMmap) -> Result<()> {
+    fn map(
+        &mut self,
+        region: &GuestRegionMmap,
+    ) -> std::result::Result<(), crate::error::MemoryError> {
         self.inner.map(region)
     }
 
-    fn unmap(&mut self, region: &GuestRegionMmap) -> Result<()> {
+    fn unmap(
+        &mut self,
+        region: &GuestRegionMmap,
+    ) -> std::result::Result<(), crate::error::MemoryError> {
         self.inner.unmap(region)
     }
 }
@@ -125,7 +130,7 @@ impl VirtualMachine for Vm {
         let b = self
             .boot
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("VM not prepared"))?;
+            .ok_or_else(|| PlatformError::VmNotPrepared)?;
         self.cpus.as_ref().unwrap().start(b.entry, b.dtb);
         Ok(())
     }
@@ -143,7 +148,7 @@ impl VirtualMachine for Vm {
                 completion: a.reply,
             }))),
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                anyhow::bail!("all vCPU event senders disconnected")
+                Err(PlatformError::EventChannelDisconnected)
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if self.cpus.as_ref().unwrap().stopping() {
