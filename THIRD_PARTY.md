@@ -21,7 +21,7 @@ SPDX-License-Identifier: Apache-2.0
 ## Rust 组件
 
 - rust-vmm: vm-memory、linux-loader、vm-fdt、virtio-queue、virtio-bindings、vm-superio。
-- imago 0.2.5: https://docs.rs/imago/0.2.5/imago/ ，使用原生 `sync` feature。
+- imago 0.2.5: https://docs.rs/imago/0.2.5/imago/ ，使用官方 crate，启用 `sync` 和 `vm-memory` features，通过官方 volatile 转换器接入，内部缓冲和引用处理由 imago 管理，遵循 MIT 许可证。
 - block2、dispatch2：Apple Blocks / Grand Central Dispatch 的 Rust 包装，https://github.com/madsmtm/objc2 。
 - 其余依赖见 Cargo.lock 和各 crate 的 license 声明。
 

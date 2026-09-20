@@ -6,6 +6,7 @@ use std::{
     rc::Rc,
     time::Duration,
 };
+use vm_memory::VolatileSlice;
 use vm_memory::{
     Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion, GuestRegionMmap,
 };
@@ -366,12 +367,14 @@ impl BlockStorage for Disk {
         false
     }
 
-    fn read(&self, _: u64, d: &mut [u8]) -> Result<(), StorageError> {
-        d.fill(0);
+    fn read(&self, _: u64, d: &[VolatileSlice<'_>]) -> Result<(), StorageError> {
+        for s in d {
+            s.copy_from(&vec![0u8; s.len()]);
+        }
         Ok(())
     }
 
-    fn write(&self, _: u64, _: &[u8]) -> Result<(), StorageError> {
+    fn write(&self, _: u64, _: &[VolatileSlice<'_>]) -> Result<(), StorageError> {
         Ok(())
     }
 
@@ -424,11 +427,11 @@ impl NetDevice for NoNet {
         1514
     }
 
-    fn send(&mut self, _: &[u8]) -> Result<bool, NetError> {
+    fn send(&mut self, _: &[VolatileSlice<'_>]) -> Result<bool, NetError> {
         Ok(true)
     }
 
-    fn recv(&mut self, _: &mut [u8]) -> Result<Option<usize>, NetError> {
+    fn recv(&mut self, _: &[VolatileSlice<'_>]) -> Result<Option<usize>, NetError> {
         Ok(None)
     }
 }

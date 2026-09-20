@@ -1,23 +1,30 @@
 use crate::error::StorageError;
 use imago::{
-    DenyImplicitOpenGate, FormatAccess, FormatDriverBuilder, file::File as ImageFile, qcow2::Qcow2,
+    DenyImplicitOpenGate, FormatAccess, FormatDriverBuilder,
+    file::File as ImageFile,
+    io_buffers::{IoVector, IoVectorMut},
+    qcow2::Qcow2,
 };
 use std::{
     fs::{File, OpenOptions},
     os::{fd::AsRawFd, unix::fs::FileExt},
     path::Path,
 };
+use vm_memory::VolatileSlice;
 
 type Result<T> = std::result::Result<T, StorageError>;
 
+/// Complete synchronous requests; implementations must not retain guest pointers.
+/// Backends choose their own copying strategy; guest bytes require volatile access.
+/// A failed read may have modified part of the destination.
 pub trait BlockStorage {
     fn size(&self) -> u64;
 
     fn read_only(&self) -> bool;
 
-    fn read(&self, offset: u64, data: &mut [u8]) -> Result<()>;
+    fn read(&self, offset: u64, data: &[VolatileSlice<'_>]) -> Result<()>;
 
-    fn write(&self, offset: u64, data: &[u8]) -> Result<()>;
+    fn write(&self, offset: u64, data: &[VolatileSlice<'_>]) -> Result<()>;
 
     fn flush(&self) -> Result<()>;
 }
@@ -32,11 +39,11 @@ impl<T: BlockStorage + ?Sized> BlockStorage for Box<T> {
         (**self).read_only()
     }
 
-    fn read(&self, offset: u64, data: &mut [u8]) -> Result<()> {
+    fn read(&self, offset: u64, data: &[VolatileSlice<'_>]) -> Result<()> {
         (**self).read(offset, data)
     }
 
-    fn write(&self, offset: u64, data: &[u8]) -> Result<()> {
+    fn write(&self, offset: u64, data: &[VolatileSlice<'_>]) -> Result<()> {
         (**self).write(offset, data)
     }
 
@@ -94,6 +101,20 @@ pub fn validate_header(h: &[u8]) -> Result<u64> {
     Ok(size)
 }
 
+fn iov_max() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let limit = unsafe { libc::sysconf(libc::_SC_IOV_MAX) };
+        usize::try_from(limit).ok().filter(|&n| n > 0).unwrap_or(16)
+    })
+}
+
+fn overlaps(a: &VolatileSlice<'_>, b: &VolatileSlice<'_>) -> bool {
+    let a_start = a.ptr_guard().as_ptr() as usize;
+    let b_start = b.ptr_guard().as_ptr() as usize;
+    a_start < b_start.saturating_add(b.len()) && b_start < a_start.saturating_add(a.len())
+}
+
 pub struct Disk {
     image: FormatAccess<ImageFile>,
     lock: File,
@@ -103,6 +124,55 @@ pub struct Disk {
 }
 
 impl Disk {
+    fn transfer(&self, offset: u64, data: &[VolatileSlice<'_>], write: bool) -> Result<()> {
+        let operation = if write { "qcow2 write" } else { "qcow2 read" };
+        let context = |source| StorageError::Operation {
+            operation,
+            path: self.path.clone(),
+            source,
+        };
+        let len = data.iter().try_fold(0usize, |len, segment| {
+            len.checked_add(segment.len()).ok_or_else(|| {
+                context(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "disk request length overflow",
+                ))
+            })
+        })?;
+        // Validate the complete request before any batch can change the disk or guest.
+        bounds(self.size, offset, len)?;
+        let limit = iov_max();
+        let mut segments = data.iter().filter(|segment| !segment.is_empty()).peekable();
+        let mut offset = offset;
+        while segments.peek().is_some() {
+            let mut batch: Vec<&VolatileSlice<'_>> = Vec::new();
+            let mut bytes = 0;
+            while let Some(&segment) = segments.peek() {
+                if batch.len() == limit
+                    || (!write && batch.iter().any(|other| overlaps(segment, other)))
+                {
+                    break;
+                }
+                bytes += segment.len();
+                batch.push(segments.next().unwrap());
+            }
+            // Only descriptors are collected here. imago owns the conversion and buffering.
+            if write {
+                let (vector, guard) = IoVector::from_volatile_slice(batch.iter().copied());
+                let result = self.image.writev(vector, offset);
+                drop(guard);
+                result.map_err(context)?;
+            } else {
+                let (vector, guard) = IoVectorMut::from_volatile_slice(batch.iter().copied());
+                let result = self.image.readv(vector, offset);
+                drop(guard);
+                result.map_err(context)?;
+            }
+            offset += bytes as u64;
+        }
+        Ok(())
+    }
+
     pub fn open(path: &Path, readonly: bool) -> Result<Self> {
         let lock = OpenOptions::new()
             .read(true)
@@ -192,29 +262,15 @@ impl BlockStorage for Disk {
         self.readonly
     }
 
-    fn read(&self, offset: u64, data: &mut [u8]) -> Result<()> {
-        bounds(self.size, offset, data.len())?;
-        self.image
-            .read(data, offset)
-            .map_err(|source| StorageError::Operation {
-                operation: "qcow2 read",
-                path: self.path.clone(),
-                source,
-            })
+    fn read(&self, offset: u64, data: &[VolatileSlice<'_>]) -> Result<()> {
+        self.transfer(offset, data, false)
     }
 
-    fn write(&self, offset: u64, data: &[u8]) -> Result<()> {
+    fn write(&self, offset: u64, data: &[VolatileSlice<'_>]) -> Result<()> {
         if self.readonly {
             return Err(StorageError::ReadOnly);
         }
-        bounds(self.size, offset, data.len())?;
-        self.image
-            .write(data, offset)
-            .map_err(|source| StorageError::Operation {
-                operation: "qcow2 write",
-                path: self.path.clone(),
-                source,
-            })
+        self.transfer(offset, data, true)
     }
 
     fn flush(&self) -> Result<()> {

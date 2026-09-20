@@ -1,8 +1,10 @@
+use super::buffers;
 use super::mmio::{Queues, VirtioDevice, read_config};
 use crate::error::DeviceError;
 use crate::net::NetDevice;
 use virtio_bindings::bindings::virtio_net::{VIRTIO_NET_F_MAC, VIRTIO_NET_F_MTU};
-use vm_memory::{Bytes, GuestMemoryMmap};
+use virtio_queue::QueueT;
+use vm_memory::{GuestMemoryMmap, VolatileSlice};
 
 type Result<T> = std::result::Result<T, DeviceError>;
 
@@ -13,7 +15,8 @@ pub(crate) struct Net<ND: NetDevice> {
     backend: ND,
     config: [u8; 12],
     rx: Vec<u8>,
-    pending_tx: Option<(u16, Vec<u8>)>,
+    pending_tx: Option<u16>,
+    tx: Vec<u8>,
 }
 
 impl<ND: NetDevice> Net<ND> {
@@ -37,59 +40,83 @@ impl<ND: NetDevice> Net<ND> {
             config,
             rx: vec![0; HEADER + max],
             pending_tx: None,
+            tx: Vec::with_capacity(max),
         })
     }
 
     fn transmit(&mut self, queues: &mut Queues, mem: &GuestMemoryMmap) -> Result<()> {
         for _ in 0..BUDGET {
-            let (head, frame) = if let Some(pending) = self.pending_tx.take() {
-                pending
-            } else {
-                let Some(chain) = queues.pop(1, mem)? else {
+            if let Some(head) = self.pending_tx {
+                if !self
+                    .backend
+                    .send(&[VolatileSlice::from(self.tx.as_mut_slice())])?
+                {
                     break;
-                };
-                if !chain.descriptors.iter().all(|d| !d.is_write_only()) {
-                    return Err(DeviceError::TxDescriptorMustBeReadable);
                 }
-                let total = chain
-                    .descriptors
-                    .iter()
-                    .try_fold(0usize, |n, d| n.checked_add(d.len() as usize))
-                    .ok_or_else(|| DeviceError::TxLengthOverflow)?;
-                if !(HEADER + 14..=self.rx.len()).contains(&total) {
-                    return Err(DeviceError::InvalidTxPacketSize {
-                        length: total,
-                        capacity: self.rx.len(),
-                    });
-                }
-                let mut packet = vec![0; total];
-                let mut offset = 0;
-                for d in &chain.descriptors {
-                    let end = offset + d.len() as usize;
-                    mem.read_slice(&mut packet[offset..end], d.addr())?;
-                    offset = end;
-                }
-                if !(packet[0] == 0 && packet[1] == 0) {
-                    return Err(DeviceError::UnnegotiatedTxChecksumGsoOffload);
-                }
-                // Ignore unused header fields; never forward virtio metadata to the backend.
-                (chain.head, packet[HEADER..].to_vec())
+                self.pending_tx = None;
+                queues.complete(1, mem, head, 0)?;
+                continue;
+            }
+            let Some(chain) = queues.pop(1, mem)? else {
+                break;
             };
-            if !self.backend.send(&frame)? {
-                self.pending_tx = Some((head, frame));
+            if !chain.descriptors.iter().all(|d| !d.is_write_only()) {
+                return Err(DeviceError::TxDescriptorMustBeReadable);
+            }
+            let total = chain
+                .descriptors
+                .iter()
+                .try_fold(0usize, |n, d| n.checked_add(d.len() as usize))
+                .ok_or(DeviceError::TxLengthOverflow)?;
+            if !(HEADER + 14..=self.rx.len()).contains(&total) {
+                return Err(DeviceError::InvalidTxPacketSize {
+                    length: total,
+                    capacity: self.rx.len(),
+                });
+            }
+            let slices = buffers::slices(mem, &chain.descriptors)?;
+            let mut header = [0; HEADER];
+            buffers::copy_to(&slices, &mut header);
+            if header[0] != 0 || header[1] != 0 {
+                return Err(DeviceError::UnnegotiatedTxChecksumGsoOffload);
+            }
+            let payload = buffers::range(&slices, HEADER, total - HEADER);
+            if !self.backend.send(&payload)? {
+                self.tx.resize(total - HEADER, 0);
+                buffers::copy_to(&payload, &mut self.tx);
+                self.pending_tx = Some(chain.head);
                 break;
             }
-            queues.complete(1, mem, head, 0)?;
+            queues.complete(1, mem, chain.head, 0)?;
         }
         Ok(())
     }
 
     fn receive(&mut self, queues: &mut Queues, mem: &GuestMemoryMmap) -> Result<()> {
         for _ in 0..BUDGET {
-            if queues.available(0, mem)? == 0 {
+            let Some(chain) = queues.pop(0, mem)? else {
                 break;
+            };
+            if !chain.descriptors.iter().all(|d| d.is_write_only()) {
+                return Err(DeviceError::RxDescriptorMustBeWritable);
             }
-            let Some(len) = self.backend.recv(&mut self.rx[HEADER..])? else {
+            let capacity = chain
+                .descriptors
+                .iter()
+                .try_fold(0usize, |n, d| n.checked_add(d.len() as usize))
+                .ok_or(DeviceError::RxLengthOverflow)?;
+            let slices = buffers::slices(mem, &chain.descriptors)?;
+            let direct = capacity >= self.rx.len() && !buffers::overlaps(&slices);
+            let result = if direct {
+                let payload = buffers::range(&slices, HEADER, self.rx.len() - HEADER);
+                self.backend.recv(&payload)?
+            } else {
+                self.backend
+                    .recv(&[VolatileSlice::from(&mut self.rx[HEADER..])])?
+            };
+            let Some(len) = result else {
+                let q = &mut queues.rings[0];
+                q.set_next_avail(q.next_avail().wrapping_sub(1));
                 break;
             };
             if !(14..=self.rx.len() - HEADER).contains(&len) {
@@ -98,33 +125,18 @@ impl<ND: NetDevice> Net<ND> {
                     capacity: self.rx.len() - HEADER,
                 });
             }
-            let chain = queues
-                .pop(0, mem)?
-                .ok_or_else(|| DeviceError::MissingRxChain)?;
-            if !chain.descriptors.iter().all(|d| d.is_write_only()) {
-                return Err(DeviceError::RxDescriptorMustBeWritable);
-            }
-            let capacity = chain
-                .descriptors
-                .iter()
-                .try_fold(0usize, |n, d| n.checked_add(d.len() as usize))
-                .ok_or_else(|| DeviceError::RxLengthOverflow)?;
-            let total = len + HEADER;
+            let total = HEADER + len;
             if capacity < total {
-                // One receive buffer (possibly a chain) must hold the entire packet.
                 queues.complete(0, mem, chain.head, 0)?;
                 continue;
             }
-            self.rx[..HEADER].fill(0);
-            self.rx[10..12].copy_from_slice(&1u16.to_le_bytes());
-            let mut offset = 0;
-            for d in &chain.descriptors {
-                let end = total.min(offset + d.len() as usize);
-                mem.write_slice(&self.rx[offset..end], d.addr())?;
-                offset = end;
-                if offset == total {
-                    break;
-                }
+            let mut header = [0; HEADER];
+            header[10..12].copy_from_slice(&1u16.to_le_bytes());
+            if direct {
+                buffers::copy_from(&slices, &header);
+            } else {
+                self.rx[..HEADER].copy_from_slice(&header);
+                buffers::copy_from(&slices, &self.rx[..total]);
             }
             queues.complete(0, mem, chain.head, total as u32)?;
         }
@@ -164,6 +176,7 @@ impl<ND: NetDevice> VirtioDevice for Net<ND> {
 
     fn reset(&mut self) -> Result<()> {
         self.pending_tx = None;
+        self.tx.clear();
         Ok(())
     }
 }
@@ -174,7 +187,7 @@ mod tests {
     use crate::devices::mmio::{Mmio, tests::initialize};
     use std::{cell::RefCell, collections::VecDeque, rc::Rc};
     use virtio_queue::{QueueT, desc::split::Descriptor};
-    use vm_memory::GuestAddress;
+    use vm_memory::{Bytes, GuestAddress};
 
     #[derive(Default)]
     struct Fake {
@@ -182,6 +195,8 @@ mod tests {
         sent: Vec<Vec<u8>>,
         blocked: bool,
         fail: bool,
+        tx_addresses: Vec<Vec<usize>>,
+        rx_addresses: Vec<Vec<usize>>,
     }
 
     impl NetDevice for Rc<RefCell<Fake>> {
@@ -195,8 +210,17 @@ mod tests {
             1514
         }
 
-        fn send(&mut self, frame: &[u8]) -> std::result::Result<bool, crate::error::NetError> {
+        fn send(
+            &mut self,
+            frame: &[VolatileSlice<'_>],
+        ) -> std::result::Result<bool, crate::error::NetError> {
             let mut backend = self.borrow_mut();
+            backend.tx_addresses.push(
+                frame
+                    .iter()
+                    .map(|s| s.ptr_guard().as_ptr() as usize)
+                    .collect(),
+            );
             if backend.fail {
                 return Err(crate::error::NetError::Backend(
                     std::io::Error::other("injected send failure").into(),
@@ -205,15 +229,23 @@ mod tests {
             if backend.blocked {
                 return Ok(false);
             }
-            backend.sent.push(frame.to_vec());
+            let mut bytes = vec![0; frame.iter().map(VolatileSlice::len).sum()];
+            buffers::copy_to(frame, &mut bytes);
+            backend.sent.push(bytes);
             Ok(true)
         }
 
         fn recv(
             &mut self,
-            buffer: &mut [u8],
+            buffer: &[VolatileSlice<'_>],
         ) -> std::result::Result<Option<usize>, crate::error::NetError> {
             let mut backend = self.borrow_mut();
+            backend.rx_addresses.push(
+                buffer
+                    .iter()
+                    .map(|s| s.ptr_guard().as_ptr() as usize)
+                    .collect(),
+            );
             if backend.fail {
                 return Err(crate::error::NetError::Backend(
                     std::io::Error::other("injected receive failure").into(),
@@ -222,7 +254,7 @@ mod tests {
             let Some(frame) = backend.received.pop_front() else {
                 return Ok(None);
             };
-            buffer[..frame.len()].copy_from_slice(&frame);
+            buffers::copy_from(buffer, &frame);
             Ok(Some(frame.len()))
         }
     }
@@ -242,13 +274,16 @@ mod tests {
                 self.0
             }
 
-            fn send(&mut self, _: &[u8]) -> std::result::Result<bool, crate::error::NetError> {
+            fn send(
+                &mut self,
+                _: &[VolatileSlice<'_>],
+            ) -> std::result::Result<bool, crate::error::NetError> {
                 unreachable!()
             }
 
             fn recv(
                 &mut self,
-                _: &mut [u8],
+                _: &[VolatileSlice<'_>],
             ) -> std::result::Result<Option<usize>, crate::error::NetError> {
                 unreachable!()
             }
@@ -420,5 +455,104 @@ mod tests {
             matches!(net.poll(&mem), Err(DeviceError::Net(crate::error::NetError::Backend(source))) if source.downcast_ref::<std::io::Error>().is_some())
         );
         assert_eq!(used(&mem, 1), (0, 0));
+    }
+    #[test]
+    fn direct_guest_addresses_cross_regions_empty_segments_and_rollback() {
+        use vm_memory::GuestMemoryBackend;
+        let backend = Rc::new(RefCell::new(Fake::default()));
+        let mem = GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0), 0x9000),
+            (GuestAddress(0x9000), 0x17000),
+        ])
+        .unwrap();
+        let mut net = Mmio::new(Net::new(backend.clone()).unwrap());
+        initialize(&mut net, &mem);
+        let mut packet = vec![0; HEADER];
+        packet.extend_from_slice(&[0x66; 64]);
+        mem.write_slice(&packet, GuestAddress(0x8ff0)).unwrap();
+        post(
+            &net,
+            &mem,
+            1,
+            &[
+                Descriptor::new(0, 0, 1, 1),
+                Descriptor::new(0x8ff0, 5, 1, 2),
+                Descriptor::new(0x8ff5, 71, 0, 0),
+            ],
+        );
+        net.poll(&mem).unwrap();
+        let ptr = |addr, len| {
+            mem.get_slice(GuestAddress(addr), len)
+                .unwrap()
+                .ptr_guard()
+                .as_ptr() as usize
+        };
+        assert_eq!(
+            backend.borrow().tx_addresses[0],
+            [ptr(0x8ffc, 4), ptr(0x9000, 60)]
+        );
+        assert!(net.device.tx.is_empty()); // successful TX did not create a payload snapshot
+        post(
+            &net,
+            &mem,
+            0,
+            &[
+                Descriptor::new(0x8ff8, 5, 3, 1),
+                Descriptor::new(0, 0, 3, 2),
+                Descriptor::new(0x8ffd, 2043, 2, 0),
+            ],
+        );
+        net.poll(&mem).unwrap();
+        net.poll(&mem).unwrap();
+        assert_eq!(net.queues.rings[0].next_avail(), 0);
+        assert_eq!(used(&mem, 0), (0, 0));
+        backend.borrow_mut().received.push_back(vec![0x77; 64]);
+        net.poll(&mem).unwrap();
+        assert_eq!(
+            backend.borrow().rx_addresses.last().unwrap(),
+            &[ptr(0x9004, 1514)]
+        );
+        let mut actual = [0; 76];
+        mem.read_slice(&mut actual, GuestAddress(0x8ff8)).unwrap();
+        assert_eq!(&actual[HEADER..], &[0x77; 64]);
+        assert_eq!(used(&mem, 0), (1, 76));
+    }
+
+    #[test]
+    fn overlapping_receive_uses_snapshot_and_invalid_tail_never_reaches_backend() {
+        use vm_memory::GuestMemoryBackend;
+        let (mut net, mem, backend) = setup();
+        backend.borrow_mut().received.push_back((0..64).collect());
+        post(
+            &net,
+            &mem,
+            0,
+            &[
+                Descriptor::new(0x8000, 20, 3, 1),
+                Descriptor::new(0x8000, 2048, 2, 0),
+            ],
+        );
+        net.poll(&mem).unwrap();
+        let guest = mem
+            .get_slice(GuestAddress(0x8000), 2048)
+            .unwrap()
+            .ptr_guard()
+            .as_ptr() as usize;
+        assert_ne!(backend.borrow().rx_addresses[0][0], guest + HEADER);
+        let mut actual = [0; 56];
+        mem.read_slice(&mut actual, GuestAddress(0x8000)).unwrap();
+        assert_eq!(actual.as_slice(), &(8..64).collect::<Vec<u8>>());
+        let (mut net, mem, backend) = setup();
+        post(
+            &net,
+            &mem,
+            1,
+            &[
+                Descriptor::new(0x8000, 40, 1, 1),
+                Descriptor::new(0x1fff0, 40, 0, 0),
+            ],
+        );
+        assert!(net.poll(&mem).is_err());
+        assert!(backend.borrow().tx_addresses.is_empty());
     }
 }

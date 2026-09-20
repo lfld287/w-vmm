@@ -120,6 +120,14 @@ fn run(serial: impl SerialIo) -> Result<(), Box<dyn std::error::Error>> {
 
 `net::NetDevice` 提供 `mac_address`、必填关联常量 `MTU: u16`、`max_frame_len` 和非阻塞 `send` / `recv`，传输完整以太网帧，不含 FCS 或 virtio 头。`send` 返回 `false` 表示未消费该帧、稍后重试；`recv` 返回 `None` 表示没有数据。trait 不涉及 DHCP、IP、路由或 NAT；这些服务由具体后端决定。实现不需要 `Send` / `Sync`，可用 `Box<T>` 包装具体后端，关联常量会转发给 `T`。
 
+`BlockStorage::read/write` 和 `NetDevice::send/recv` 的数据参数统一为 `&[vm_memory::VolatileSlice<'_>]`，长度是各段字节数之和。后端必须在调用返回前完成内存访问，不得保存 guest 指针或自行把 guest 数据转换为普通 Rust slice；使用 imago 官方转换器时，其内部引用处理由 imago 管理。各后端自行选择复制策略，可以通过 volatile 复制访问数据，或持有 `ptr_guard` / `ptr_guard_mut`，在同步系统调用中传递原始 `iovec`。`recv(None)` 不得修改接收缓冲；磁盘读失败允许部分目标数据已被修改，但设备只报告 IOERR 和状态字长度。
+
+普通 vmnet TX 直接发送 guest 分段；背压时复制一次到可复用宿主快照，后续重试使用该快照，reset 丢弃它。RX 在容量达到最大帧长且分段不重叠时直接写入 guest；无包会撤销出队，小缓冲和重叠区间使用可复用回退缓冲。设备层将 guest 分段直接传递给 `NetDevice` / `BlockStorage`，这里的“零拷贝”限定于自定义接口边界，不保证具体后端内部零拷贝。
+
+`Disk` 固定使用官方 imago `=0.2.5`，启用 `sync` 和 `vm-memory` features，不引入 vendor 或补丁。通过官方 `IoVectorMut::from_volatile_slice` / `IoVector::from_volatile_slice` 转换器将 guest 分段缓冲直接传给同步 `readv` / `writev`，guard 保持到调用结束；内部缓冲和引用处理由 imago 管理。普通数据路径省去请求级用户态 payload 中转复制；压缩簇、对齐回退和内核数据搬运不属于零拷贝承诺。
+
+完整请求的长度溢出及容量范围在任何 I/O 前校验，忽略空段，按宿主 `IOV_MAX` 分批（查询失败使用 16）；读取目标重叠时先完成当前批次，再按原顺序推进磁盘偏移。读取失败可能已修改部分目标，设备仍报告 IOERR。只读检查、空请求和刷新语义保持不变。
+
 `serial::SerialIo: std::io::Write` 是必传的串口后端。`recv(&mut [u8])` 非阻塞读取发往客户机的数据，返回长度不得超过缓冲区；`0`（含 EOF）、`WouldBlock` 和 `Interrupted` 表示暂无输入。每轮只读取 UART FIFO 剩余容量，满时不读取。暂停期间不调用 `recv()`，输入留在宿主缓冲区，恢复后继续按 FIFO 容量读取。所有调用在 VMM 线程执行，无需 `Send` / `Sync`，支持 `Box<dyn SerialIo>`。
 
 客户机输出使用同步 `write_all` / `flush`，没有额外输出队列。输入的其他错误及输出错误会终止运行，并尝试刷新全部磁盘。库不解释 `0x1d` 等控制字节；终端 raw mode、stdin/stdout、Ctrl-]、信号和恢复由 `demo/src/terminal.rs` 的 `Terminal` 实现负责。`Terminal::new()` 返回 `(Terminal, TerminalGuard)`，调用方必须保留 guard 直到 `run()` 返回。信号和 Ctrl-] 通过本地通知通道唤醒独立线程，再调用同步 `VmControl::stop()`；串口销毁只恢复终端，guard 注销信号并回收线程。自定义后端需要退出时也应通知其他线程调用 `VmControl::stop()`，不可在 VMM 回调内调用阻塞控制方法。
@@ -273,6 +281,8 @@ cargo check --workspace --all-targets --locked
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
+# 需要本地 qemu-img：压缩、稀疏、跨簇、只读、越界、持久化、空段、IOV_MAX 分批及重叠读取
+cargo test -p w-vmm --test volatile_disk --locked -- --ignored
 cargo build -p w-vmm --lib --locked
 ./build.sh
 python3 scripts/smoke.py --binary dist/w-vmm

@@ -176,6 +176,7 @@ dependencies = [
  "page_size",
  "rustc_version",
  "tracing",
+ "vm-memory",
  "windows-sys",
 ]
 
@@ -559,6 +560,7 @@ dependencies = [
  "serde_json",
  "signal-hook",
  "thiserror",
+ "vm-memory",
  "w-vmm",
 ]
 

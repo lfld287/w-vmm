@@ -1,6 +1,7 @@
 //! Local test peer demonstrating NetDevice injection. No host network or privileges.
 //! Run the signed binary as: net-peer run [disk.qcow2 ...]
 //! Guest: ip link set eth0 up; ip addr add 192.0.2.2/24 dev eth0; ping 192.0.2.1
+use vm_memory::VolatileSlice;
 use w_vmm::error::NetError;
 use w_vmm_demo::{Result, error::ArgumentError};
 
@@ -53,10 +54,17 @@ impl NetDevice for Peer {
         1514
     }
 
-    fn send(&mut self, frame: &[u8]) -> std::result::Result<bool, NetError> {
+    fn send(&mut self, frame: &[VolatileSlice<'_>]) -> std::result::Result<bool, NetError> {
         if self.replies.len() == 128 {
             return Ok(false);
         }
+        let mut bytes = vec![0; frame.iter().map(VolatileSlice::len).sum()];
+        let mut offset = 0;
+        for s in frame {
+            s.copy_to(&mut bytes[offset..offset + s.len()]);
+            offset += s.len();
+        }
+        let frame = bytes.as_slice();
         if frame.len() < 42 {
             return Ok(true);
         }
@@ -104,17 +112,26 @@ impl NetDevice for Peer {
         Ok(true)
     }
 
-    fn recv(&mut self, buffer: &mut [u8]) -> std::result::Result<Option<usize>, NetError> {
+    fn recv(
+        &mut self,
+        buffer: &[VolatileSlice<'_>],
+    ) -> std::result::Result<Option<usize>, NetError> {
         let Some(frame) = self.replies.pop_front() else {
             return Ok(None);
         };
-        if buffer.len() < frame.len() {
+        let capacity = buffer.iter().map(VolatileSlice::len).sum();
+        if capacity < frame.len() {
             return Err(NetError::Backend(Box::new(PeerError::Buffer {
-                capacity: buffer.len(),
+                capacity,
                 length: frame.len(),
             })));
         }
-        buffer[..frame.len()].copy_from_slice(&frame);
+        let mut remaining = frame.as_slice();
+        for s in buffer {
+            let n = s.len().min(remaining.len());
+            s.copy_from(&remaining[..n]);
+            remaining = &remaining[n..];
+        }
         Ok(Some(frame.len()))
     }
 }

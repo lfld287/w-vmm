@@ -200,11 +200,14 @@ impl NetDevice for NoNet {
         1514
     }
 
-    fn send(&mut self, _: &[u8]) -> std::result::Result<bool, NetError> {
+    fn send(&mut self, _: &[vm_memory::VolatileSlice<'_>]) -> std::result::Result<bool, NetError> {
         Ok(true)
     }
 
-    fn recv(&mut self, _: &mut [u8]) -> std::result::Result<Option<usize>, NetError> {
+    fn recv(
+        &mut self,
+        _: &[vm_memory::VolatileSlice<'_>],
+    ) -> std::result::Result<Option<usize>, NetError> {
         Ok(None)
     }
 }

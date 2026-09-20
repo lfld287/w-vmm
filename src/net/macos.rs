@@ -9,6 +9,7 @@ use std::{
     sync::mpsc,
     time::Duration,
 };
+use vm_memory::VolatileSlice;
 
 type Result<T> = std::result::Result<T, NetError>;
 
@@ -242,22 +243,33 @@ impl NetDevice for Vmnet {
         self.max_frame
     }
 
-    fn send(&mut self, frame: &[u8]) -> Result<bool> {
-        if !(14..=self.max_frame).contains(&frame.len()) {
+    fn send(&mut self, frame: &[VolatileSlice<'_>]) -> Result<bool> {
+        let length: usize = frame.iter().map(VolatileSlice::len).sum();
+        if !(14..=self.max_frame).contains(&length) {
             return Err(NetError::InvalidVmnetTxFrameSize {
-                length: frame.len(),
+                length,
                 capacity: self.max_frame,
             });
         }
-        // vmnet_write only reads the iovec despite its C API taking mutable pointers.
-        let mut iov = libc::iovec {
-            iov_base: frame.as_ptr().cast_mut().cast(),
-            iov_len: frame.len(),
-        };
+        // Guards and iovecs live only through this synchronous vmnet call.
+        let guards: Vec<_> = frame
+            .iter()
+            .filter(|s| !s.is_empty())
+            .map(VolatileSlice::ptr_guard)
+            .collect();
+        let mut iov: Vec<_> = frame
+            .iter()
+            .filter(|s| !s.is_empty())
+            .zip(&guards)
+            .map(|(s, g)| libc::iovec {
+                iov_base: g.as_ptr().cast_mut().cast(),
+                iov_len: s.len(),
+            })
+            .collect();
         let mut packet = Packet {
-            size: frame.len(),
-            iov: &mut iov,
-            iov_count: 1,
+            size: length,
+            iov: iov.as_mut_ptr(),
+            iov_count: iov.len().try_into()?,
             flags: 0,
         };
         let mut count = 1;
@@ -272,21 +284,32 @@ impl NetDevice for Vmnet {
         Ok(count == 1)
     }
 
-    fn recv(&mut self, buffer: &mut [u8]) -> Result<Option<usize>> {
-        if buffer.len() < self.max_frame {
+    fn recv(&mut self, buffer: &[VolatileSlice<'_>]) -> Result<Option<usize>> {
+        let length: usize = buffer.iter().map(VolatileSlice::len).sum();
+        if length < self.max_frame {
             return Err(NetError::VmnetRxBufferTooSmall {
-                length: buffer.len(),
+                length,
                 capacity: self.max_frame,
             });
         }
-        let mut iov = libc::iovec {
-            iov_base: buffer.as_mut_ptr().cast(),
-            iov_len: buffer.len(),
-        };
+        let guards: Vec<_> = buffer
+            .iter()
+            .filter(|s| !s.is_empty())
+            .map(VolatileSlice::ptr_guard_mut)
+            .collect();
+        let mut iov: Vec<_> = buffer
+            .iter()
+            .filter(|s| !s.is_empty())
+            .zip(&guards)
+            .map(|(s, g)| libc::iovec {
+                iov_base: g.as_ptr().cast(),
+                iov_len: s.len(),
+            })
+            .collect();
         let mut packet = Packet {
-            size: buffer.len(),
-            iov: &mut iov,
-            iov_count: 1,
+            size: length,
+            iov: iov.as_mut_ptr(),
+            iov_count: iov.len().try_into()?,
             flags: 0,
         };
         let mut count = 1;
@@ -341,6 +364,11 @@ mod tests {
         assert_ne!(net.mac_address(), [0; 6]);
         net.close().unwrap();
         net.close().unwrap();
-        assert!(net.recv(&mut vec![0; net.max_frame_len()]).is_err());
+        assert!(
+            net.recv(&[VolatileSlice::from(
+                vec![0; net.max_frame_len()].as_mut_slice()
+            )])
+            .is_err()
+        );
     }
 }

@@ -77,30 +77,43 @@ impl<BS: BlockStorage> Block<BS> {
         if desc.len() < 2 {
             return Err(DeviceError::TruncatedBlockDescriptorChain);
         }
-        let header = desc[0];
         let status = desc[desc.len() - 1];
-        if !(!header.is_write_only()
-            && header.len() == 16
-            && status.is_write_only()
-            && status.len() == 1)
-        {
+        if !status.is_write_only() || status.len() != 1 {
             return Err(DeviceError::InvalidBlockHeaderStatus);
         }
-        let mut h = [0; 16];
-        mem.read_slice(&mut h, header.addr())?;
-        let kind = u32::from_le_bytes(h[..4].try_into()?);
-        let sector = u64::from_le_bytes(h[8..].try_into()?);
-        let data = &desc[1..desc.len() - 1];
-        let total = data
+        // Validate the entire request, including status, before any backend access.
+        let all = super::buffers::slices(mem, desc)?;
+        let request = &desc[..desc.len() - 1];
+        let request_len = request
             .iter()
-            .try_fold(0usize, |sum, d| sum.checked_add(d.len() as usize))
-            .ok_or_else(|| DeviceError::RequestLengthOverflow)?;
+            .try_fold(0usize, |n, d| n.checked_add(d.len() as usize))
+            .ok_or(DeviceError::RequestLengthOverflow)?;
+        let total = request_len
+            .checked_sub(16)
+            .ok_or(DeviceError::InvalidBlockHeaderStatus)?;
         if total > MAX_REQUEST {
             return Err(DeviceError::BlockRequestTooLarge {
                 length: total,
                 limit: MAX_REQUEST,
             });
         }
+        let mut remaining_header = 16;
+        let mut data = Vec::new();
+        for d in request {
+            let header_len = remaining_header.min(d.len() as usize);
+            if header_len != 0 && d.is_write_only() {
+                return Err(DeviceError::InvalidBlockHeaderStatus);
+            }
+            remaining_header -= header_len;
+            if d.len() as usize > header_len {
+                data.push(*d);
+            }
+        }
+        let mut h = [0; 16];
+        super::buffers::copy_to(&all, &mut h);
+        let kind = u32::from_le_bytes(h[..4].try_into()?);
+        let sector = u64::from_le_bytes(h[8..].try_into()?);
+        let buffers = super::buffers::range(&all, 16, total);
         let mut used = 1;
         let result = (|| -> Result<u8> {
             match kind {
@@ -119,24 +132,11 @@ impl<BS: BlockStorage> Block<BS> {
                         .checked_mul(512)
                         .ok_or_else(|| DeviceError::SectorOverflow { sector })?;
                     bounds(self.disk.size(), offset, total)?;
-                    let mut buf = vec![0; total];
                     if read {
-                        self.disk.read(offset, &mut buf)?;
-                        let mut p = 0;
-                        for d in data {
-                            let n = d.len() as usize;
-                            mem.write_slice(&buf[p..p + n], d.addr())?;
-                            p += n;
-                        }
+                        self.disk.read(offset, &buffers)?;
                         used += total as u32;
                     } else {
-                        let mut p = 0;
-                        for d in data {
-                            let n = d.len() as usize;
-                            mem.read_slice(&mut buf[p..p + n], d.addr())?;
-                            p += n;
-                        }
-                        self.disk.write(offset, &buf)?;
+                        self.disk.write(offset, &buffers)?;
                         if negotiated & (1 << VIRTIO_BLK_F_FLUSH) == 0 {
                             self.disk.flush()?; // Without FLUSH negotiation, use write-through.
                         }
@@ -152,16 +152,7 @@ impl<BS: BlockStorage> Block<BS> {
                     if !(total >= 20 && data.iter().all(|d| d.is_write_only())) {
                         return Err(DeviceError::InvalidGetId);
                     }
-                    let id = &self.id;
-                    let mut p = 0;
-                    for d in data {
-                        let n = (d.len() as usize).min(20 - p);
-                        mem.write_slice(&id[p..p + n], d.addr())?;
-                        p += n;
-                        if p == 20 {
-                            break;
-                        }
-                    }
+                    super::buffers::copy_from(&buffers, &self.id);
                     used += 20;
                 }
                 _ => return Ok(VIRTIO_BLK_S_UNSUPP as u8),
@@ -193,12 +184,15 @@ mod tests {
     use virtio_queue::QueueT;
     use virtio_queue::desc::split::Descriptor;
     use vm_memory::GuestAddress;
+    use vm_memory::VolatileSlice;
 
     struct Fake {
         data: RefCell<Vec<u8>>,
         ro: bool,
         fail: bool,
         flushes: Cell<u32>,
+        addresses: RefCell<Vec<usize>>,
+        partial: Cell<bool>,
     }
 
     impl BlockStorage for Rc<Fake> {
@@ -213,26 +207,47 @@ mod tests {
         fn read(
             &self,
             o: u64,
-            d: &mut [u8],
+            d: &[VolatileSlice<'_>],
         ) -> std::result::Result<(), crate::error::StorageError> {
+            *self.addresses.borrow_mut() =
+                d.iter().map(|s| s.ptr_guard().as_ptr() as usize).collect();
+            if self.partial.get() {
+                if let Some(first) = d.first() {
+                    first.copy_from(&[0x99u8]);
+                }
+                return Err(crate::error::StorageError::Backend(
+                    std::io::Error::other("partial read").into(),
+                ));
+            }
             if self.fail {
                 return Err(crate::error::StorageError::Backend(
                     std::io::Error::other("injected host I/O error").into(),
                 ));
             }
-            bounds(self.size(), o, d.len())?;
-            d.copy_from_slice(&self.data.borrow()[o as usize..o as usize + d.len()]);
+            let len = d.iter().map(VolatileSlice::len).sum();
+            bounds(self.size(), o, len)?;
+            super::super::buffers::copy_from(d, &self.data.borrow()[o as usize..o as usize + len]);
             Ok(())
         }
 
-        fn write(&self, o: u64, d: &[u8]) -> std::result::Result<(), crate::error::StorageError> {
+        fn write(
+            &self,
+            o: u64,
+            d: &[VolatileSlice<'_>],
+        ) -> std::result::Result<(), crate::error::StorageError> {
+            *self.addresses.borrow_mut() =
+                d.iter().map(|s| s.ptr_guard().as_ptr() as usize).collect();
             if !(!self.ro && !self.fail) {
                 return Err(crate::error::StorageError::Backend(
                     std::io::Error::other("read-only/injected host I/O error").into(),
                 ));
             }
-            bounds(self.size(), o, d.len())?;
-            self.data.borrow_mut()[o as usize..o as usize + d.len()].copy_from_slice(d);
+            let len = d.iter().map(VolatileSlice::len).sum();
+            bounds(self.size(), o, len)?;
+            super::super::buffers::copy_to(
+                d,
+                &mut self.data.borrow_mut()[o as usize..o as usize + len],
+            );
             Ok(())
         }
 
@@ -253,6 +268,8 @@ mod tests {
             ro,
             fail,
             flushes: Cell::new(0),
+            addresses: RefCell::new(Vec::new()),
+            partial: Cell::new(false),
         });
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let mut b = Mmio::new(Block::new("w-vmm-data-000000001".into(), disk.clone()).unwrap());
@@ -432,5 +449,54 @@ mod tests {
         }
         let boxed: Box<dyn BlockStorage> = Box::new(da);
         assert!(Block::new("boxed".into(), boxed).is_ok());
+    }
+    #[test]
+    fn split_header_and_payload_cross_regions_reach_backend_directly() {
+        use vm_memory::GuestMemoryBackend;
+        let (_, _, disk) = setup(false, false);
+        let b = Block::new("scatter".into(), disk.clone()).unwrap();
+        let mem = GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0), 0x6000),
+            (GuestAddress(0x6000), 0x2000),
+        ])
+        .unwrap();
+        let desc = [
+            Descriptor::new(0x4000, 7, 0, 0),
+            Descriptor::new(0x4100, 9, 0, 0),
+            Descriptor::new(0, 0, 0, 0),
+            Descriptor::new(0x5f80, 512, 0, 0),
+            Descriptor::new(0x7000, 1, 2, 0),
+        ];
+        mem.write_obj(VIRTIO_BLK_T_OUT, GuestAddress(0x4000))
+            .unwrap();
+        mem.write_slice(&[0x55; 512], GuestAddress(0x5f80)).unwrap();
+        assert_eq!(b.request(&mem, &desc, 1 << VIRTIO_BLK_F_FLUSH).unwrap(), 1);
+        let ptr = |addr, len| {
+            mem.get_slice(GuestAddress(addr), len)
+                .unwrap()
+                .ptr_guard()
+                .as_ptr() as usize
+        };
+        assert_eq!(
+            *disk.addresses.borrow(),
+            [ptr(0x5f80, 128), ptr(0x6000, 384)]
+        );
+        assert_eq!(&disk.data.borrow()[..512], &[0x55; 512]);
+        let mut read_desc = desc;
+        read_desc[3] = Descriptor::new(0x5f80, 512, 2, 0);
+        mem.write_obj(VIRTIO_BLK_T_IN, GuestAddress(0x4000))
+            .unwrap();
+        assert_eq!(b.request(&mem, &read_desc, 0).unwrap(), 513);
+        disk.partial.set(true);
+        assert_eq!(b.request(&mem, &read_desc, 0).unwrap(), 1);
+        assert_eq!(
+            mem.read_obj::<u8>(GuestAddress(0x7000)).unwrap(),
+            VIRTIO_BLK_S_IOERR as u8
+        );
+        assert_eq!(mem.read_obj::<u8>(GuestAddress(0x5f80)).unwrap(), 0x99);
+        disk.addresses.borrow_mut().clear();
+        read_desc[3] = Descriptor::new(0x7fff, 512, 2, 0);
+        assert!(b.request(&mem, &read_desc, 0).is_err());
+        assert!(disk.addresses.borrow().is_empty());
     }
 }

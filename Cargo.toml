@@ -16,7 +16,7 @@ vm-memory = { version = "0.18", features = ["backend-mmap"] }
 virtio-queue = "0.18"
 virtio-bindings = "0.2"
 vm-superio = "0.8"
-imago = { version = "=0.2.5", default-features = false, features = ["sync"] }
+imago = { version = "=0.2.5", default-features = false, features = ["sync", "vm-memory"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6.2"
