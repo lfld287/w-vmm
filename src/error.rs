@@ -75,9 +75,13 @@ pub enum MemoryError {
     #[error("VM has stopped")]
     Stopped,
     #[error(
-        "requested memory {requested} MiB must be a multiple of 128 MiB within region capacity {capacity} MiB"
+        "requested memory {requested} MiB must be a multiple of {block_size_mib} MiB within region capacity {capacity} MiB"
     )]
-    InvalidTarget { requested: u64, capacity: u64 },
+    InvalidTarget {
+        requested: u64,
+        capacity: u64,
+        block_size_mib: u64,
+    },
     #[error("memory capacity overflow: {mib} MiB")]
     CapacityOverflow { mib: u64 },
     #[error("readable descriptor after writable descriptor")]
@@ -88,10 +92,12 @@ pub enum MemoryError {
     IpaOverflow,
     #[error("hotplug overflow")]
     HotplugOverflow,
-    #[error("hotplug alignment: address {address:#x}")]
-    HotplugAlignment { address: u64 },
-    #[error("virtio-mem region must be a positive multiple of 128 MiB (got {mib})")]
-    InvalidRegionSize { mib: u64 },
+    #[error("hotplug address {address:#x} must align to {alignment} bytes")]
+    HotplugAlignment { address: u64, alignment: u64 },
+    #[error("virtio-mem region must be a positive multiple of {alignment_mib} MiB (got {mib})")]
+    InvalidRegionSize { mib: u64, alignment_mib: u64 },
+    #[error("virtio-mem block size must be a representable power of two MiB (got {mib})")]
+    InvalidBlockSize { mib: u64 },
     #[error("memory mapping rollback failed; stopping VM: {source}; rollback: {rollback}")]
     RollbackFailed {
         #[source]

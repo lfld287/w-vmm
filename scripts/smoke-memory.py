@@ -50,6 +50,39 @@ def main():
             raise AssertionError(status)
         def rss():
             return int(subprocess.check_output(['ps', '-o', 'rss=', '-p', str(vm.p.pid)]))
+        for block in [1, 2, 4]:
+            with VM(f'memory-block-{block}', ['--vcpus', '4', '--virtio-mem-size-mib', '128', '--virtio-mem-block-size-mib', str(block), '--control-socket', sock], binary=binary) as vm:
+                vm.ready()
+                resize(0)
+                assert control('memory-status')['status']['block_size_mib'] == block
+                vm.command('cat /sys/devices/system/memory/block_size_bytes; dmesg | grep -i "virtio_mem"', 'GUEST_MEMORY_GRANULARITY')
+                if block == 1:
+                    # Observe an odd target without demanding guest convergence.
+                    assert control('memory-set', '--requested-mib', '3')['status']['requested_size_mib'] == 3
+                    deadline = time.monotonic() + 5
+                    observed = set()
+                    while time.monotonic() < deadline:
+                        status = control('memory-status')['status']
+                        assert status['requested_size_mib'] == 3
+                        assert status['plugged_size_mib'] <= 3
+                        observed.add(status['plugged_size_mib'])
+                        vm.read(0.05)
+                    print(f'1 MiB device, target 3 MiB: actual observations {sorted(observed)}, final {status}', flush=True)
+                    resize(4)
+                    resize(0)
+                else:
+                    assert control('pause')['ok']
+                    before = control('memory-status')['status']['plugged_size_mib']
+                    accepted = control('memory-set', '--requested-mib', str(3 * block))['status']
+                    assert accepted['requested_size_mib'] == 3 * block
+                    vm.read(0.1)
+                    assert control('memory-status')['status']['plugged_size_mib'] == before
+                    assert control('resume')['ok']
+                    resize(3 * block)
+                    resize(block)
+                    resize(0)
+                assert control('stop')['ok']
+                vm.wait_exit()
         with VM('memory-4', ['--vcpus', '4', '--disk', str(disk), '--virtio-mem-size-mib', '1024', '--control-socket', sock], binary=binary) as vm:
             vm.ready()
             vm.command('mount /dev/vda /data', 'MOUNT_OK')

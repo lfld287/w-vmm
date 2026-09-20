@@ -20,11 +20,12 @@ pub trait Mapper {
     fn unmap(&mut self, region: &GuestRegionMmap) -> Result<()>;
 }
 
-fn validate_target(target: u64, capacity: u64) -> Result<()> {
-    if !(target.is_multiple_of(HOTPLUG_BLOCK_SIZE / MIB) && target <= capacity) {
+fn validate_target(target: u64, capacity: u64, block_size_mib: u64) -> Result<()> {
+    if !(target.is_multiple_of(block_size_mib) && target <= capacity) {
         return Err(MemoryError::InvalidTarget {
             requested: target,
             capacity,
+            block_size_mib,
         });
     }
     Ok(())
@@ -40,6 +41,7 @@ pub enum MemoryLifecycle {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryStatus {
     pub region_size_mib: u64,
+    pub block_size_mib: u64,
     pub requested_size_mib: u64,
     pub plugged_size_mib: u64,
     pub driver_ready: bool,
@@ -50,9 +52,10 @@ pub struct MemoryStatus {
 pub(crate) struct MemoryControl(Arc<Mutex<MemoryStatus>>);
 
 impl MemoryControl {
-    pub(crate) fn new(region_size_mib: u64) -> Self {
+    pub(crate) fn new(region_size_mib: u64, block_size_mib: u64) -> Self {
         Self(Arc::new(Mutex::new(MemoryStatus {
             region_size_mib,
+            block_size_mib,
             requested_size_mib: 0,
             plugged_size_mib: 0,
             driver_ready: false,
@@ -70,7 +73,7 @@ impl MemoryControl {
         if state.lifecycle == MemoryLifecycle::Stopped {
             return Err(MemoryError::Stopped);
         }
-        validate_target(requested, state.region_size_mib)?;
+        validate_target(requested, state.region_size_mib, state.block_size_mib)?;
         state.requested_size_mib = requested;
         Ok(())
     }
@@ -80,13 +83,15 @@ impl MemoryControl {
     }
 }
 
-/// Sparse dynamic memory. Guest targets retain the existing 128 MiB constraint.
+/// Sparse dynamic memory with an immutable device block size.
+/// Targets are block-aligned; guest adjustment may use a coarser granularity.
 pub struct VirtioMem(pub(crate) crate::devices::memory::VirtioMem);
 
 impl VirtioMem {
-    pub fn new(region_size_mib: u64) -> Result<Self> {
+    pub fn new(region_size_mib: u64, block_size_mib: u64) -> Result<Self> {
         Ok(Self(crate::devices::memory::VirtioMem::new(
             region_size_mib,
+            block_size_mib,
         )?))
     }
 

@@ -37,7 +37,7 @@ pub enum Request {
 fn status(control: &VmControl) -> Result<Value> {
     let s = control.memory_status()?;
     Ok(
-        json!({"region_size_mib": s.region_size_mib, "requested_size_mib": s.requested_size_mib, "plugged_size_mib": s.plugged_size_mib, "driver_ready": s.driver_ready, "lifecycle": format!("{:?}", s.lifecycle)}),
+        json!({"region_size_mib": s.region_size_mib, "block_size_mib": s.block_size_mib, "requested_size_mib": s.requested_size_mib, "plugged_size_mib": s.plugged_size_mib, "driver_ready": s.driver_ready, "lifecycle": format!("{:?}", s.lifecycle)}),
     )
 }
 
@@ -310,7 +310,7 @@ pub(crate) mod tests {
         let dir = std::env::temp_dir().join(format!("w-vmm-control-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("control.sock");
-        let memory = VirtioMem::new(128).unwrap();
+        let memory = VirtioMem::new(128, 2).unwrap();
         let vm = test_vm(Some(memory));
         let server = Server::bind(&path, vm.control()).unwrap();
         assert_eq!(

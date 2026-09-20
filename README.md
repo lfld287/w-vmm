@@ -169,7 +169,7 @@ fn flush_backend(file: &std::fs::File) -> Result<(), StorageError> {
 
 核数范围为 `1..=HVF 查询到的上限`，启动后固定。所有 vCPU 在自己的线程上创建、运行和销毁，启动前建立全部 GIC 拓扑。PSCI 0.2 支持 `CPU_ON`、`CPU_OFF`、`AFFINITY_INFO`；可通过客户机 `/sys/devices/system/cpu/cpu1/online` 离线、重新上线次级核。设备后端仍由调用线程独占，无需 `Send` / `Sync`。
 
-`memory_mib` 是不可移除的基础 RAM；virtio-mem 的区域容量和目标容量都是**额外**内存。基础 RAM、动态区域和合计容量均无 16 GiB 固定上限；完整地址范围（含对齐间隙）必须落在当前 VM 的 HVF IPA 位宽内，容量换算与地址计算也必须可表示。区域容量必须为 Linux 热插拔块大小的正整数倍，起点位于基础 RAM 后并按该块大小向上对齐；目标默认 0，必须为零或该块大小的整数倍且不超过区域容量。内部常量 `HOTPLUG_BLOCK_SIZE` 与当前内核对应的值为 128 MiB，不自动探测客户机。virtio-mem 协议和底层映射仍以 2 MiB 为单位，因此异步调整中的实际插入量可以小于 Linux 热插拔块大小。未启用时保持原有默认启动行为。
+`memory_mib` 是不可移除的基础 RAM；virtio-mem 的区域容量和目标容量都是**额外**内存。基础 RAM、动态区域和合计容量均无 16 GiB 固定上限；完整地址范围（含对齐间隙）必须落在当前 VM 的 HVF IPA 位宽内，容量换算与地址计算也必须可表示。设备块大小通过 `--virtio-mem-block-size-mib` 配置（默认 2），显式使用时必须同时指定 `--virtio-mem-size-mib`。块大小为整数 MiB 的二次幂（1、2、4、8……），创建后不可修改，单块映射长度必须可转换为 `usize`。区域容量必须为 `max(128 MiB, block_size)` 的正整数倍，起点位于基础 RAM 后并按同一对齐量向上对齐。目标初始为 0，按设备块大小校验且不能超过区域容量；非法输入直接拒绝、保留原目标，不自动取整。例如容量 128 MiB、块大小 2 MiB 时，6 MiB 合法、3 MiB 非法；块大小 4 MiB 时 6 MiB 非法。128 MiB 仅为区域布局的最低对齐量，平台不探测 guest 热插拔粒度。未启用时保持原有默认启动行为。
 
 库可在 `run` 前取得控制句柄，然后移交给其他线程。
 
@@ -181,17 +181,17 @@ fn flush_backend(file: &std::fs::File) -> Result<(), StorageError> {
 
 ```rust,no_run
 use w_vmm::{VmConfig, Vmm, VirtioMem};
-let memory = VirtioMem::new(1024)?;
+let memory = VirtioMem::new(1024, 2)?;
 let vm = Vmm::new(VmConfig { vcpu_count: 4, ..VmConfig::default() }, blocks, net, Some(memory), serial);
 let control = vm.control();
 assert!(control.supports_memory());
-control.set_requested_mib(512)?;
+control.set_requested_mib(6)?;
 println!("{:?}", control.memory_status()?);
 // 将 control.clone() 交给控制线程，再调用 vm.run()。
 # Ok::<(), w_vmm::Error>(())
 ```
 
-调节成功表示目标已接受，客户机异步完成扩缩容。`memory_status()?` 包含 `region_size_mib`、`requested_size_mib`、`plugged_size_mib`、`driver_ready` 和 `Created / Running / Stopped` 生命周期。启动前允许调节；退出或丢弃未运行的 Vmm 后拒绝调节，句柄保留最终状态。
+调节成功表示目标已接受，客户机异步尝试扩缩容；设备粒度、区域布局对齐量和 guest 实际调整粒度彼此独立。目标和实际容量允许暂时或长期不一致，不自动视为设备错误，也不会改写目标。`memory_status()?` 包含 `region_size_mib`、`block_size_mib`、`requested_size_mib`、`plugged_size_mib`、`driver_ready` 和 `Created / Running / Stopped` 生命周期。启动前、运行中和暂停期间采用相同校验并允许调节；退出或丢弃未运行的 Vmm 后拒绝调节，句柄保留最终状态。
 
 驱动必须协商 `VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE`。未插入块不映射到 HVF，也不在设备 DMA 内存视图中。变更映射时暂停所有 vCPU，保护有效队列和待处理缓冲区；失败则回滚，回滚失败终止 VM。普通设备 reset 保留已插入内存及数据，`UNPLUG_ALL` 才移除全部块。
 
@@ -297,6 +297,8 @@ python3 scripts/smoke-net.py --peer --memory --binary target/debug/examples/net-
 
 控制冒烟使用临时测试盘，验证 1/4 核反复暂停恢复、离线核、磁盘负载、UART 输入保留、Ctrl-] 延后处理、并发状态读取、暂停时停止和信号退出、并发信号与 socket stop、启动失败及正常关机回收、socket 清理，以及暂停期间设置内存目标。
 
+内存冒烟还验证 2 MiB 块的 `0 → 6 → 2 → 0`、4 MiB 块的 `0 → 12 → 4 → 0`，包括暂停期间设置目标。1 MiB 配置会记录 guest 粒度及目标 3 MiB 的实际插入量，不要求收敛，再验证可达目标 4 MiB、归零和停止。2026-09-20 本地 HVF 验证中，随附 guest 报告 128 MiB memory block、2 MiB subblock；设备块 1 MiB、目标 3 MiB 时，观察到实际 2 MiB，目标保持 3 MiB，随后 4 MiB、0 和停止均成功。
+
 内存冒烟使用临时测试盘，验证 1/2/4 核、每核绑核计算、次级核离线/上线、4 核重启/信号/快捷键与终端恢复。客户机反复扩容、写入并校验 640 MiB（超过基础 RAM）、缩容到零、再扩容，同时核对控制状态、`MemTotal` 和宿主 RSS 回收。组合测试在 4 核和动态内存反复扩缩容时执行本地网络及双盘 I/O，不使用 vmnet 或外部网络。
 
 ### vmnet 手动测试
@@ -376,7 +378,7 @@ sudo env "PATH=$PATH" python3 scripts/smoke-net.py \
 - `src/platform/macos_arm64/hvf.rs`：最小 FFI、VM 映射、原生 GIC 和绑定创建线程的 RAII vCPU。VM 内存由 vm-memory 持有，先销毁 vCPU 和映射，再释放 RAM。
 - `src/devices/mmio.rs`：共享 modern virtio-mmio、功能协商、队列配置、描述符校验、复位及中断确认。
 - `src/platform/macos_arm64/cpus.rs`：每核独立线程、PSCI 启停、全核暂停及统一退出。
-- `src/devices/memory.rs`：公开 `VirtioMem`、可跨线程克隆的控制句柄与生命周期；virtio-mem 请求与按 2 MiB 块事务映射、回滚、回收。
+- `src/devices/memory.rs`：公开 `VirtioMem`、可跨线程克隆的控制句柄与生命周期；virtio-mem 请求与按配置块大小事务映射、回滚、回收。
 - `demo/src/control.rs`：可选本地 Unix socket JSON 服务与客户端。
 - `src/devices/block.rs`：磁盘请求与配置，单个 128 项 split virtqueue，IN/OUT/FLUSH/GET_ID，单请求上限 1 MiB。
 - `src/devices/net.rs`：网络请求与配置，RX/TX 各 128 项队列，完整帧收发与发送背压。
@@ -411,4 +413,4 @@ cargo run -p w-vmm --example platform
 
 `Mapper::map/unmap` 单次失败必须不留部分变更。映射借用分配，不能提前释放；`pause` 成功必须表示全部 vCPU 已静止。动态映射成功或回滚成功后恢复，回滚失败直接进入停止流程。`stop` 必须停止并回收所有 vCPU，支持部分启动和重复调用；VM 析构也必须支持重复清理。清理顺序为停止 vCPU、尝试刷新每块磁盘、撤销映射、销毁 VM，最后释放基础 RAM、动态 RAM 和回滚保留分配。
 
-`memory::VirtioMem` 封装私有设备，库根的 `VirtioMem` / `MemoryStatus` / `MemoryLifecycle` 导出保持兼容。当前 guest 兼容约束仍要求容量和目标值为 128 MiB 的倍数、区域按 128 MiB 对齐，virtio-mem 协议块仍为 2 MiB；平台不推断或配置 guest 热插拔块大小。多架构接口不保证任意 guest 内核的热插拔兼容性。
+`memory::VirtioMem` 封装私有设备，库根的 `VirtioMem` / `MemoryStatus` / `MemoryLifecycle` 导出保持兼容。设备块大小由使用者配置，容量和区域起点按 `max(128 MiB, block_size)` 对齐，目标按设备块大小校验；平台不推断或配置 guest 热插拔块大小。多架构接口不保证任意 guest 内核的热插拔兼容性。

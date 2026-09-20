@@ -65,7 +65,7 @@ impl<VM: VirtualMachine, BS: BlockStorage, ND: NetDevice> Runtime<VM, BS, ND> {
             devices: kinds,
             hotplug: memory.as_ref().map(|m| MemoryRequirement {
                 capacity: m.control().status().region_size_mib * crate::memory::MIB,
-                alignment: crate::memory::HOTPLUG_BLOCK_SIZE,
+                alignment: m.0.alignment(),
             }),
         };
         let layout = platform.layout(config, &needs)?;

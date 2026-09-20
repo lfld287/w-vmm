@@ -135,7 +135,7 @@ mod tests {
 
     #[test]
     fn startup_failure_stops_memory_device() {
-        let memory = VirtioMem::new(128).unwrap();
+        let memory = VirtioMem::new(128, 2).unwrap();
         let vm = Vmm::new(
             VmConfig {
                 memory_mib: 0,

@@ -57,8 +57,12 @@ enum Command {
         memory_mib: u64,
         #[arg(long, default_value_t = 1)]
         vcpus: u32,
+        /// Extra memory capacity: positive multiple of max(128, block size) MiB.
         #[arg(long)]
         virtio_mem_size_mib: Option<u64>,
+        /// Device block size in MiB (power of two); guest may adjust more coarsely.
+        #[arg(long, default_value_t = 2, requires = "virtio_mem_size_mib")]
+        virtio_mem_block_size_mib: u64,
         #[arg(long)]
         control_socket: Option<std::path::PathBuf>,
         /// Open all supplied disks read-only.
@@ -106,6 +110,7 @@ fn run(command: Command) -> Result<()> {
         memory_mib,
         vcpus,
         virtio_mem_size_mib,
+        virtio_mem_block_size_mib,
         control_socket,
         read_only,
         net,
@@ -126,7 +131,9 @@ fn run(command: Command) -> Result<()> {
             net.ipv4()
         );
     }
-    let memory = virtio_mem_size_mib.map(VirtioMem::new).transpose()?;
+    let memory = virtio_mem_size_mib
+        .map(|size| VirtioMem::new(size, virtio_mem_block_size_mib))
+        .transpose()?;
     let (terminal, mut terminal_guard) = Terminal::new()?;
     let vmm = Vmm::new(
         VmConfig {
@@ -170,6 +177,36 @@ fn main() -> std::process::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_size_cli_requires_capacity_only_when_explicit() {
+        assert!(Cli::try_parse_from(["w-vmm", "run"]).is_ok());
+        assert!(Cli::try_parse_from(["w-vmm", "run", "--virtio-mem-block-size-mib", "2"]).is_err());
+        let cli = Cli::try_parse_from(["w-vmm", "run", "--virtio-mem-size-mib", "128"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Run {
+                virtio_mem_block_size_mib: 2,
+                ..
+            }
+        ));
+        let cli = Cli::try_parse_from([
+            "w-vmm",
+            "run",
+            "--virtio-mem-size-mib",
+            "128",
+            "--virtio-mem-block-size-mib",
+            "4",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Run {
+                virtio_mem_block_size_mib: 4,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn named_disks_and_legacy_path() {

@@ -195,7 +195,7 @@ mod tests {
     fn notification_before_bind_is_retained_and_binding_is_once() {
         let mut guard = TerminalGuard::new().unwrap();
         guard.notify.write_all(&[1]).unwrap();
-        let vm = crate::control::tests::test_vm(Some(w_vmm::VirtioMem::new(128).unwrap()));
+        let vm = crate::control::tests::test_vm(Some(w_vmm::VirtioMem::new(128, 2).unwrap()));
         let control = vm.control();
         guard.bind(control.clone()).unwrap();
         assert!(guard.bind(control.clone()).is_err());

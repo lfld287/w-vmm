@@ -8,10 +8,7 @@ use vm_memory::{
 
 type Result<T> = std::result::Result<T, MemoryError>;
 
-// virtio-mem protocol/mapping granularity, independent of Linux hotplug blocks.
-const BLOCK: u64 = 2 << 20;
-// Linux memory hotplug block size for the bundled guest kernel.
-const HOTPLUG_BLOCK_SIZE: u64 = 128 << 20;
+use crate::memory::HOTPLUG_BLOCK_SIZE;
 
 #[cfg(test)]
 use crate::memory::MemoryStatus;
@@ -22,6 +19,8 @@ pub(crate) struct VirtioMem {
     control: MemoryControl,
     pub(crate) start: u64,
     capacity: u64,
+    block_size: u64,
+    block_len: usize,
     requested: u64,
     plugged: u64,
     generation: u32,
@@ -58,7 +57,7 @@ impl VirtioMem {
             let region = if plug {
                 Arc::new(GuestRegionMmap::from_range(
                     GuestAddress(addr),
-                    BLOCK as usize,
+                    self.block_len,
                     None,
                 )?)
             } else {
@@ -67,7 +66,7 @@ impl VirtioMem {
             next = if plug {
                 next.insert_region(region.clone())?
             } else {
-                next.remove_region(GuestAddress(addr), BLOCK)?.0
+                next.remove_region(GuestAddress(addr), self.block_size)?.0
             };
             regions.push(region);
         }
@@ -107,25 +106,40 @@ impl VirtioMem {
 }
 
 impl VirtioMem {
-    pub(crate) fn new(region_size_mib: u64) -> Result<Self> {
-        if !(region_size_mib > 0
-            && region_size_mib.is_multiple_of(HOTPLUG_BLOCK_SIZE / crate::memory::MIB))
-        {
-            return Err(MemoryError::InvalidRegionSize {
-                mib: region_size_mib,
+    pub(crate) fn new(region_size_mib: u64, block_size_mib: u64) -> Result<Self> {
+        if !block_size_mib.is_power_of_two() {
+            return Err(MemoryError::InvalidBlockSize {
+                mib: block_size_mib,
             });
         }
+        let block_size = crate::memory::mib_bytes(block_size_mib)?;
+        let block_len = usize::try_from(block_size).map_err(|_| MemoryError::InvalidBlockSize {
+            mib: block_size_mib,
+        })?;
+        let alignment = HOTPLUG_BLOCK_SIZE.max(block_size);
         let capacity = crate::memory::mib_bytes(region_size_mib)?;
+        if capacity == 0 || !capacity.is_multiple_of(alignment) {
+            return Err(MemoryError::InvalidRegionSize {
+                mib: region_size_mib,
+                alignment_mib: alignment / crate::memory::MIB,
+            });
+        }
         Ok(Self {
             start: 0,
             capacity,
+            block_size,
+            block_len,
             requested: 0,
             plugged: 0,
             generation: 0,
-            control: MemoryControl::new(region_size_mib),
+            control: MemoryControl::new(region_size_mib, block_size_mib),
             blocks: BTreeMap::new(),
             retained: Vec::new(),
         })
+    }
+
+    pub(crate) fn alignment(&self) -> u64 {
+        HOTPLUG_BLOCK_SIZE.max(self.block_size)
     }
 
     pub(crate) fn control(&self) -> MemoryControl {
@@ -133,8 +147,11 @@ impl VirtioMem {
     }
 
     pub(crate) fn attach_at(&mut self, start: u64) -> Result<()> {
-        if !start.is_multiple_of(HOTPLUG_BLOCK_SIZE) {
-            return Err(MemoryError::HotplugAlignment { address: start });
+        if !start.is_multiple_of(self.alignment()) {
+            return Err(MemoryError::HotplugAlignment {
+                address: start,
+                alignment: self.alignment(),
+            });
         }
         start
             .checked_add(self.capacity)
@@ -148,7 +165,7 @@ impl VirtioMem {
     fn attach(&mut self, base_mib: u64) -> Result<()> {
         let end = 0x4000_0000u64
             .checked_add(crate::memory::mib_bytes(base_mib)?)
-            .and_then(|v| v.checked_next_multiple_of(HOTPLUG_BLOCK_SIZE))
+            .and_then(|v| v.checked_next_multiple_of(self.alignment()))
             .ok_or_else(|| MemoryError::HotplugOverflow)?;
         self.attach_at(end)
     }
@@ -215,17 +232,23 @@ impl VirtioMem {
         let addresses = if kind == 2 {
             self.addresses()
         } else {
-            let Some(end) = addr.checked_add(count * BLOCK) else {
+            let Some(end) = count
+                .checked_mul(self.block_size)
+                .and_then(|len| addr.checked_add(len))
+            else {
                 return Ok((3, 0));
             };
             if count == 0
-                || !addr.is_multiple_of(BLOCK)
+                || !addr.is_multiple_of(self.block_size)
                 || addr < self.start
                 || end > self.start + self.capacity
             {
                 return Ok((3, 0));
             }
-            (0..count).map(|n| addr + n * BLOCK).collect::<Vec<_>>()
+            // The checked request end bounds every block address below.
+            (0..count)
+                .map(|n| addr + n * self.block_size)
+                .collect::<Vec<_>>()
         };
         let plugged = addresses.iter().filter(|&&a| self.plugged(a)).count();
         if kind == 3 {
@@ -247,7 +270,9 @@ impl VirtioMem {
         let control = self.control.clone();
         let mut status = control.lock();
         if kind == 0
-            && (self.count() + count) > status.requested_size_mib / (BLOCK / crate::memory::MIB)
+            && count
+                > (status.requested_size_mib / (self.block_size / crate::memory::MIB))
+                    .saturating_sub(self.count())
         {
             return Ok((1, 0));
         }
@@ -255,7 +280,7 @@ impl VirtioMem {
             && addresses.iter().any(|a| {
                 pinned
                     .iter()
-                    .any(|&(p, len)| p < a + BLOCK && p.saturating_add(len) > *a)
+                    .any(|&(p, len)| p < a + self.block_size && p.saturating_add(len) > *a)
             })
         {
             return Ok((2, 0));
@@ -263,7 +288,8 @@ impl VirtioMem {
         if !self.change(&addresses, kind == 0, mapper, view)? {
             return Ok((2, 0));
         }
-        self.plugged = self.count() * BLOCK;
+        // Distinct mapped blocks are bounded by the byte-checked capacity.
+        self.plugged = self.count() * self.block_size;
         self.generation = self.generation.wrapping_add(1);
         status.plugged_size_mib = self.plugged >> 20;
         Ok((0, 0))
@@ -355,7 +381,7 @@ impl VirtioDevice for VirtioMem {
     fn read_config(&self, offset: usize, data: &mut [u8]) {
         let mut config = [0; 56];
         for (offset, value) in [
-            (0, BLOCK),
+            (0, self.block_size),
             (16, self.start),
             (24, self.capacity),
             (32, self.capacity),
@@ -393,6 +419,7 @@ impl Drop for VirtioMem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const BLOCK: u64 = 2 << 20;
     use crate::devices::mmio::{Mmio, tests::initialize};
     use std::collections::BTreeSet;
     use vm_memory::{GuestMemoryBackend, GuestMemoryRegion};
@@ -429,20 +456,81 @@ mod tests {
     }
 
     #[test]
+    fn configured_blocks_targets_and_overflow() {
+        for block_mib in [1, 2, 4, 256] {
+            let mut d = VirtioMem::new(128.max(2 * block_mib), block_mib).unwrap();
+            assert_eq!(d.control().status().block_size_mib, block_mib);
+            d.control().set_requested_mib(block_mib).unwrap();
+            for invalid in [block_mib + 1, u64::MAX] {
+                if invalid.is_multiple_of(block_mib) && invalid <= d.capacity / crate::memory::MIB {
+                    continue;
+                }
+                assert!(d.control().set_requested_mib(invalid).is_err());
+                assert_eq!(d.control().status().requested_size_mib, block_mib);
+            }
+            d.attach(129).unwrap();
+            assert_eq!(
+                d.start,
+                (0x4000_0000u64 + 129 * crate::memory::MIB).next_multiple_of(d.alignment())
+            );
+            let mut config = [0; 56];
+            d.read_config(0, &mut config);
+            assert_eq!(
+                u64::from_le_bytes(config[..8].try_into().unwrap()),
+                block_mib * crate::memory::MIB
+            );
+            assert_eq!(
+                u64::from_le_bytes(config[48..].try_into().unwrap()),
+                block_mib * crate::memory::MIB
+            );
+            assert!(d.attach_at(d.start + 1).is_err());
+        }
+        let two = VirtioMem::new(128, 2).unwrap();
+        two.control().set_requested_mib(6).unwrap();
+        assert!(two.control().set_requested_mib(3).is_err());
+        assert_eq!(two.control().status().requested_size_mib, 6);
+        let four = VirtioMem::new(128, 4).unwrap();
+        four.control().set_requested_mib(12).unwrap();
+        assert!(four.control().set_requested_mib(6).is_err());
+        assert_eq!(four.control().status().requested_size_mib, 12);
+        for (capacity, block) in [
+            (128, 0),
+            (128, 3),
+            (128, 256),
+            (0, 2),
+            (384, 256),
+            (128, 1 << 44),
+            (u64::MAX, 2),
+        ] {
+            assert!(VirtioMem::new(capacity, block).is_err());
+        }
+        let mut huge = VirtioMem::new(1 << 43, 1 << 43).unwrap();
+        huge.attach_at(0).unwrap();
+        let mut view = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
+        assert_eq!(
+            huge.request(&req(0, 0, 2), &mut Fake::default(), &mut view, &[])
+                .unwrap()
+                .0,
+            3
+        );
+    }
+
+    #[test]
     fn capacity_and_lifecycle() {
         const H: u64 = HOTPLUG_BLOCK_SIZE / crate::memory::MIB;
         for size in [0, 1, H + 1, u64::MAX, (u64::MAX / H) * H] {
-            assert!(VirtioMem::new(size).is_err());
+            assert!(VirtioMem::new(size, 2).is_err());
         }
-        let mut max = VirtioMem::new(16384).unwrap();
+        let mut max = VirtioMem::new(16384, 2).unwrap();
         max.attach(32768).unwrap();
         max.validate_ipa(36).unwrap();
-        let mut d = VirtioMem::new(HOTPLUG_BLOCK_SIZE / crate::memory::MIB).unwrap();
+        let mut d = VirtioMem::new(HOTPLUG_BLOCK_SIZE / crate::memory::MIB, 2).unwrap();
         let c = d.control();
         assert_eq!(
             c.status(),
             MemoryStatus {
                 region_size_mib: H,
+                block_size_mib: 2,
                 requested_size_mib: 0,
                 plugged_size_mib: 0,
                 driver_ready: false,
@@ -453,7 +541,8 @@ mod tests {
             c.set_requested_mib(3),
             Err(MemoryError::InvalidTarget {
                 requested: 3,
-                capacity: H
+                capacity: H,
+                block_size_mib: 2
             })
         ));
         assert!(c.set_requested_mib(2 * H).is_err());
@@ -474,7 +563,7 @@ mod tests {
         d.stop(&mut Fake::default());
         assert_eq!(c.status().lifecycle, MemoryLifecycle::Stopped);
         assert!(matches!(c.set_requested_mib(0), Err(MemoryError::Stopped)));
-        let unused = VirtioMem::new(HOTPLUG_BLOCK_SIZE / crate::memory::MIB).unwrap();
+        let unused = VirtioMem::new(HOTPLUG_BLOCK_SIZE / crate::memory::MIB, 2).unwrap();
         let c = unused.control();
         drop(unused);
         assert_eq!(c.status().lifecycle, MemoryLifecycle::Stopped);
@@ -483,7 +572,7 @@ mod tests {
     #[test]
     fn region_address_boundaries() {
         const H: u64 = HOTPLUG_BLOCK_SIZE / crate::memory::MIB;
-        let mut d = VirtioMem::new(2 * H).unwrap();
+        let mut d = VirtioMem::new(2 * H, 2).unwrap();
         for target in [0, H, 2 * H] {
             d.control().set_requested_mib(target).unwrap();
         }
@@ -503,14 +592,14 @@ mod tests {
                 .is_err()
         ); // Alignment.
         let capacity = (u64::MAX / HOTPLUG_BLOCK_SIZE) * H;
-        let mut huge = VirtioMem::new(capacity).unwrap();
+        let mut huge = VirtioMem::new(capacity, 2).unwrap();
         assert!(huge.attach(H).is_err()); // Region end.
     }
 
     #[test]
     fn large_sparse_region_grows_and_reclaims_allocations() {
         const H: u64 = HOTPLUG_BLOCK_SIZE / crate::memory::MIB;
-        let mut d = VirtioMem::new(32768).unwrap();
+        let mut d = VirtioMem::new(32768, 2).unwrap();
         d.attach(512).unwrap();
         let mut view = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let mut mapper = Fake::default();
@@ -548,33 +637,36 @@ mod tests {
 
     #[test]
     fn rollback_allocations_live_through_vm_teardown() {
-        let (mut d, mut view, mut mapper) = setup();
-        mapper.fail = vec![2, 3];
-        let a = d.start;
-        assert!(
-            d.request(&req(0, a, 2), &mut mapper, &mut view, &[])
-                .is_err()
-        );
-        assert_eq!(d.count(), 0);
-        assert_eq!(d.control().status().plugged_size_mib, 0);
-        assert!(!view.check_range(GuestAddress(a), 1));
-        let allocations: Vec<_> = d.retained.iter().map(Arc::downgrade).collect();
-        // Simulate failed final unmaps, then destruction of the platform mapping state.
-        mapper.fail.extend([4, 5]);
-        d.stop(&mut mapper);
-        assert!(allocations.iter().all(|r| r.upgrade().is_some()));
-        drop(mapper);
-        drop(view);
-        assert!(allocations.iter().all(|r| r.upgrade().is_some()));
-        drop(d);
-        assert!(allocations.iter().all(|r| r.upgrade().is_none()));
+        for block_mib in [1, 2, 4, 256] {
+            let block = block_mib * crate::memory::MIB;
+            let (mut d, mut view, mut mapper) = setup_with(block_mib);
+            assert_eq!(d.block_size, block);
+            mapper.fail = vec![2, 3];
+            let a = d.start;
+            assert!(
+                d.request(&req(0, a, 2), &mut mapper, &mut view, &[])
+                    .is_err()
+            );
+            assert_eq!(d.count(), 0);
+            assert_eq!(d.control().status().plugged_size_mib, 0);
+            assert!(!view.check_range(GuestAddress(a), 1));
+            let allocations: Vec<_> = d.retained.iter().map(Arc::downgrade).collect();
+            // Simulate failed final unmaps, then destruction of the platform mapping state.
+            mapper.fail.extend([4, 5]);
+            d.stop(&mut mapper);
+            assert!(allocations.iter().all(|r| r.upgrade().is_some()));
+            drop(mapper);
+            drop(view);
+            assert!(allocations.iter().all(|r| r.upgrade().is_some()));
+            drop(d);
+            assert!(allocations.iter().all(|r| r.upgrade().is_none()));
+        }
     }
 
-    fn setup() -> (VirtioMem, GuestMemoryMmap, Fake) {
-        let mut d = VirtioMem::new(HOTPLUG_BLOCK_SIZE / crate::memory::MIB).unwrap();
-        d.control()
-            .set_requested_mib(HOTPLUG_BLOCK_SIZE / crate::memory::MIB)
-            .unwrap();
+    fn setup_with(block_mib: u64) -> (VirtioMem, GuestMemoryMmap, Fake) {
+        let capacity = 128.max(2 * block_mib);
+        let mut d = VirtioMem::new(capacity, block_mib).unwrap();
+        d.control().set_requested_mib(capacity).unwrap();
         d.attach(512).unwrap();
         (
             d,
@@ -593,180 +685,197 @@ mod tests {
 
     #[test]
     fn requests_state_target_reset_and_holes() {
-        let (mut d, mut view, mut mapper) = setup();
-        let a = d.start;
-        assert_eq!(
-            d.request(&req(3, a, 2), &mut mapper, &mut view, &[])
-                .unwrap(),
-            (0, 1)
-        );
-        assert_eq!(
-            d.request(&req(0, a, 1), &mut mapper, &mut view, &[])
-                .unwrap()
-                .0,
-            0
-        );
-        assert_eq!(
-            d.request(&req(0, a, 1), &mut mapper, &mut view, &[])
-                .unwrap()
-                .0,
-            3
-        );
-        assert_eq!(
-            d.request(&req(3, a, 2), &mut mapper, &mut view, &[])
-                .unwrap(),
-            (0, 2)
-        );
-        assert!(!view.check_range(GuestAddress(a + BLOCK - 8), 16));
-        assert_eq!(
-            d.request(&req(0, a + BLOCK, 1), &mut mapper, &mut view, &[])
-                .unwrap()
-                .0,
-            0
-        );
-        assert!(view.check_range(GuestAddress(a + BLOCK - 8), 16));
-        view.write_slice(&[42; 16], GuestAddress(a + BLOCK - 8))
-            .unwrap();
-        d.reset().unwrap();
-        let mut data = [0; 16];
-        view.read_slice(&mut data, GuestAddress(a + BLOCK - 8))
-            .unwrap();
-        assert_eq!(data, [42; 16]);
-        assert_eq!(
-            d.request(&req(3, a, 2), &mut mapper, &mut view, &[])
-                .unwrap(),
-            (0, 0)
-        );
-        assert_eq!(
-            d.request(&req(1, a, 1), &mut mapper, &mut view, &[(a + 16, 4)])
-                .unwrap()
-                .0,
-            2
-        );
-        assert_eq!(
-            d.request(&req(1, a, 1), &mut mapper, &mut view, &[])
-                .unwrap()
-                .0,
-            0
-        );
-        assert_eq!(
-            d.request(&req(1, a, 2), &mut mapper, &mut view, &[])
-                .unwrap()
-                .0,
-            3
-        );
-        d.control.set_requested_mib(0).unwrap();
-        assert_eq!(
-            d.request(&req(0, a, 1), &mut mapper, &mut view, &[])
-                .unwrap()
-                .0,
-            1
-        );
-        assert_eq!(
-            d.request(&req(2, u64::MAX, 0), &mut mapper, &mut view, &[])
-                .unwrap()
-                .0,
-            0
-        );
-        assert!(mapper.mapped.is_empty());
-        assert_eq!(d.control.status().plugged_size_mib, 0);
-    }
-
-    #[test]
-    fn invalid_requests() {
-        let (mut d, mut view, mut mapper) = setup();
-        let a = d.start;
-        for (kind, addr, n) in [
-            (0, a, 0),
-            (0, a + 1, 1),
-            (0, a - BLOCK, 1),
-            (0, a + HOTPLUG_BLOCK_SIZE, 1),
-            (0, u64::MAX, 2),
-            (7, a, 1),
-        ] {
+        for block_mib in [1, 2, 4, 256] {
+            let block = block_mib * crate::memory::MIB;
+            let (mut d, mut view, mut mapper) = setup_with(block_mib);
+            assert_eq!(d.block_size, block);
+            let a = d.start;
             assert_eq!(
-                d.request(&req(kind, addr, n), &mut mapper, &mut view, &[])
+                d.request(&req(3, a, 2), &mut mapper, &mut view, &[])
+                    .unwrap(),
+                (0, 1)
+            );
+            assert_eq!(
+                d.request(&req(0, a, 1), &mut mapper, &mut view, &[])
+                    .unwrap()
+                    .0,
+                0
+            );
+            assert_eq!(
+                d.request(&req(0, a, 1), &mut mapper, &mut view, &[])
                     .unwrap()
                     .0,
                 3
             );
+            assert_eq!(
+                d.request(&req(3, a, 2), &mut mapper, &mut view, &[])
+                    .unwrap(),
+                (0, 2)
+            );
+            assert!(!view.check_range(GuestAddress(a + block - 8), 16));
+            assert_eq!(
+                d.request(&req(0, a + block, 1), &mut mapper, &mut view, &[])
+                    .unwrap()
+                    .0,
+                0
+            );
+            assert!(view.check_range(GuestAddress(a + block - 8), 16));
+            view.write_slice(&[42; 16], GuestAddress(a + block - 8))
+                .unwrap();
+            d.reset().unwrap();
+            let mut data = [0; 16];
+            view.read_slice(&mut data, GuestAddress(a + block - 8))
+                .unwrap();
+            assert_eq!(data, [42; 16]);
+            assert!(d.blocks.values().all(|r| r.len() == block));
+            assert_eq!(
+                d.request(&req(3, a, 2), &mut mapper, &mut view, &[])
+                    .unwrap(),
+                (0, 0)
+            );
+            assert_eq!(
+                d.request(&req(1, a, 1), &mut mapper, &mut view, &[(a + 16, 4)])
+                    .unwrap()
+                    .0,
+                2
+            );
+            assert_eq!(
+                d.request(&req(1, a, 1), &mut mapper, &mut view, &[])
+                    .unwrap()
+                    .0,
+                0
+            );
+            assert_eq!(
+                d.request(&req(1, a, 2), &mut mapper, &mut view, &[])
+                    .unwrap()
+                    .0,
+                3
+            );
+            d.control.set_requested_mib(0).unwrap();
+            assert_eq!(
+                d.request(&req(0, a, 1), &mut mapper, &mut view, &[])
+                    .unwrap()
+                    .0,
+                1
+            );
+            assert_eq!(
+                d.request(&req(2, u64::MAX, 0), &mut mapper, &mut view, &[])
+                    .unwrap()
+                    .0,
+                0
+            );
+            assert!(mapper.mapped.is_empty());
+            assert_eq!(d.control.status().plugged_size_mib, 0);
+        }
+    }
+
+    #[test]
+    fn invalid_requests() {
+        for block_mib in [1, 2, 4, 256] {
+            let block = block_mib * crate::memory::MIB;
+            let (mut d, mut view, mut mapper) = setup_with(block_mib);
+            assert_eq!(d.block_size, block);
+            let a = d.start;
+            for (kind, addr, n) in [
+                (0, a, 0),
+                (0, a + 1, 1),
+                (0, a - block, 1),
+                (0, a + d.capacity, 1),
+                (0, u64::MAX, 2),
+                (7, a, 1),
+            ] {
+                assert_eq!(
+                    d.request(&req(kind, addr, n), &mut mapper, &mut view, &[])
+                        .unwrap()
+                        .0,
+                    3
+                );
+            }
         }
     }
 
     #[test]
     fn transactional_map_and_unmap_failure() {
-        let (mut d, mut view, mut mapper) = setup();
-        let a = d.start;
-        mapper.fail = vec![2];
-        assert_eq!(
+        for block_mib in [1, 2, 4, 256] {
+            let block = block_mib * crate::memory::MIB;
+            let (mut d, mut view, mut mapper) = setup_with(block_mib);
+            assert_eq!(d.block_size, block);
+            let a = d.start;
+            mapper.fail = vec![2];
+            assert_eq!(
+                d.request(&req(0, a, 2), &mut mapper, &mut view, &[])
+                    .unwrap()
+                    .0,
+                2
+            );
+            assert_eq!(d.count(), 0);
+            assert!(mapper.mapped.is_empty());
+            mapper.fail.clear();
             d.request(&req(0, a, 2), &mut mapper, &mut view, &[])
-                .unwrap()
-                .0,
-            2
-        );
-        assert_eq!(d.count(), 0);
-        assert!(mapper.mapped.is_empty());
-        mapper.fail.clear();
-        d.request(&req(0, a, 2), &mut mapper, &mut view, &[])
-            .unwrap();
-        view.write_slice(&[91], GuestAddress(a)).unwrap();
-        mapper.fail = vec![mapper.calls + 2];
-        assert_eq!(
-            d.request(&req(1, a, 2), &mut mapper, &mut view, &[])
-                .unwrap()
-                .0,
-            2
-        );
-        assert_eq!(d.count(), 2);
-        assert_eq!(mapper.mapped.len(), 2);
-        assert_eq!(view.read_obj::<u8>(GuestAddress(a)).unwrap(), 91);
-        mapper.fail = vec![mapper.calls + 2, mapper.calls + 3];
-        assert!(
-            d.request(&req(1, a, 2), &mut mapper, &mut view, &[])
-                .is_err()
-        );
-        assert_eq!(d.retained.len(), 2);
+                .unwrap();
+            view.write_slice(&[91], GuestAddress(a)).unwrap();
+            mapper.fail = vec![mapper.calls + 2];
+            assert_eq!(
+                d.request(&req(1, a, 2), &mut mapper, &mut view, &[])
+                    .unwrap()
+                    .0,
+                2
+            );
+            assert_eq!(d.count(), 2);
+            assert_eq!(mapper.mapped.len(), 2);
+            assert_eq!(view.read_obj::<u8>(GuestAddress(a)).unwrap(), 91);
+            mapper.fail = vec![mapper.calls + 2, mapper.calls + 3];
+            assert!(
+                d.request(&req(1, a, 2), &mut mapper, &mut view, &[])
+                    .is_err()
+            );
+            assert_eq!(d.retained.len(), 2);
+        }
     }
 
     #[test]
     fn negotiation_generation_and_queue_response() {
-        let (mut d, mut view, mut mapper) = setup();
-        d.control().set_requested_mib(0).unwrap();
-        d.attach(512).unwrap();
-        let a = d.start;
-        let mut mmio = Mmio::new(d);
-        mmio.write(0x24, 1, &view).unwrap();
-        mmio.write(0x20, 1, &view).unwrap();
-        mmio.write(0x70, 11, &view).unwrap();
-        assert_eq!(mmio.read(0x70, 4) & 8, 0);
-        mmio.write(0x70, 0, &view).unwrap();
-        initialize(&mut mmio, &view);
-        mmio.device
-            .control()
-            .set_requested_mib(HOTPLUG_BLOCK_SIZE / crate::memory::MIB)
-            .unwrap();
-        assert!(mmio.device.sync_target(true));
-        mmio.config_changed();
-        assert_eq!(mmio.read(0xfc, 4), 1);
-        assert_eq!(mmio.read(0x60, 4), 2);
-        assert!(mmio.device.control.status().driver_ready);
-        use virtio_queue::desc::split::Descriptor;
-        view.write_obj(Descriptor::new(0x8000, 24, 1, 1), GuestAddress(0x1000))
-            .unwrap();
-        view.write_obj(Descriptor::new(0x9000, 10, 2, 0), GuestAddress(0x1010))
-            .unwrap();
-        view.write_slice(&req(0, a, 2), GuestAddress(0x8000))
-            .unwrap();
-        view.write_obj(1u16, GuestAddress(0x2002)).unwrap();
-        let pins = mmio.queues.pinned(&view).unwrap();
-        mmio.device
-            .process(&mut mmio.queues, &mut mapper, &mut view, &pins)
-            .unwrap();
-        assert_eq!(view.read_obj::<u16>(GuestAddress(0x9000)).unwrap(), 0);
-        assert_eq!(mmio.device.count(), 2);
-        assert_eq!(mmio.read(0x128, 8), 2 * BLOCK);
-        mmio.write(0x70, 0, &view).unwrap();
-        assert_eq!(mmio.device.count(), 2);
-        assert!(!mmio.device.control.status().driver_ready);
+        for block_mib in [1, 2, 4, 256] {
+            let block = block_mib * crate::memory::MIB;
+            let (mut d, mut view, mut mapper) = setup_with(block_mib);
+            assert_eq!(d.block_size, block);
+            d.control().set_requested_mib(0).unwrap();
+            d.attach(512).unwrap();
+            let a = d.start;
+            let mut mmio = Mmio::new(d);
+            mmio.write(0x24, 1, &view).unwrap();
+            mmio.write(0x20, 1, &view).unwrap();
+            mmio.write(0x70, 11, &view).unwrap();
+            assert_eq!(mmio.read(0x70, 4) & 8, 0);
+            mmio.write(0x70, 0, &view).unwrap();
+            initialize(&mut mmio, &view);
+            mmio.device
+                .control()
+                .set_requested_mib(128.max(2 * block_mib))
+                .unwrap();
+            assert!(mmio.device.sync_target(true));
+            mmio.config_changed();
+            assert_eq!(mmio.read(0xfc, 4), 1);
+            assert_eq!(mmio.read(0x60, 4), 2);
+            assert!(mmio.device.control.status().driver_ready);
+            use virtio_queue::desc::split::Descriptor;
+            view.write_obj(Descriptor::new(0x8000, 24, 1, 1), GuestAddress(0x1000))
+                .unwrap();
+            view.write_obj(Descriptor::new(0x9000, 10, 2, 0), GuestAddress(0x1010))
+                .unwrap();
+            view.write_slice(&req(0, a, 2), GuestAddress(0x8000))
+                .unwrap();
+            view.write_obj(1u16, GuestAddress(0x2002)).unwrap();
+            let pins = mmio.queues.pinned(&view).unwrap();
+            mmio.device
+                .process(&mut mmio.queues, &mut mapper, &mut view, &pins)
+                .unwrap();
+            assert_eq!(view.read_obj::<u16>(GuestAddress(0x9000)).unwrap(), 0);
+            assert_eq!(mmio.device.count(), 2);
+            assert_eq!(mmio.read(0x128, 8), 2 * block);
+            mmio.write(0x70, 0, &view).unwrap();
+            assert_eq!(mmio.device.count(), 2);
+            assert!(!mmio.device.control.status().driver_ready);
+        }
     }
 }

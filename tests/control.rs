@@ -54,6 +54,11 @@ impl Platform for Machine {
         _: &VmConfig,
         needs: &DeviceRequirements,
     ) -> std::result::Result<MachineLayout, PlatformError> {
+        if let Some(hotplug) = &needs.hotplug {
+            let status = self.control.memory_status().unwrap();
+            assert_eq!(hotplug.capacity, status.region_size_mib << 20);
+            assert_eq!(hotplug.alignment, status.block_size_mib.max(128) << 20);
+        }
         Ok(MachineLayout {
             ram: vec![MemoryRange {
                 address: 0x100000,
@@ -301,7 +306,7 @@ fn wait(mut predicate: impl FnMut() -> bool) {
 fn pause_resume_memory_and_stop_are_synchronous() {
     for fault in [Fault::None, Fault::Pause, Fault::Resume, Fault::Flush] {
         let state = Arc::new(State::default());
-        let vm = new_vm(state.clone(), fault, Some(VirtioMem::new(128).unwrap()));
+        let vm = new_vm(state.clone(), fault, Some(VirtioMem::new(128, 2).unwrap()));
         let c = vm.control();
         let final_control = c.clone();
         let other = state.clone();
@@ -318,7 +323,9 @@ fn pause_resume_memory_and_stop_are_synchronous() {
                 let ticks = other.ticks.load(Ordering::SeqCst);
                 let output = other.output.load(Ordering::SeqCst);
                 let reads = other.reads.load(Ordering::SeqCst);
-                mem.set_requested_mib(128).unwrap();
+                mem.set_requested_mib(6).unwrap();
+                assert!(mem.set_requested_mib(3).is_err());
+                assert_eq!(mem.memory_status().unwrap().requested_size_mib, 6);
                 std::thread::sleep(Duration::from_millis(50));
                 assert_eq!(other.ticks.load(Ordering::SeqCst), ticks);
                 assert_eq!(other.output.load(Ordering::SeqCst), output);
@@ -367,27 +374,29 @@ fn pause_resume_memory_and_stop_are_synchronous() {
 
 #[test]
 fn startup_failure_and_cancelled_run() {
-    for cancel in [false, true] {
-        let state = Arc::new(State::default());
-        let vm = new_vm(
-            state.clone(),
-            Fault::Prepare,
-            Some(VirtioMem::new(128).unwrap()),
-        );
-        let control = vm.control();
-        if cancel {
+    for block in [1, 2, 4, 256] {
+        for cancel in [false, true] {
+            let state = Arc::new(State::default());
+            let vm = new_vm(
+                state.clone(),
+                Fault::Prepare,
+                Some(VirtioMem::new(128.max(block), block).unwrap()),
+            );
+            let control = vm.control();
+            if cancel {
+                control.stop().unwrap();
+            }
+            assert!(run(vm, state.clone(), Fault::Prepare).is_err());
+            assert_eq!(control.status().lifecycle, VmLifecycle::Stopped);
+            assert_eq!(control.status().final_error.is_some(), !cancel);
             control.stop().unwrap();
+            assert_eq!(
+                control.memory_status().unwrap().lifecycle,
+                MemoryLifecycle::Stopped
+            );
+            assert!(control.set_requested_mib(0).is_err());
+            assert!(state.log.lock().unwrap().contains(&"disk-drop"));
         }
-        assert!(run(vm, state.clone(), Fault::Prepare).is_err());
-        assert_eq!(control.status().lifecycle, VmLifecycle::Stopped);
-        assert_eq!(control.status().final_error.is_some(), !cancel);
-        control.stop().unwrap();
-        assert_eq!(
-            control.memory_status().unwrap().lifecycle,
-            MemoryLifecycle::Stopped
-        );
-        assert!(control.set_requested_mib(0).is_err());
-        assert!(state.log.lock().unwrap().contains(&"disk-drop"));
     }
 }
 
@@ -457,7 +466,7 @@ fn memory_capability_targets_and_device_ownership() {
             let vm = new_vm(
                 state.clone(),
                 Fault::None,
-                configured.then(|| VirtioMem::new(256).unwrap()),
+                configured.then(|| VirtioMem::new(256, 2).unwrap()),
             );
             let c = vm.control();
             let other = c.clone();
@@ -468,12 +477,12 @@ fn memory_capability_targets_and_device_ownership() {
                     MemoryLifecycle::Created
                 );
                 assert!(!c.memory_status().unwrap().driver_ready);
-                other.set_requested_mib(128).unwrap();
-                assert_eq!(c.memory_status().unwrap().requested_size_mib, 128);
+                other.set_requested_mib(6).unwrap();
+                assert_eq!(c.memory_status().unwrap().requested_size_mib, 6);
                 for invalid in [1, 384, u64::MAX] {
                     assert!(c.set_requested_mib(invalid).is_err());
                 }
-                assert_eq!(c.memory_status().unwrap().requested_size_mib, 128);
+                assert_eq!(c.memory_status().unwrap().requested_size_mib, 6);
             } else {
                 assert_eq!(
                     c.memory_status().unwrap_err().to_string(),
@@ -503,7 +512,7 @@ fn memory_capability_targets_and_device_ownership() {
             if configured {
                 let status = other.memory_status().unwrap();
                 assert_eq!(status.lifecycle, MemoryLifecycle::Stopped);
-                assert_eq!(status.requested_size_mib, 128);
+                assert_eq!(status.requested_size_mib, 6);
             }
         }
     }

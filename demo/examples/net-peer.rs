@@ -141,7 +141,7 @@ fn main() -> Result<()> {
     let (terminal, mut terminal_guard) = Terminal::new()?;
     let memory = std::env::var("W_VMM_MEMORY_SOCKET")
         .ok()
-        .map(|_| w_vmm::VirtioMem::new(1024))
+        .map(|_| w_vmm::VirtioMem::new(1024, 2))
         .transpose()?;
     let vmm = Vmm::new(config, blocks, Some(Peer::default()), memory, terminal);
     terminal_guard.bind(vmm.control())?;

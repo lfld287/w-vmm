@@ -280,10 +280,7 @@ impl VirtualMachine for TestVm {
         Ok(())
     }
 
-    fn poll_event(
-        &mut self,
-        _: Duration,
-    ) -> Result<Option<Event<usize>>, PlatformError> {
+    fn poll_event(&mut self, _: Duration) -> Result<Option<Event<usize>>, PlatformError> {
         if self.fault == Fault::Poll {
             return Err(PlatformError::Backend(
                 io::Error::other("poll failure").into(),
@@ -292,11 +289,7 @@ impl VirtualMachine for TestVm {
         Ok(self.events.pop_front())
     }
 
-    fn complete_io(
-        &mut self,
-        completion: usize,
-        value: u64,
-    ) -> Result<(), PlatformError> {
+    fn complete_io(&mut self, completion: usize, value: u64) -> Result<(), PlatformError> {
         let mut s = self.state.borrow_mut();
         assert_eq!(completion, s.replies.len());
         s.replies.push(value);
@@ -442,7 +435,7 @@ impl NetDevice for NoNet {
 
 fn run(fault: Fault, port: bool, base: u64) -> Shared {
     let state = Shared::default();
-    let memory = VirtioMem::new(128).unwrap();
+    let memory = VirtioMem::new(128, 2).unwrap();
     let blocks = [
         ("z".into(), Disk(state.clone(), fault == Fault::Flush)),
         ("a".into(), Disk(state.clone(), fault == Fault::Flush)),
@@ -587,7 +580,7 @@ fn errors_and_transaction_rollback_cleanup() {
 
 #[test]
 fn dropping_unused_memory_stops_control() {
-    let m = VirtioMem::new(128).unwrap();
+    let m = VirtioMem::new(128, 2).unwrap();
     let vm = Vmm::new(
         VmConfig::default(),
         BTreeMap::<String, Disk>::new(),
