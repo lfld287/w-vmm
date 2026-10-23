@@ -1,13 +1,14 @@
-use super::mmio::{Queues, VirtioDevice, read_config};
+use super::mmio::{MAX_QUEUE, Queues, VirtioDevice, read_config};
 use crate::error::DeviceError;
 use crate::storage::{BlockStorage, bounds};
 use virtio_bindings::bindings::virtio_blk::*;
 use virtio_queue::desc::split::Descriptor;
-use vm_memory::{Bytes, GuestMemoryMmap};
+use vm_memory::{Bytes, GuestMemoryBackend, GuestMemoryMmap};
 
 type Result<T> = std::result::Result<T, DeviceError>;
 
-const MAX_REQUEST: usize = 1024 * 1024;
+// Without INDIRECT_DESC, one chain also needs a header and a status descriptor.
+const SEG_MAX: u32 = MAX_QUEUE as u32 - 2;
 
 pub(crate) struct Block<BS: BlockStorage> {
     disk: BS,
@@ -21,7 +22,9 @@ impl<BS: BlockStorage> VirtioDevice for Block<BS> {
     }
 
     fn features(&self) -> u64 {
+        // SIZE_MAX is deliberately absent: requests have no per-segment or aggregate size cap.
         (1 << VIRTIO_BLK_F_FLUSH)
+            | (1 << VIRTIO_BLK_F_SEG_MAX)
             | if self.disk.read_only() {
                 1 << VIRTIO_BLK_F_RO
             } else {
@@ -34,7 +37,11 @@ impl<BS: BlockStorage> VirtioDevice for Block<BS> {
     }
 
     fn read_config(&self, offset: usize, data: &mut [u8]) {
-        read_config(&(self.disk.size() / 512).to_le_bytes(), offset, data);
+        // capacity, size_max (ignored without SIZE_MAX), seg_max.
+        let mut config = [0; 16];
+        config[..8].copy_from_slice(&(self.disk.size() / 512).to_le_bytes());
+        config[12..].copy_from_slice(&SEG_MAX.to_le_bytes());
+        read_config(&config, offset, data);
     }
 
     fn notify(&mut self, _queue: usize, queues: &mut Queues, mem: &GuestMemoryMmap) -> Result<()> {
@@ -73,17 +80,43 @@ impl<BS: BlockStorage> Block<BS> {
         Ok(Self { disk, name, id })
     }
 
+    /// For a chain that passed queue validation, only an untrustworthy status
+    /// descriptor is fatal. Any other malformed request is completed with IOERR
+    /// and an unknown operation with UNSUPP.
     fn request(&self, mem: &GuestMemoryMmap, desc: &[Descriptor], negotiated: u64) -> Result<u32> {
-        if desc.len() < 2 {
-            return Err(DeviceError::TruncatedBlockDescriptorChain);
-        }
-        let status = desc[desc.len() - 1];
-        if !status.is_write_only() || status.len() != 1 {
+        let (status, request) = desc
+            .split_last()
+            .ok_or(DeviceError::TruncatedBlockDescriptorChain)?;
+        if !(status.is_write_only() && status.len() == 1 && mem.check_range(status.addr(), 1)) {
             return Err(DeviceError::InvalidBlockHeaderStatus);
         }
-        // Validate the entire request, including status, before any backend access.
-        let all = super::buffers::slices(mem, desc)?;
-        let request = &desc[..desc.len() - 1];
+        let mut kind = None;
+        let (status_value, used) = match self.execute(mem, request, negotiated, &mut kind) {
+            Ok(done) => done,
+            Err(e) => {
+                let kind = kind.map_or_else(|| "?".into(), |k: u32| k.to_string());
+                eprintln!(
+                    "virtio-blk request {kind} ({}): {}",
+                    self.name,
+                    crate::error::diagnostic(&e)
+                );
+                (VIRTIO_BLK_S_IOERR as u8, 1)
+            }
+        };
+        mem.write_obj(status_value, status.addr())?;
+        Ok(used)
+    }
+
+    /// Returns the status byte and used length. Errors become IOERR.
+    fn execute(
+        &self,
+        mem: &GuestMemoryMmap,
+        request: &[Descriptor],
+        negotiated: u64,
+        kind: &mut Option<u32>,
+    ) -> Result<(u8, u32)> {
+        // Validate the entire request before any backend access.
+        let all = super::buffers::slices(mem, request)?;
         let request_len = request
             .iter()
             .try_fold(0usize, |n, d| n.checked_add(d.len() as usize))
@@ -91,12 +124,6 @@ impl<BS: BlockStorage> Block<BS> {
         let total = request_len
             .checked_sub(16)
             .ok_or(DeviceError::InvalidBlockHeaderStatus)?;
-        if total > MAX_REQUEST {
-            return Err(DeviceError::BlockRequestTooLarge {
-                length: total,
-                limit: MAX_REQUEST,
-            });
-        }
         let mut remaining_header = 16;
         let mut data = Vec::new();
         for d in request {
@@ -111,67 +138,61 @@ impl<BS: BlockStorage> Block<BS> {
         }
         let mut h = [0; 16];
         super::buffers::copy_to(&all, &mut h);
-        let kind = u32::from_le_bytes(h[..4].try_into()?);
+        let k = u32::from_le_bytes(h[..4].try_into()?);
+        *kind = Some(k);
         let sector = u64::from_le_bytes(h[8..].try_into()?);
         let buffers = super::buffers::range(&all, 16, total);
-        let mut used = 1;
-        let result = (|| -> Result<u8> {
-            match kind {
-                VIRTIO_BLK_T_IN | VIRTIO_BLK_T_OUT => {
-                    let read = kind == VIRTIO_BLK_T_IN;
-                    if !data.iter().all(|d| d.is_write_only() == read) {
-                        return Err(DeviceError::BlockDescriptorDirectionMismatch);
-                    }
-                    if !total.is_multiple_of(512) {
-                        return Err(DeviceError::UnalignedBlockRequest { length: total });
-                    }
-                    if !(read || !self.disk.read_only()) {
-                        return Err(DeviceError::WriteToReadOnlyDisk);
-                    }
-                    let offset = sector
-                        .checked_mul(512)
-                        .ok_or_else(|| DeviceError::SectorOverflow { sector })?;
-                    bounds(self.disk.size(), offset, total)?;
-                    if read {
-                        self.disk.read(offset, &buffers)?;
-                        used += total as u32;
-                    } else {
-                        self.disk.write(offset, &buffers)?;
-                        if negotiated & (1 << VIRTIO_BLK_F_FLUSH) == 0 {
-                            self.disk.flush()?; // Without FLUSH negotiation, use write-through.
-                        }
+        match k {
+            VIRTIO_BLK_T_IN | VIRTIO_BLK_T_OUT => {
+                let read = k == VIRTIO_BLK_T_IN;
+                if !data.iter().all(|d| d.is_write_only() == read) {
+                    return Err(DeviceError::BlockDescriptorDirectionMismatch);
+                }
+                if !total.is_multiple_of(512) {
+                    return Err(DeviceError::UnalignedBlockRequest { length: total });
+                }
+                if !(read || !self.disk.read_only()) {
+                    return Err(DeviceError::WriteToReadOnlyDisk);
+                }
+                // The used length covers payload plus status and must fit before any I/O.
+                let used = if read {
+                    u32::try_from(total)
+                        .ok()
+                        .and_then(|n| n.checked_add(1))
+                        .ok_or(DeviceError::RequestLengthOverflow)?
+                } else {
+                    1
+                };
+                let offset = sector
+                    .checked_mul(512)
+                    .ok_or_else(|| DeviceError::SectorOverflow { sector })?;
+                bounds(self.disk.size(), offset, total)?;
+                if read {
+                    self.disk.read(offset, &buffers)?;
+                } else {
+                    self.disk.write(offset, &buffers)?;
+                    if negotiated & (1 << VIRTIO_BLK_F_FLUSH) == 0 {
+                        self.disk.flush()?; // Without FLUSH negotiation, use write-through.
                     }
                 }
-                VIRTIO_BLK_T_FLUSH => {
-                    if !(total == 0 && negotiated & (1 << VIRTIO_BLK_F_FLUSH) != 0) {
-                        return Err(DeviceError::InvalidFlush);
-                    }
-                    self.disk.flush()?;
-                }
-                VIRTIO_BLK_T_GET_ID => {
-                    if !(total >= 20 && data.iter().all(|d| d.is_write_only())) {
-                        return Err(DeviceError::InvalidGetId);
-                    }
-                    super::buffers::copy_from(&buffers, &self.id);
-                    used += 20;
-                }
-                _ => return Ok(VIRTIO_BLK_S_UNSUPP as u8),
+                Ok((VIRTIO_BLK_S_OK as u8, used))
             }
-            Ok(VIRTIO_BLK_S_OK as u8)
-        })();
-        let status_value = match result {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!(
-                    "virtio-blk request {kind} ({}): {}",
-                    self.name,
-                    crate::error::diagnostic(&e)
-                );
-                VIRTIO_BLK_S_IOERR as u8
+            VIRTIO_BLK_T_FLUSH => {
+                if !(total == 0 && negotiated & (1 << VIRTIO_BLK_F_FLUSH) != 0) {
+                    return Err(DeviceError::InvalidFlush);
+                }
+                self.disk.flush()?;
+                Ok((VIRTIO_BLK_S_OK as u8, 1))
             }
-        };
-        mem.write_obj(status_value, status.addr())?;
-        Ok(used)
+            VIRTIO_BLK_T_GET_ID => {
+                if !(total >= 20 && data.iter().all(|d| d.is_write_only())) {
+                    return Err(DeviceError::InvalidGetId);
+                }
+                super::buffers::copy_from(&buffers, &self.id);
+                Ok((VIRTIO_BLK_S_OK as u8, 21))
+            }
+            _ => Ok((VIRTIO_BLK_S_UNSUPP as u8, 1)),
+        }
     }
 }
 
@@ -193,11 +214,14 @@ mod tests {
         flushes: Cell<u32>,
         addresses: RefCell<Vec<usize>>,
         partial: Cell<bool>,
+        capacity: Cell<Option<u64>>,
     }
 
     impl BlockStorage for Rc<Fake> {
         fn size(&self) -> u64 {
-            self.data.borrow().len() as u64
+            self.capacity
+                .get()
+                .unwrap_or(self.data.borrow().len() as u64)
         }
 
         fn read_only(&self) -> bool {
@@ -263,15 +287,25 @@ mod tests {
     }
 
     fn setup(ro: bool, fail: bool) -> (Mmio<Block<Rc<Fake>>>, GuestMemoryMmap, Rc<Fake>) {
+        setup_sized(ro, fail, 0x10000, 4096)
+    }
+
+    fn setup_sized(
+        ro: bool,
+        fail: bool,
+        memory: usize,
+        disk: usize,
+    ) -> (Mmio<Block<Rc<Fake>>>, GuestMemoryMmap, Rc<Fake>) {
         let disk = Rc::new(Fake {
-            data: RefCell::new(vec![0; 4096]),
+            data: RefCell::new(vec![0; disk]),
             ro,
             fail,
             flushes: Cell::new(0),
             addresses: RefCell::new(Vec::new()),
             partial: Cell::new(false),
+            capacity: Cell::new(None),
         });
-        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), memory)]).unwrap();
         let mut b = Mmio::new(Block::new("w-vmm-data-000000001".into(), disk.clone()).unwrap());
         for (o, v) in [
             (0x70, 1),
@@ -496,7 +530,249 @@ mod tests {
         assert_eq!(mem.read_obj::<u8>(GuestAddress(0x5f80)).unwrap(), 0x99);
         disk.addresses.borrow_mut().clear();
         read_desc[3] = Descriptor::new(0x7fff, 512, 2, 0);
-        assert!(b.request(&mem, &read_desc, 0).is_err());
+        assert_eq!(b.request(&mem, &read_desc, 0).unwrap(), 1);
+        assert_eq!(
+            mem.read_obj::<u8>(GuestAddress(0x7000)).unwrap(),
+            VIRTIO_BLK_S_IOERR as u8
+        );
         assert!(disk.addresses.borrow().is_empty());
+    }
+
+    /// Write `chain` as descriptors 0.. and publish it on the 8-entry queue.
+    fn submit_chain(
+        b: &mut Mmio<Block<Rc<Fake>>>,
+        m: &GuestMemoryMmap,
+        chain: &[(u64, u32, bool)],
+    ) -> Result<()> {
+        let idx = b.queues.rings[0].next_avail();
+        for (i, &(addr, len, write)) in chain.iter().enumerate() {
+            let next = i + 1 < chain.len();
+            let flags = u16::from(next) | if write { 2 } else { 0 };
+            let d = Descriptor::new(addr, len, flags, if next { i as u16 + 1 } else { 0 });
+            m.write_obj(d, GuestAddress(0x1000 + 16 * i as u64))?;
+        }
+        m.write_obj(0u16, GuestAddress(0x2004 + 2 * (idx % 8) as u64))?;
+        m.write_obj(idx.wrapping_add(1).to_le(), GuestAddress(0x2002))?;
+        b.write(0x50, 0, m)
+    }
+
+    fn header(m: &GuestMemoryMmap, kind: u32, sector: u64) {
+        m.write_obj(kind.to_le(), GuestAddress(0x4000)).unwrap();
+        m.write_obj(0u32, GuestAddress(0x4004)).unwrap();
+        m.write_obj(sector.to_le(), GuestAddress(0x4008)).unwrap();
+    }
+
+    /// (used index, used length of the latest element)
+    fn last_used(b: &Mmio<Block<Rc<Fake>>>, m: &GuestMemoryMmap) -> (u16, u32) {
+        let idx: u16 = m.read_obj(GuestAddress(0x3002)).unwrap();
+        let slot = u64::from(idx.wrapping_sub(1) % b.queues.rings[0].size());
+        (
+            idx,
+            m.read_obj(GuestAddress(0x3004 + slot * 8 + 4)).unwrap(),
+        )
+    }
+
+    #[test]
+    fn advertises_seg_max_without_size_max() {
+        let (b, _, _) = setup(false, false);
+        let features = b.device.features();
+        assert_ne!(features & (1 << VIRTIO_BLK_F_SEG_MAX), 0);
+        assert_eq!(features & (1 << VIRTIO_BLK_F_SIZE_MAX), 0);
+        assert_eq!(b.read(0x100, 8).unwrap(), 8); // 4096-byte disk in sectors.
+        assert_eq!(b.read(0x108, 4).unwrap(), 0);
+        assert_eq!(b.read(0x10c, 4).unwrap(), 126);
+        assert_eq!(SEG_MAX as u16 + 2, MAX_QUEUE);
+    }
+
+    #[test]
+    fn four_mib_multisegment_requests_complete() {
+        const MIB4: usize = 4 << 20;
+        let (mut b, m, d) = setup_sized(false, false, 0x80_0000 + MIB4, 2 * MIB4);
+        let pattern: Vec<u8> = (0..MIB4).map(|i| (i / 512 % 251) as u8).collect();
+        m.write_slice(&pattern, GuestAddress(0x80_0000)).unwrap();
+        // Uneven segments that only add up to a sector multiple; max chain for queue size 8.
+        let cuts = [0, 1000, 70_000, 1 << 20, 3 << 20, MIB4 - 333, MIB4];
+        let segments = |write| {
+            cuts.windows(2)
+                .map(|w| (0x80_0000 + w[0] as u64, (w[1] - w[0]) as u32, write))
+                .collect::<Vec<_>>()
+        };
+        let mut chain = vec![(0x4000, 16, false)];
+        chain.extend(segments(false));
+        chain.push((0x6000, 1, true));
+        assert_eq!(chain.len(), 8);
+        header(&m, VIRTIO_BLK_T_OUT, 8);
+        submit_chain(&mut b, &m, &chain).unwrap();
+        assert_eq!(status(&m), VIRTIO_BLK_S_OK as u8);
+        assert_eq!(last_used(&b, &m), (1, 1));
+        assert_eq!(&d.data.borrow()[4096..4096 + MIB4], &pattern[..]);
+
+        m.write_slice(&vec![0; MIB4], GuestAddress(0x80_0000))
+            .unwrap();
+        let mut chain = vec![(0x4000, 16, false)];
+        chain.extend(segments(true));
+        chain.push((0x6000, 1, true));
+        header(&m, VIRTIO_BLK_T_IN, 8);
+        submit_chain(&mut b, &m, &chain).unwrap();
+        assert_eq!(status(&m), VIRTIO_BLK_S_OK as u8);
+        assert_eq!(last_used(&b, &m), (2, MIB4 as u32 + 1));
+        let mut actual = vec![0; MIB4];
+        m.read_slice(&mut actual, GuestAddress(0x80_0000)).unwrap();
+        assert_eq!(actual, pattern);
+        assert_eq!(d.addresses.borrow().len(), 6);
+
+        // The advertised maximum: header, SEG_MAX data segments and status in one chain.
+        let mut desc = vec![Descriptor::new(0x4000, 16, 0, 0)];
+        let seg = (MIB4 / SEG_MAX as usize) as u32 & !511;
+        for i in 0..SEG_MAX as u64 {
+            desc.push(Descriptor::new(0x80_0000 + i * u64::from(seg), seg, 2, 0));
+        }
+        desc.push(Descriptor::new(0x6000, 1, 2, 0));
+        assert_eq!(desc.len(), MAX_QUEUE as usize);
+        let used = b
+            .device
+            .request(&m, &desc, 1 << VIRTIO_BLK_F_FLUSH)
+            .unwrap();
+        assert_eq!(used, SEG_MAX * seg + 1);
+        assert_eq!(status(&m), VIRTIO_BLK_S_OK as u8);
+        assert_eq!(d.addresses.borrow().len(), SEG_MAX as usize);
+    }
+
+    #[test]
+    fn malformed_requests_complete_with_ioerr_and_unknown_with_unsupp() {
+        let ioerr = VIRTIO_BLK_S_IOERR as u8;
+        let header_ro = (0x4000, 16, false);
+        let status_wo = (0x6000, 1, true);
+        let cases = [
+            // Header shorter than 16 bytes.
+            (
+                VIRTIO_BLK_T_IN,
+                0,
+                vec![(0x4000, 8, false), status_wo],
+                ioerr,
+            ),
+            // Only the status descriptor.
+            (VIRTIO_BLK_T_IN, 0, vec![status_wo], ioerr),
+            // Device-writable header.
+            (
+                VIRTIO_BLK_T_IN,
+                0,
+                vec![(0x4000, 16, true), (0x5000, 512, true), status_wo],
+                ioerr,
+            ),
+            // Sector whose byte offset overflows.
+            (
+                VIRTIO_BLK_T_OUT,
+                u64::MAX,
+                vec![header_ro, (0x5000, 512, false), status_wo],
+                ioerr,
+            ),
+            // Read into a device-readable buffer.
+            (
+                VIRTIO_BLK_T_IN,
+                0,
+                vec![header_ro, (0x5000, 512, false), status_wo],
+                ioerr,
+            ),
+            // Payload is not a sector multiple.
+            (
+                VIRTIO_BLK_T_OUT,
+                0,
+                vec![header_ro, (0x5000, 100, false), status_wo],
+                ioerr,
+            ),
+            // Sector beyond the disk.
+            (
+                VIRTIO_BLK_T_OUT,
+                8,
+                vec![header_ro, (0x5000, 512, false), status_wo],
+                ioerr,
+            ),
+            // FLUSH carrying data.
+            (
+                VIRTIO_BLK_T_FLUSH,
+                0,
+                vec![header_ro, (0x5000, 512, false), status_wo],
+                ioerr,
+            ),
+            // GET_ID buffer too short.
+            (
+                VIRTIO_BLK_T_GET_ID,
+                0,
+                vec![header_ro, (0x5000, 8, true), status_wo],
+                ioerr,
+            ),
+            // Unknown operation, even with an otherwise invalid payload.
+            (
+                0x7777,
+                0,
+                vec![header_ro, (0x5000, 3, true), status_wo],
+                VIRTIO_BLK_S_UNSUPP as u8,
+            ),
+        ];
+        let (mut b, m, d) = setup(false, false);
+        for (i, (kind, sector, chain, expected)) in cases.into_iter().enumerate() {
+            header(&m, kind, sector);
+            m.write_obj(0xffu8, GuestAddress(0x6000)).unwrap();
+            b.write(0x64, 1, &m).unwrap();
+            submit_chain(&mut b, &m, &chain).unwrap_or_else(|e| panic!("case {i}: {e}"));
+            assert_eq!(status(&m), expected, "case {i}");
+            assert_eq!(last_used(&b, &m), (i as u16 + 1, 1), "case {i}");
+            assert!(b.interrupt_pending(), "case {i}");
+        }
+        assert!(d.addresses.borrow().is_empty());
+        assert_eq!(d.flushes.get(), 0);
+        assert!(d.data.borrow().iter().all(|v| *v == 0));
+        // The queue keeps working after malformed requests.
+        m.write_slice(&[0x42; 512], GuestAddress(0x5000)).unwrap();
+        submit(&mut b, &m, VIRTIO_BLK_T_OUT, 0, 512).unwrap();
+        assert_eq!(status(&m), VIRTIO_BLK_S_OK as u8);
+        assert_eq!(d.data.borrow()[0], 0x42);
+    }
+
+    #[test]
+    fn lenient_keeps_request_status_and_isolates_only_untrusted_chains() {
+        let ioerr = VIRTIO_BLK_S_IOERR as u8;
+        let (b, m, d) = setup(false, false);
+        let mut b = b.with_strict(false);
+        // Malformed requests and backend errors behind a trusted status
+        // descriptor are normal responses in either mode.
+        header(&m, VIRTIO_BLK_T_OUT, 0);
+        let chain = [(0x4000, 16, false), (0x5000, 100, false), (0x6000, 1, true)];
+        submit_chain(&mut b, &m, &chain).unwrap();
+        assert_eq!((status(&m), b.needs_reset()), (ioerr, false));
+        // An untrustworthy status descriptor isolates the device.
+        b.write(0x64, 1, &m).unwrap();
+        submit_chain(&mut b, &m, &[(0x4000, 16, false), (0x6000, 2, true)]).unwrap();
+        assert!(b.needs_reset());
+        assert_eq!(b.read(0x60, 4), Some(2));
+        assert_eq!(last_used(&b, &m), (1, 1));
+        assert!(d.addresses.borrow().is_empty());
+        // Host failures stay fatal: reset flushes the disk.
+        let (b, m, _) = setup(false, true);
+        let mut b = b.with_strict(false);
+        assert!(matches!(b.write(0x70, 0, &m), Err(DeviceError::Storage(_))));
+        assert_eq!(b.status, 15);
+    }
+
+    #[test]
+    fn read_used_length_overflow_rejected_before_backend() {
+        const SEG: u32 = 1 << 28;
+        let (_, m, d) = setup_sized(false, false, 0x10000 + SEG as usize, 4096);
+        let b = Block::new("overflow".into(), d.clone()).unwrap();
+        // 16 aliasing segments add up to exactly 4 GiB, so used = 4 GiB + 1 overflows u32.
+        let mut desc = vec![Descriptor::new(0x4000, 16, 0, 0)];
+        desc.extend((0..16).map(|_| Descriptor::new(0x10000, SEG, 2, 0)));
+        desc.push(Descriptor::new(0x6000, 1, 2, 0));
+        d.capacity.set(Some(1 << 40)); // Bounds checks alone would accept the request.
+        header(&m, VIRTIO_BLK_T_IN, 0);
+        assert_eq!(b.request(&m, &desc, 0).unwrap(), 1);
+        assert_eq!(status(&m), VIRTIO_BLK_S_IOERR as u8);
+        assert!(d.addresses.borrow().is_empty());
+        // One sector less fits (used = 4 GiB - 511) and reaches the backend, which fails here.
+        desc[16] = Descriptor::new(0x10000, SEG - 512, 2, 0);
+        d.partial.set(true);
+        assert_eq!(b.request(&m, &desc, 0).unwrap(), 1);
+        assert_eq!(d.addresses.borrow().len(), 16);
     }
 }

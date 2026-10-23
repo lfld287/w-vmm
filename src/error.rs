@@ -249,8 +249,14 @@ pub enum PlatformError {
     VcpuThreadPanicked,
     #[error("startup cancelled")]
     StartupCancelled,
-    #[error("VM stopped during memory transaction")]
-    VmStoppedDuringMemoryTransaction,
+    #[error("MMIO reply channel disconnected: address {address:#x}")]
+    MmioReplyDisconnected { address: u64 },
+    #[error("guest range overlaps an existing mapping: address {address:#x}, size {size}")]
+    MappingOverlap { address: u64, size: u64 },
+    #[error("no mapping matches guest range: address {address:#x}, size {size}")]
+    MappingNotFound { address: u64, size: u64 },
+    #[error("mapped allocation differs from region: address {address:#x}, size {size}")]
+    MappingMismatch { address: u64, size: u64 },
     /// Error supplied by a caller-provided backend.
     #[error(transparent)]
     Backend(Box<dyn std::error::Error + Send + Sync + 'static>),
@@ -332,8 +338,6 @@ pub enum DeviceError {
     UnalignedBlockRequest { length: usize },
     #[error("block descriptor direction mismatch")]
     BlockDescriptorDirectionMismatch,
-    #[error("block request length {length} exceeds limit {limit}")]
-    BlockRequestTooLarge { length: usize, limit: usize },
     #[error("request length overflow")]
     RequestLengthOverflow,
     #[error("invalid block header/status")]
@@ -448,10 +452,14 @@ pub enum RuntimeError {
     VmmThreadPanicked,
     #[error("unmapped I/O {address:#x}, size {width}")]
     UnmappedIo { address: u64, width: usize },
-    #[error("virtio MMIO writes must be 32 bit (got {width} bytes)")]
-    InvalidMmioWidth { width: usize },
-    #[error("invalid I/O width {width}")]
-    InvalidIoWidth { width: usize },
+    /// The access starts in a declared device window but does not decode to a
+    /// register, such as a virtio register access that is not 32 bit.
+    #[error("invalid guest access {address:#x}, size {width}, write {write}")]
+    InvalidAccess {
+        address: u64,
+        width: usize,
+        write: bool,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -462,6 +470,86 @@ pub enum SerialError {
     Io(#[from] std::io::Error),
     #[error("UART: {0}")]
     Uart(#[from] vm_superio::serial::Error<std::io::Error>),
+}
+
+impl DeviceError {
+    /// Guest-caused errors, which a lenient VM contains to the device. Host and
+    /// backend failures, backend contract violations and construction errors
+    /// are always fatal.
+    pub(crate) fn is_guest(&self) -> bool {
+        match self {
+            Self::InvalidGetId
+            | Self::InvalidFlush
+            | Self::SectorOverflow { .. }
+            | Self::WriteToReadOnlyDisk
+            | Self::UnalignedBlockRequest { .. }
+            | Self::BlockDescriptorDirectionMismatch
+            | Self::RequestLengthOverflow
+            | Self::InvalidBlockHeaderStatus
+            | Self::TruncatedBlockDescriptorChain
+            | Self::MissingBlockChain
+            | Self::RxLengthOverflow
+            | Self::RxDescriptorMustBeWritable
+            | Self::MissingRxChain
+            | Self::UnnegotiatedTxChecksumGsoOffload
+            | Self::InvalidTxPacketSize { .. }
+            | Self::TxLengthOverflow
+            | Self::TxDescriptorMustBeReadable
+            | Self::InvalidQueueMemory
+            | Self::InvalidQueueReady { .. }
+            | Self::QueueTooLarge { .. }
+            | Self::QueueConfigurationWhileReady
+            | Self::QueueConfigurationAfterDriverOk
+            | Self::DriverNotReady
+            | Self::StatusBitsCleared
+            | Self::CyclicDescriptorChain
+            | Self::InvalidDescriptorFlagsRange { .. }
+            | Self::UnnegotiatedIndirectDescriptor
+            | Self::DescriptorIndexOutOfRange { .. }
+            | Self::InvalidAvailableDescriptor
+            | Self::AvailableRingOverrun { .. }
+            | Self::InvalidVirtqueue
+            | Self::CyclicPendingDescriptorChain
+            | Self::InvalidPendingDescriptor { .. }
+            | Self::InvalidLiveQueue
+            | Self::GuestAccess(_)
+            | Self::Queue(_) => true,
+            Self::Memory(e) => e.is_guest(),
+            Self::InvalidBlockName { .. }
+            | Self::InvalidBackendRxPacketSize { .. }
+            | Self::NetworkMacMustBeNonzeroUnicast
+            | Self::InvalidNetworkMtuFrameCapacity { .. }
+            | Self::Storage(_)
+            | Self::Net(_)
+            | Self::Slice(_) => false,
+        }
+    }
+}
+
+impl MemoryError {
+    /// Malformed virtio-mem requests. Mapping failures, including rollback
+    /// failures, are host errors.
+    pub(crate) fn is_guest(&self) -> bool {
+        match self {
+            Self::ReadableDescriptorAfterWritableDescriptor
+            | Self::InvalidVirtioMemRequestBuffers { .. }
+            | Self::GuestAccess(_) => true,
+            Self::Stopped
+            | Self::InvalidTarget { .. }
+            | Self::CapacityOverflow { .. }
+            | Self::IpaOverflow
+            | Self::HotplugOverflow
+            | Self::HotplugAlignment { .. }
+            | Self::InvalidRegionSize { .. }
+            | Self::InvalidBlockSize { .. }
+            | Self::RollbackFailed { .. }
+            | Self::Backend(_)
+            | Self::GuestMemory(_)
+            | Self::Slice(_)
+            | Self::Mapping(_)
+            | Self::Regions(_) => false,
+        }
+    }
 }
 
 impl From<PlatformError> for MemoryError {
@@ -488,6 +576,39 @@ pub fn diagnostic(error: &(dyn std::error::Error + 'static)) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_guest_errors_are_containable() {
+        let rollback = MemoryError::RollbackFailed {
+            source: Box::new(MemoryError::Backend(std::io::Error::other("map").into())),
+            rollback: Box::new(MemoryError::Backend(std::io::Error::other("unmap").into())),
+        };
+        for (error, guest) in [
+            (
+                DeviceError::AvailableRingOverrun { count: 9, size: 8 },
+                true,
+            ),
+            (DeviceError::InvalidBlockHeaderStatus, true),
+            (DeviceError::StatusBitsCleared, true),
+            (
+                MemoryError::InvalidVirtioMemRequestBuffers { read: 0, write: 0 }.into(),
+                true,
+            ),
+            (rollback.into(), false),
+            (MemoryError::from(PlatformError::EmptyRegion).into(), false),
+            (StorageError::ReadOnly.into(), false),
+            (NetError::Closed.into(), false),
+            (
+                DeviceError::InvalidBackendRxPacketSize {
+                    length: 8,
+                    capacity: 1514,
+                },
+                false,
+            ),
+        ] {
+            assert_eq!(error.is_guest(), guest, "{error}");
+        }
+    }
 
     #[derive(Debug, thiserror::Error)]
     #[error("backend flush")]

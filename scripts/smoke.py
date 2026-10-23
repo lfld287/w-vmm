@@ -13,6 +13,7 @@ import select
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import termios
 import time
@@ -117,7 +118,14 @@ class VM:
     def __enter__(self):
         return self
 
-    def __exit__(self, *_):
+    def __exit__(self, failure, *_):
+        if failure:
+            # The helper stops reading on failure; keep the VM's final error in the log.
+            end, size = time.monotonic() + 2, -1
+            while len(self.buf) != size and time.monotonic() < end:
+                size = len(self.buf)
+                self.read(0.2)
+            print(self.buf[-2000:].decode(errors="replace"), file=sys.stderr)
         self.close()
 
 
@@ -214,6 +222,15 @@ def main():
                 "RO_PASS",
             )
             vm.send("cd /; umount /data")
+            # D1 regression: 4 MiB reads, also at the device's maximum request size.
+            vm.command(
+                'test "$(cat /sys/block/vda/queue/max_segments)" -eq 126 && dd if=/dev/vda of=/dev/null bs=4M count=8',
+                "LARGE_BLOCK_PASS",
+            )
+            vm.command(
+                "cat /sys/block/vda/queue/max_hw_sectors_kb > /sys/block/vda/queue/max_sectors_kb && dd if=/dev/vda of=/dev/null bs=4M count=8",
+                "LARGE_LIMIT_PASS",
+            )
             vm.poweroff()
         assert hashlib.sha256(disk.read_bytes()).hexdigest() == before, (
             "read-only image changed"
@@ -262,7 +279,7 @@ def main():
         (LOGS / "corrupt.log").write_bytes(result.stderr)
         check("qemu-img", "check", str(disk))
     print(
-        "PASS: shell, multiple named disks, persistence, offline, read-only, lock, corrupt image, real host EFBIG, reboot, signals, terminal restoration"
+        "PASS: shell, multiple named disks, persistence, offline, read-only, 4 MiB requests, lock, corrupt image, real host EFBIG, reboot, signals, terminal restoration"
     )
 
     (LOGS / "summary.json").write_text(

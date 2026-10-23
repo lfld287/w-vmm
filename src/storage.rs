@@ -115,9 +115,17 @@ fn overlaps(a: &VolatileSlice<'_>, b: &VolatileSlice<'_>) -> bool {
     a_start < b_start.saturating_add(b.len()) && b_start < a_start.saturating_add(a.len())
 }
 
+/// qcow2 disk backed by imago with zero-copy guest buffers.
+///
+/// Known limitation: imago 0.2.5 turns the guest `VolatileSlice`s into ordinary
+/// Rust slices (`io_buffers.rs` `from_raw_parts(_mut)`; the zero-fill path uses
+/// `fill`). Other vCPUs can access that shared guest memory concurrently, which
+/// is undefined behavior under Rust's aliasing model. Zero-copy is kept
+/// deliberately until imago fixes this upstream.
 pub struct Disk {
     image: FormatAccess<ImageFile>,
-    lock: File,
+    // Holds the advisory flock for the disk's lifetime; I/O and sync go through `image`.
+    _lock: File,
     readonly: bool,
     size: u64,
     path: std::path::PathBuf,
@@ -245,7 +253,7 @@ impl Disk {
         }
         Ok(Self {
             image,
-            lock,
+            _lock: lock,
             readonly,
             size,
             path: path.to_owned(),
@@ -282,17 +290,12 @@ impl BlockStorage for Disk {
                     path: self.path.clone(),
                     source,
                 })?;
+            // imago syncs its duplicate of the lock descriptor with `sync_all`
+            // (F_FULLFSYNC on macOS). It is the same inode, so no second sync is needed.
             self.image
                 .sync()
                 .map_err(|source| StorageError::Operation {
                     operation: "qcow2 host sync",
-                    path: self.path.clone(),
-                    source,
-                })?;
-            self.lock
-                .sync_all()
-                .map_err(|source| StorageError::Operation {
-                    operation: "disk fsync",
                     path: self.path.clone(),
                     source,
                 })?;

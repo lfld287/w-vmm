@@ -3,6 +3,7 @@
 use std::{
     collections::BTreeMap,
     io::{self, Write},
+    sync::Arc,
     time::Duration,
 };
 use vm_memory::{GuestMemoryMmap, GuestMemoryRegion, GuestRegionMmap};
@@ -15,7 +16,8 @@ use w_vmm::{
 struct InProcess;
 
 struct Vm {
-    mappings: BTreeMap<u64, u64>,
+    // Mapped regions are owned until a successful unmap or VM destruction.
+    mappings: BTreeMap<u64, Arc<GuestRegionMmap>>,
     running: bool,
     next: usize,
 }
@@ -68,7 +70,7 @@ impl Platform for InProcess {
 }
 
 impl Mapper for Vm {
-    fn map(&mut self, region: &GuestRegionMmap) -> std::result::Result<(), MemoryError> {
+    fn map(&mut self, region: Arc<GuestRegionMmap>) -> std::result::Result<(), MemoryError> {
         if self.running {
             return Err(MemoryError::Backend(
                 io::Error::other("mapping requires quiescence").into(),
@@ -80,8 +82,9 @@ impl Mapper for Vm {
                 io::Error::other("already mapped").into(),
             ));
         }
-        // A real hypervisor maps region.as_ptr() here, borrowing its allocation.
-        self.mappings.insert(address, region.len());
+        // A real hypervisor maps region.as_ptr() here; keeping the Arc keeps the
+        // host allocation alive for as long as the hypervisor references it.
+        self.mappings.insert(address, region);
         Ok(())
     }
 
@@ -91,7 +94,17 @@ impl Mapper for Vm {
                 io::Error::other("unmapping requires quiescence").into(),
             ));
         }
-        self.mappings.remove(&region.start_addr().0);
+        let address = region.start_addr().0;
+        let same = self.mappings.get(&address).is_some_and(|mapped| {
+            mapped.len() == region.len() && Arc::ptr_eq(&mapped.get_mmap(), &region.get_mmap())
+        });
+        if !same {
+            return Err(MemoryError::Backend(
+                io::Error::other("region is not mapped").into(),
+            ));
+        }
+        // Release ownership only after the hypervisor unmap succeeds.
+        self.mappings.remove(&address);
         Ok(())
     }
 }
@@ -147,9 +160,10 @@ impl VirtualMachine for Vm {
         Ok(())
     }
 
-    fn pause(&mut self) -> std::result::Result<(), PlatformError> {
+    fn pause(&mut self) -> std::result::Result<PauseOutcome, PlatformError> {
+        // Return Stopping instead if a vCPU already began shutting the VM down.
         self.running = false;
-        Ok(())
+        Ok(PauseOutcome::Paused)
     }
 
     fn resume(&mut self) -> std::result::Result<(), PlatformError> {
@@ -157,14 +171,18 @@ impl VirtualMachine for Vm {
         Ok(())
     }
 
-    fn stop(&mut self) {
+    fn stop(&mut self) -> std::result::Result<(), PlatformError> {
+        // Real platforms join every vCPU, then return the first fault that
+        // poll_event has not returned. Later calls return Ok.
         self.running = false;
+        Ok(())
     }
 }
 
 impl Drop for Vm {
     fn drop(&mut self) {
-        self.stop();
+        let _ = self.stop();
+        // Destroy the hypervisor VM first; only then release the allocations.
         self.mappings.clear();
     }
 }
@@ -216,7 +234,7 @@ fn main() -> Result<()> {
     Vmm::new(
         VmConfig {
             memory_mib: 2,
-            vcpu_count: 1,
+            ..VmConfig::default()
         },
         BTreeMap::<String, Disk>::new(),
         None::<NoNet>,

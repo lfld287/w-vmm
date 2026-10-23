@@ -1,8 +1,8 @@
 //! Thin HVF binding, authored against Apple's SDK. See THIRD_PARTY.md for libkrun reference.
 use crate::error::PlatformError;
 use crate::{boot, memory::Mapper};
-use std::{ffi::c_void, marker::PhantomData, rc::Rc};
-use vm_memory::{Address, GuestMemoryRegion};
+use std::{collections::BTreeMap, ffi::c_void, marker::PhantomData, rc::Rc, sync::Arc};
+use vm_memory::{Address, GuestMemoryRegion, GuestRegionMmap};
 
 type Result<T> = std::result::Result<T, PlatformError>;
 
@@ -109,7 +109,68 @@ pub fn kick(id: u64) {
 
 // !Send and !Sync: HVF VM/vCPU operations have owning-thread requirements.
 pub struct Vm {
+    mappings: Mappings,
     _thread: PhantomData<Rc<()>>,
+}
+
+/// Regions mapped into HVF, keyed by guest address. HVF only receives host
+/// pointers, so the table owns each allocation until a successful unmap or VM
+/// destruction.
+#[derive(Default)]
+struct Mappings(BTreeMap<u64, Arc<GuestRegionMmap>>);
+
+impl Mappings {
+    fn map(
+        &mut self,
+        region: Arc<GuestRegionMmap>,
+        map: impl FnOnce(&GuestRegionMmap) -> Result<()>,
+    ) -> Result<()> {
+        let (address, size) = (region.start_addr().raw_value(), region.len());
+        let end = address
+            .checked_add(size)
+            .ok_or_else(|| PlatformError::RegionOverflow { address, size })?;
+        if self
+            .0
+            .range(..end)
+            .next_back()
+            .is_some_and(|(&a, r)| a + r.len() > address)
+        {
+            return Err(PlatformError::MappingOverlap { address, size });
+        }
+        map(&region)?;
+        self.0.insert(address, region);
+        Ok(())
+    }
+
+    /// The allocation is released only after `unmap` succeeds.
+    fn unmap(
+        &mut self,
+        region: &GuestRegionMmap,
+        unmap: impl FnOnce(u64, u64) -> Result<()>,
+    ) -> Result<()> {
+        let (address, size) = (region.start_addr().raw_value(), region.len());
+        let mapped = self
+            .0
+            .get(&address)
+            .filter(|r| r.len() == size)
+            .ok_or_else(|| PlatformError::MappingNotFound { address, size })?;
+        // Another wrapper around the same allocation is the same mapping.
+        if !Arc::ptr_eq(&mapped.get_mmap(), &region.get_mmap()) {
+            return Err(PlatformError::MappingMismatch { address, size });
+        }
+        unmap(address, size)?;
+        self.0.remove(&address);
+        Ok(())
+    }
+
+    /// Without a successful VM destruction, HVF may still reference every
+    /// mapped allocation, so they are leaked rather than released.
+    fn destroyed(&mut self, success: bool) {
+        let mappings = std::mem::take(&mut self.0);
+        if !success {
+            std::mem::forget(mappings);
+        }
+    }
 }
 
 impl Vm {
@@ -121,6 +182,7 @@ impl Vm {
             )?;
         }
         Ok(Self {
+            mappings: Mappings::default(),
             _thread: PhantomData,
         })
     }
@@ -159,8 +221,12 @@ impl Vm {
 
 impl Drop for Vm {
     fn drop(&mut self) {
-        unsafe {
-            hv_vm_destroy();
+        let result = unsafe { check(hv_vm_destroy(), "destroy VM") };
+        // Secure the leak before logging: a panicking eprintln! must not free
+        // allocations Hypervisor.framework may still map.
+        self.mappings.destroyed(result.is_ok());
+        if let Err(e) = &result {
+            eprintln!("{}; leaking mapped guest RAM", crate::error::diagnostic(e));
         }
     }
 }
@@ -188,7 +254,7 @@ pub fn max_vcpus() -> Result<u32> {
 impl Mapper for Vm {
     fn map(
         &mut self,
-        region: &vm_memory::GuestRegionMmap,
+        region: Arc<GuestRegionMmap>,
     ) -> std::result::Result<(), crate::error::MemoryError> {
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
         if !((region.as_ptr() as u64).is_multiple_of(page)
@@ -199,7 +265,8 @@ impl Mapper for Vm {
         }
         boot::validate_ipa_range(region.start_addr().raw_value(), region.len(), ipa_bits()?)
             .map_err(PlatformError::from)?;
-        unsafe {
+        Ok(self.mappings.map(region, |region| unsafe {
+            // The table keeps the allocation alive while HVF references it.
             check(
                 hv_vm_map(
                     region.as_ptr().cast(),
@@ -207,23 +274,18 @@ impl Mapper for Vm {
                     region.len() as usize,
                     7,
                 ),
-                "map hotplug RAM",
+                "map guest RAM",
             )
-            .map_err(Into::into)
-        }
+        })?)
     }
 
     fn unmap(
         &mut self,
-        region: &vm_memory::GuestRegionMmap,
+        region: &GuestRegionMmap,
     ) -> std::result::Result<(), crate::error::MemoryError> {
-        unsafe {
-            check(
-                hv_vm_unmap(region.start_addr().raw_value(), region.len() as usize),
-                "unmap hotplug RAM",
-            )
-            .map_err(Into::into)
-        }
+        Ok(self.mappings.unmap(region, |address, size| unsafe {
+            check(hv_vm_unmap(address, size as usize), "unmap guest RAM")
+        })?)
     }
 }
 
@@ -299,6 +361,98 @@ impl Drop for Vcpu {
     fn drop(&mut self) {
         unsafe {
             hv_vcpu_destroy(self.id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vm_memory::GuestAddress;
+
+    fn region(address: u64, size: usize) -> Arc<GuestRegionMmap> {
+        Arc::new(GuestRegionMmap::from_range(GuestAddress(address), size, None).unwrap())
+    }
+
+    fn fail() -> Result<()> {
+        Err(PlatformError::Backend(
+            std::io::Error::other("injected").into(),
+        ))
+    }
+
+    #[test]
+    fn table_owns_mappings_until_successful_unmap() {
+        let mut m = Mappings::default();
+        let a = region(0x10000, 0x4000);
+        let weak = Arc::downgrade(&a.get_mmap());
+        m.map(a.clone(), |_| Ok(())).unwrap();
+        drop(a);
+        assert!(weak.upgrade().is_some());
+        let a = m.0[&0x10000].clone();
+        // Address, length and allocation identity must all match.
+        let other = region(0x10000, 0x4000);
+        assert!(matches!(
+            m.unmap(&other, |_, _| unreachable!()),
+            Err(PlatformError::MappingMismatch { .. })
+        ));
+        let moved = GuestRegionMmap::with_arc(a.get_mmap(), GuestAddress(0x14000)).unwrap();
+        assert!(matches!(
+            m.unmap(&moved, |_, _| unreachable!()),
+            Err(PlatformError::MappingNotFound { .. })
+        ));
+        drop(moved);
+        m.map(region(0x20000, 0x8000), |_| Ok(())).unwrap();
+        let resized =
+            GuestRegionMmap::with_arc(region(0, 0x4000).get_mmap(), GuestAddress(0x20000)).unwrap();
+        assert!(matches!(
+            m.unmap(&resized, |_, _| unreachable!()),
+            Err(PlatformError::MappingNotFound { .. })
+        ));
+        // A failed unmap keeps ownership; the same region may be retried.
+        assert!(m.unmap(&a, |_, _| fail()).is_err());
+        drop(a);
+        assert!(weak.upgrade().is_some());
+        let wrapper =
+            GuestRegionMmap::with_arc(m.0[&0x10000].get_mmap(), GuestAddress(0x10000)).unwrap();
+        m.unmap(&wrapper, |address, size| {
+            assert_eq!((address, size), (0x10000, 0x4000));
+            Ok(())
+        })
+        .unwrap();
+        drop(wrapper);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(m.0.len(), 1);
+    }
+
+    #[test]
+    fn overlap_and_failed_map_do_not_take_ownership() {
+        let mut m = Mappings::default();
+        m.map(region(0x10000, 0x4000), |_| Ok(())).unwrap();
+        for (address, size) in [(0x10000, 0x4000), (0xf000, 0x2000), (0x13000, 0x4000)] {
+            assert!(matches!(
+                m.map(region(address, size), |_| unreachable!()),
+                Err(PlatformError::MappingOverlap { .. })
+            ));
+        }
+        m.map(region(0xc000, 0x4000), |_| Ok(())).unwrap();
+        m.map(region(0x14000, 0x4000), |_| Ok(())).unwrap();
+        let failed = region(0x20000, 0x4000);
+        let weak = Arc::downgrade(&failed.get_mmap());
+        assert!(m.map(failed, |_| fail()).is_err());
+        assert!(weak.upgrade().is_none());
+        assert_eq!(m.0.len(), 3);
+    }
+
+    #[test]
+    fn destroy_failure_leaks_mapped_allocations() {
+        for success in [true, false] {
+            let mut m = Mappings::default();
+            let r = region(0x10000, 0x4000);
+            let weak = Arc::downgrade(&r.get_mmap());
+            m.map(r, |_| Ok(())).unwrap();
+            m.destroyed(success);
+            drop(m);
+            assert_eq!(weak.upgrade().is_none(), success);
         }
     }
 }

@@ -45,6 +45,10 @@ impl<ND: NetDevice> Net<ND> {
     }
 
     fn transmit(&mut self, queues: &mut Queues, mem: &GuestMemoryMmap) -> Result<()> {
+        // A deferred frame belongs to the TX queue; once disabled it waits for reset.
+        if !queues.rings[1].ready() {
+            return Ok(());
+        }
         for _ in 0..BUDGET {
             if let Some(head) = self.pending_tx {
                 if !self
@@ -356,10 +360,10 @@ mod tests {
     #[test]
     fn scatter_transmit_receive_and_irq() {
         let (mut net, mem, backend) = setup();
-        assert_eq!(net.read(8, 4), 1);
-        assert_eq!(net.read(0x100, 4), 2);
-        assert_eq!(net.read(0x104, 2), 0x100);
-        assert_eq!(net.read(0x10a, 2), 1500);
+        assert_eq!(net.read(8, 4), Some(1));
+        assert_eq!(net.read(0x100, 4).unwrap(), 2);
+        assert_eq!(net.read(0x104, 2).unwrap(), 0x100);
+        assert_eq!(net.read(0x10a, 2).unwrap(), 1500);
         let frame = tx(&net, &mem);
         net.write(0x50, 1, &mem).unwrap();
         assert_eq!(
@@ -419,6 +423,69 @@ mod tests {
         backend.borrow_mut().blocked = false;
         net.poll(&mem).unwrap();
         assert_eq!(backend.borrow().sent.len(), 1);
+    }
+
+    #[test]
+    fn disabled_tx_queue_holds_pending_frame_until_reset() {
+        let (mut net, mem, backend) = setup();
+        tx(&net, &mem);
+        backend.borrow_mut().blocked = true;
+        net.poll(&mem).unwrap();
+        assert!(net.device.pending_tx.is_some());
+        net.write(0x30, 1, &mem).unwrap();
+        net.write(0x44, 0, &mem).unwrap();
+        // Queues cannot restart after DRIVER_OK.
+        assert!(matches!(
+            net.write(0x44, 1, &mem),
+            Err(DeviceError::QueueConfigurationAfterDriverOk)
+        ));
+        backend.borrow_mut().blocked = false;
+        net.poll(&mem).unwrap();
+        net.write(0x50, 1, &mem).unwrap();
+        assert!(backend.borrow().sent.is_empty());
+        assert_eq!(used(&mem, 1), (0, 0));
+        // RX is unaffected.
+        backend.borrow_mut().received.push_back(vec![0x77; 64]);
+        post(&net, &mem, 0, &[Descriptor::new(0xa000, 2048, 2, 0)]);
+        net.poll(&mem).unwrap();
+        assert_eq!(used(&mem, 0), (1, 76));
+        net.write(0x70, 0, &mem).unwrap();
+        assert!(net.device.pending_tx.is_none());
+    }
+
+    #[test]
+    fn lenient_isolates_guest_frames_but_backend_failures_stay_fatal() {
+        let (net, mem, backend) = setup();
+        let mut net = net.with_strict(false);
+        post(&net, &mem, 1, &[Descriptor::new(0x8000, 11, 0, 0)]);
+        net.poll(&mem).unwrap();
+        assert!(net.needs_reset() && !net.active());
+        assert_eq!(net.read(0x60, 4), Some(2));
+        assert_eq!(net.read(0x70, 4), Some(0x4f));
+        // The stopped dataplane ignores further work until reset.
+        tx(&net, &mem);
+        net.poll(&mem).unwrap();
+        net.write(0x50, 1, &mem).unwrap();
+        assert!(backend.borrow().sent.is_empty());
+        net.write(0x70, 0, &mem).unwrap();
+        assert!(!net.needs_reset() && !net.interrupt_pending());
+
+        let (net, mem, backend) = setup();
+        let mut net = net.with_strict(false);
+        tx(&net, &mem);
+        backend.borrow_mut().fail = true;
+        assert!(matches!(net.poll(&mem), Err(DeviceError::Net(_))));
+        assert!(!net.needs_reset());
+        // A backend frame outside its declared capacity violates the contract.
+        let (net, mem, backend) = setup();
+        let mut net = net.with_strict(false);
+        post(&net, &mem, 0, &[Descriptor::new(0xa000, 2048, 2, 0)]);
+        backend.borrow_mut().received.push_back(vec![0; 8]);
+        assert!(matches!(
+            net.poll(&mem),
+            Err(DeviceError::InvalidBackendRxPacketSize { length: 8, .. })
+        ));
+        assert!(!net.needs_reset());
     }
 
     #[test]

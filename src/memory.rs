@@ -12,10 +12,14 @@ pub(crate) fn mib_bytes(mib: u64) -> Result<u64> {
         .ok_or_else(|| MemoryError::CapacityOverflow { mib })
 }
 
-/// Each operation must be atomic on error. Mappings borrow the region until
-/// unmap succeeds or the VM is destroyed. Called only while vCPUs are stopped.
+/// Each operation must be atomic on error. Called only while vCPUs are stopped.
+/// A successful `map` transfers ownership of the region to the mapper, which
+/// must keep it alive until a successful `unmap` or VM destruction; callers may
+/// drop their references at any time. `unmap` must reject a region whose guest
+/// address, length or host allocation differs from the mapping, and keep the
+/// allocation when unmapping fails.
 pub trait Mapper {
-    fn map(&mut self, region: &GuestRegionMmap) -> Result<()>;
+    fn map(&mut self, region: Arc<GuestRegionMmap>) -> Result<()>;
 
     fn unmap(&mut self, region: &GuestRegionMmap) -> Result<()>;
 }

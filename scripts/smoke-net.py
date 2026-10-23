@@ -72,8 +72,17 @@ with tempfile.TemporaryDirectory(prefix="w-vmm-net-") as temp:
                             resized.append(target)
                 except Exception as error:
                     resize_errors.append(error)
+            def drain(thread, timeout):
+                # The PTY holds only ~1 KiB and unread guest console output is a
+                # fatal UART error, so keep reading while another thread waits.
+                end = time.monotonic() + timeout
+                while thread.is_alive() and time.monotonic() < end:
+                    vm.read(0.05)
             resize_thread = threading.Thread(target=resize_loop, daemon=True) if args.memory else None
-            if resize_thread: resize_thread.start()
+            if resize_thread:
+                # Resize info messages would otherwise interleave with, and split, command markers.
+                vm.command("dmesg -n 5", "QUIET_CONSOLE")
+                resize_thread.start()
             vm.command("test -e /sys/class/net/eth0 && test -z \"$(ip -4 addr show dev eth0 | grep 'inet ')\" && ! pidof udhcpc", "UNCONFIGURED_PASS")
             if attached:
                 vm.command('test "$(cat /sys/block/vda/serial)" = disk0 && test "$(cat /sys/block/vdb/serial)" = disk1', "NET_DISKS_PASS")
@@ -81,10 +90,20 @@ with tempfile.TemporaryDirectory(prefix="w-vmm-net-") as temp:
             vm.command(f"ip link set eth0 up && ip addr add {guest} dev eth0", "STATIC_IP_PASS")
             if args.memory:
                 vm.send(f'ping -i 0.01 -s 1472 {host} > /tmp/pause-ping & pingpid=$!')
-                for _ in range(10):
-                    assert request({"command": "pause"})["lifecycle"] == "Paused"
-                    time.sleep(0.02)
-                    assert request({"command": "resume"})["lifecycle"] == "Running"
+                pause_errors = []
+                def pause_loop():
+                    try:
+                        for _ in range(10):
+                            assert request({"command": "pause"})["lifecycle"] == "Paused"
+                            time.sleep(0.02)
+                            assert request({"command": "resume"})["lifecycle"] == "Running"
+                    except Exception as error:
+                        pause_errors.append(error)
+                pause_thread = threading.Thread(target=pause_loop, daemon=True)
+                pause_thread.start()
+                drain(pause_thread, 30)
+                assert not pause_thread.is_alive()
+                assert not pause_errors, pause_errors
                 vm.command('kill -INT "$pingpid"; wait "$pingpid"; true', 'PAUSED_PING_OK')
             # Exercise full-size frames and enough packets to wrap a 128-entry ring.
             vm.command(f"ping -c 140 -i 0.01 -s 1472 -W 2 {host} > /tmp/ping && cat /tmp/ping && grep -q '140 packets received, 0% packet loss' /tmp/ping", "PING_PASS")
@@ -125,7 +144,7 @@ with tempfile.TemporaryDirectory(prefix="w-vmm-net-") as temp:
                         worker.join()
             if resize_thread:
                 resize_stop.set()
-                resize_thread.join(35)
+                drain(resize_thread, 35)
                 assert not resize_thread.is_alive()
                 assert not resize_errors, resize_errors
                 assert len(resized) >= 3, resized

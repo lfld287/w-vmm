@@ -1,6 +1,6 @@
 //! Architecture-independent device runtime.
 use crate::Result;
-use crate::error::RuntimeError;
+use crate::error::{PlatformError, RuntimeError};
 use crate::{
     VirtioMem, VmConfig,
     devices::{Device, block::Block, mmio::Mmio, net::Net},
@@ -9,8 +9,8 @@ use crate::{
     serial::{SerialIo, poll_input},
     storage::BlockStorage,
 };
-use std::{collections::BTreeMap, time::Duration};
-use vm_memory::{GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
+use std::{collections::BTreeMap, ops::ControlFlow, sync::Arc, time::Duration};
+use vm_memory::{GuestAddress, GuestMemoryMmap, GuestRegionMmap};
 use vm_superio::{Serial, Trigger};
 
 pub(crate) fn run<P: Platform, BS: BlockStorage, ND: NetDevice, SI: SerialIo>(
@@ -32,18 +32,22 @@ pub(crate) fn run<P: Platform, BS: BlockStorage, ND: NetDevice, SI: SerialIo>(
         })
     };
     control.cleaning();
-    let cleanup_result = runtime.cleanup();
+    let (fault, cleanup_result) = runtime.cleanup();
     control.cleanup_result(&cleanup_result);
-    result.and(cleanup_result)
+    // Every exit path reaches here; the first error in this order is the true cause.
+    result.and(fault.map_err(Into::into)).and(cleanup_result)
 }
 
+// Fields drop in declaration order. If a backend callback panics, unwinding must
+// stop and destroy the VM before devices (which own dynamic RAM) and base RAM.
 struct Runtime<VM: VirtualMachine, BS: BlockStorage, ND: NetDevice> {
+    vm: Option<VM>,
     layout: MachineLayout,
     devices: Vec<Mmio<Device<BS, ND>>>,
-    vm: Option<VM>,
-    base: Option<GuestMemoryMmap>,
+    base: Vec<Arc<GuestRegionMmap>>,
     mapped: usize,
     has_memory: bool,
+    strict: bool,
 }
 
 impl<VM: VirtualMachine, BS: BlockStorage, ND: NetDevice> Runtime<VM, BS, ND> {
@@ -74,23 +78,21 @@ impl<VM: VirtualMachine, BS: BlockStorage, ND: NetDevice> Runtime<VM, BS, ND> {
             m.0.attach_at(layout.hotplug.unwrap().address)?;
         }
         let has_memory = memory.is_some();
-        let mut devices: Vec<Mmio<Device<BS, ND>>> = blocks
+        let devices: Vec<Mmio<Device<BS, ND>>> = blocks
             .into_iter()
-            .map(|(n, b)| Block::new(n, b).map(|d| Mmio::new(Device::Block(d))))
+            .map(|(n, b)| Block::new(n, b).map(Device::Block))
+            .chain(net.map(|n| Net::new(n).map(Device::Net)))
+            .chain(memory.map(|m| Ok(Device::Mem(m.0))))
+            .map(|d| d.map(|d| Mmio::new(d).with_strict(config.strict)))
             .collect::<std::result::Result<_, crate::error::DeviceError>>()?;
-        if let Some(n) = net {
-            devices.push(Mmio::new(Device::Net(Net::new(n)?)));
-        }
-        if let Some(m) = memory {
-            devices.push(Mmio::new(Device::Mem(m.0)));
-        }
         Ok(Self {
+            vm: None,
             layout,
             devices,
-            vm: None,
-            base: None,
+            base: Vec::new(),
             mapped: 0,
             has_memory,
+            strict: config.strict,
         })
     }
 
@@ -100,25 +102,24 @@ impl<VM: VirtualMachine, BS: BlockStorage, ND: NetDevice> Runtime<VM, BS, ND> {
         platform: &P,
         control: &crate::VmControl,
     ) -> Result<GuestMemoryMmap> {
-        let ranges = self
-            .layout
-            .ram
-            .iter()
-            .map(|r| (GuestAddress(r.address), r.size as usize))
-            .collect::<Vec<_>>();
-        self.base =
-            Some(GuestMemoryMmap::from_ranges(&ranges).map_err(crate::error::MemoryError::from)?);
-        let view = self.base.as_ref().unwrap().clone();
+        for r in &self.layout.ram {
+            self.base.push(Arc::new(
+                GuestRegionMmap::from_range(GuestAddress(r.address), r.size as usize, None)
+                    .map_err(crate::error::MemoryError::from)?,
+            ));
+        }
+        let view = GuestMemoryMmap::from_arc_regions(self.base.clone())
+            .map_err(crate::error::MemoryError::from)?;
         if control.stopping() {
             return Ok(view);
         }
         self.vm = Some(platform.create(config)?);
         let vm = self.vm.as_mut().unwrap();
-        for region in self.base.as_ref().unwrap().iter() {
+        for region in &self.base {
             if control.stopping() {
                 return Ok(view);
             }
-            vm.map(region)?;
+            vm.map(region.clone())?;
             self.mapped += 1;
         }
         if control.stopping() {
@@ -151,12 +152,21 @@ impl<VM: VirtualMachine, BS: BlockStorage, ND: NetDevice> Runtime<VM, BS, ND> {
             }
             if let Some(request) = control.next() {
                 let vm = self.vm.as_mut().unwrap();
-                let outcome = match request.operation {
-                    crate::control::Operation::Pause if !paused => vm.pause(),
-                    crate::control::Operation::Resume if paused => vm.resume(),
-                    _ => Ok(()),
+                // Ok(true): the guest or a vCPU is already ending the VM.
+                let stopping = match request.operation {
+                    crate::control::Operation::Pause if !paused => {
+                        vm.pause().map(|o| o == PauseOutcome::Stopping)
+                    }
+                    crate::control::Operation::Resume if paused => vm.resume().map(|()| false),
+                    _ => Ok(false),
                 }
                 .map_err(crate::Error::from);
+                if let Ok(true) = stopping {
+                    // Terminate without resuming; stop reports any fault.
+                    control.reject_stopping(request);
+                    break;
+                }
+                let outcome = stopping.map(drop);
                 if outcome.is_ok() {
                     paused = matches!(request.operation, crate::control::Operation::Pause);
                 }
@@ -169,14 +179,16 @@ impl<VM: VirtualMachine, BS: BlockStorage, ND: NetDevice> Runtime<VM, BS, ND> {
                 continue;
             }
             poll_input(&mut serial)?;
-            self.vm.as_mut().unwrap().set_irq(
-                self.layout.uart.irq,
-                serial.state().interrupt_identification & 1 == 0,
-            )?;
+            self.vm
+                .as_mut()
+                .unwrap()
+                .set_irq(self.layout.uart.irq, uart_level(&serial))?;
             for device in &mut self.devices {
                 device.poll(&view)?;
             }
-            self.process_memory(&mut view)?;
+            if self.process_memory(&mut view)?.is_break() {
+                break;
+            }
             let vm = self.vm.as_mut().unwrap();
             for (device, region) in self.devices.iter().zip(&self.layout.virtio) {
                 vm.set_irq(region.irq, device.interrupt_pending())?;
@@ -190,9 +202,10 @@ impl<VM: VirtualMachine, BS: BlockStorage, ND: NetDevice> Runtime<VM, BS, ND> {
         Ok(())
     }
 
-    fn process_memory(&mut self, view: &mut GuestMemoryMmap) -> Result<()> {
+    /// Break means the VM began stopping before the transaction; it never resumes.
+    fn process_memory(&mut self, view: &mut GuestMemoryMmap) -> Result<ControlFlow<()>> {
         if !self.has_memory {
-            return Ok(());
+            return Ok(ControlFlow::Continue(()));
         }
         let vm = self.vm.as_mut().unwrap();
         let last = self.devices.len() - 1;
@@ -202,23 +215,33 @@ impl<VM: VirtualMachine, BS: BlockStorage, ND: NetDevice> Runtime<VM, BS, ND> {
         {
             self.devices[last].config_changed();
         }
-        if active && self.devices[last].queues.available(0, view)? != 0 {
-            vm.pause()?;
-            let pinned = self
-                .devices
-                .iter()
-                .map(|d| d.queues.pinned(view))
-                .collect::<std::result::Result<Vec<_>, crate::error::DeviceError>>()?
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>();
-            let device = &mut self.devices[last];
-            if let Device::Mem(d) = &mut device.device {
-                d.process(&mut device.queues, vm, view, &pinned)?;
-            }
-            vm.resume()?;
+        if !active {
+            return Ok(ControlFlow::Continue(()));
         }
-        Ok(())
+        let available = self.devices[last].queues.available(0, view);
+        if !matches!(self.devices[last].contain(available)?, Some(n) if n != 0) {
+            return Ok(ControlFlow::Continue(()));
+        }
+        if vm.pause()? == PauseOutcome::Stopping {
+            return Ok(ControlFlow::Break(()));
+        }
+        // Scan each device separately: in lenient mode a corrupt queue isolates
+        // only its device, whose stopped queues then need no pins.
+        let mut pinned = Vec::new();
+        for device in self.devices.iter_mut().filter(|d| !d.needs_reset()) {
+            let pins = device.queues.pinned(view);
+            pinned.extend(device.contain(pins)?.into_iter().flatten());
+        }
+        let device = &mut self.devices[last];
+        if !device.needs_reset() {
+            let Device::Mem(d) = &mut device.device else {
+                unreachable!()
+            };
+            let result = d.process(&mut device.queues, vm, view, &pinned);
+            device.contain(result)?;
+        }
+        vm.resume()?;
+        Ok(ControlFlow::Continue(()))
     }
 
     fn handle_io<SI: SerialIo>(
@@ -227,40 +250,46 @@ impl<VM: VirtualMachine, BS: BlockStorage, ND: NetDevice> Runtime<VM, BS, ND> {
         view: &GuestMemoryMmap,
         serial: &mut Serial<Irq, vm_superio::serial::NoEvents, SI>,
     ) -> Result<()> {
-        if !matches!(a.width, 1 | 2 | 4 | 8) {
-            return Err(RuntimeError::InvalidIoWidth { width: a.width }.into());
-        }
-        let contains = |r: &IoRegion| {
-            a.space == r.space
-                && a.address >= r.address
-                && a.address
-                    .checked_add(a.width as u64)
-                    .is_some_and(|e| e <= r.address + r.size)
+        let within = |r: &IoRegion| {
+            a.space == r.space && a.address.checked_sub(r.address).is_some_and(|o| o < r.size)
         };
-        let value = if contains(&self.layout.uart)
-            && a.address - self.layout.uart.address < 8
-            && a.width == 1
-        {
-            let offset = (a.address - self.layout.uart.address) as u8;
-            if a.write {
-                serial
-                    .write(offset, a.value as u8)
-                    .map_err(crate::error::SerialError::from)?;
-                0
+        let fits = |r: &IoRegion| {
+            matches!(a.width, 1 | 2 | 4 | 8)
+                && (a.address - r.address)
+                    .checked_add(a.width as u64)
+                    .is_some_and(|e| e <= r.size)
+        };
+        // None: the access starts in a device window but decodes to no register.
+        let (value, irq, level) = if within(&self.layout.uart) {
+            let offset = a.address - self.layout.uart.address;
+            let value = if offset < 8 && a.width == 1 {
+                Some(if a.write {
+                    serial
+                        .write(offset as u8, a.value as u8)
+                        .map_err(crate::error::SerialError::from)?;
+                    0
+                } else {
+                    serial.read(offset as u8) as u64
+                })
             } else {
-                serial.read(offset) as u64
-            }
-        } else if let Some(slot) = self.layout.virtio.iter().position(contains) {
-            let offset = a.address - self.layout.virtio[slot].address;
-            if a.write {
-                if a.width != 4 {
-                    return Err(RuntimeError::InvalidMmioWidth { width: a.width }.into());
-                }
-                self.devices[slot].write(offset, a.value as u32, view)?;
-                0
+                None
+            };
+            (value, self.layout.uart.irq, uart_level(serial))
+        } else if let Some(slot) = self.layout.virtio.iter().position(within) {
+            let region = self.layout.virtio[slot];
+            let device = &mut self.devices[slot];
+            let offset = a.address - region.address;
+            let value = if !fits(&region) {
+                None
+            } else if !a.write {
+                device.read(offset, a.width)
+            } else if a.width == 4 {
+                device.write(offset, a.value as u32, view)?;
+                Some(0)
             } else {
-                self.devices[slot].read(offset, a.width)
-            }
+                None
+            };
+            (value, region.irq, device.interrupt_pending())
         } else {
             return Err(RuntimeError::UnmappedIo {
                 address: a.address,
@@ -268,15 +297,33 @@ impl<VM: VirtualMachine, BS: BlockStorage, ND: NetDevice> Runtime<VM, BS, ND> {
             }
             .into());
         };
-        self.vm.as_mut().unwrap().complete_io(a.completion, value)?;
+        let value = match value {
+            Some(value) => value,
+            None if self.strict => {
+                return Err(RuntimeError::InvalidAccess {
+                    address: a.address,
+                    width: a.width,
+                    write: a.write,
+                }
+                .into());
+            }
+            // Lenient: no side effects; reads see an unclaimed bus.
+            None if a.write => 0,
+            None if a.width >= 8 => u64::MAX,
+            None => (1 << (8 * a.width)) - 1,
+        };
+        let vm = self.vm.as_mut().unwrap();
+        // An InterruptACK, IIR read or notification may change the level; the
+        // vCPU must not resume and observe the device before the GIC does.
+        vm.set_irq(irq, level)?;
+        vm.complete_io(a.completion, value)?;
         Ok(())
     }
 
-    fn cleanup(mut self) -> Result<()> {
-        // Keep both base and dynamic allocations alive through VM destruction.
-        if let Some(vm) = &mut self.vm {
-            vm.stop();
-        }
+    /// Returns the vCPU fault from `stop` and the first cleanup error. Every step
+    /// runs regardless of earlier failures.
+    fn cleanup(mut self) -> (std::result::Result<(), PlatformError>, Result<()>) {
+        let fault = self.vm.as_mut().map_or(Ok(()), |vm| vm.stop());
         let mut cleanup = Ok(());
         for device in &self.devices {
             if let Err(e) = device.flush()
@@ -287,25 +334,30 @@ impl<VM: VirtualMachine, BS: BlockStorage, ND: NetDevice> Runtime<VM, BS, ND> {
         }
         if let Some(vm) = &mut self.vm {
             for d in &self.devices {
-                if let Device::Mem(m) = &d.device {
-                    m.stop(vm);
+                if let Device::Mem(m) = &d.device
+                    && let Err(e) = m.stop(vm)
+                    && cleanup.is_ok()
+                {
+                    cleanup = Err(e.into());
                 }
             }
-            if let Some(base) = &self.base {
-                for r in base.iter().take(self.mapped) {
-                    if let Err(e) = vm.unmap(r)
-                        && cleanup.is_ok()
-                    {
-                        cleanup = Err(e.into());
-                    }
+            for r in self.base.iter().take(self.mapped) {
+                if let Err(e) = vm.unmap(r)
+                    && cleanup.is_ok()
+                {
+                    cleanup = Err(e.into());
                 }
             }
         }
         drop(self.vm);
         drop(self.base);
         drop(self.devices);
-        cleanup
+        (fault, cleanup)
     }
+}
+
+fn uart_level<SI: SerialIo>(serial: &Serial<Irq, vm_superio::serial::NoEvents, SI>) -> bool {
+    serial.state().interrupt_identification & 1 == 0
 }
 
 struct Irq;

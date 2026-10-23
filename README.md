@@ -28,6 +28,8 @@ poweroff
 
 只读盘使用 `mount -o ro /dev/vda /data`。程序不会自动格式化或自动挂载数据盘。不传 `--disk` 时没有 `/dev/vda`。基础 RAM 最低 128 MiB，默认 512 MiB；无固定容量上限，受 HVF IPA 地址范围和主机资源限制。
 
+默认以 strict 模式运行：客户机违反 virtio 或设备协议即停止整个 VM，便于尽早暴露问题。`./w-vmm run --lenient ...` 改为把客户机错误限制在出错设备内，详见下文“客户机错误处理”。
+
 `poweroff` 正常关机；`reboot` 使宿主进程退出，需要重新执行命令启动。宿主 `Ctrl-]` 可退出，`Ctrl-C` 传给客户机 shell。SIGINT、SIGTERM、SIGHUP 会使宿主停止 vCPU、刷新磁盘并恢复终端。强制退出前应在客户机执行 `sync` / `umount`；宿主只能刷新已经收到的磁盘请求，不能代替客户机刷新文件系统。SIGKILL 或宿主崩溃无法执行清理。
 
 ## 从源码准备与构建
@@ -89,7 +91,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`VmConfig` 配置 `memory_mib` 和 `vcpu_count`。后端由调用方创建并交给泛型入口：
+`VmConfig` 配置 `memory_mib`、`vcpu_count` 和 `strict`（默认 `true`，见“客户机错误处理”）。后端由调用方创建并交给泛型入口：
 
 ```rust,ignore
 impl<BS: BlockStorage, ND: NetDevice, SI: SerialIo> Vmm<BS, ND, SI> {
@@ -125,6 +127,8 @@ fn run(serial: impl SerialIo) -> Result<(), Box<dyn std::error::Error>> {
 普通 vmnet TX 直接发送 guest 分段；背压时复制一次到可复用宿主快照，后续重试使用该快照，reset 丢弃它。RX 在容量达到最大帧长且分段不重叠时直接写入 guest；无包会撤销出队，小缓冲和重叠区间使用可复用回退缓冲。设备层将 guest 分段直接传递给 `NetDevice` / `BlockStorage`，这里的“零拷贝”限定于自定义接口边界，不保证具体后端内部零拷贝。
 
 `Disk` 固定使用官方 imago `=0.2.5`，启用 `sync` 和 `vm-memory` features，不引入 vendor 或补丁。通过官方 `IoVectorMut::from_volatile_slice` / `IoVector::from_volatile_slice` 转换器将 guest 分段缓冲直接传给同步 `readv` / `writev`，guard 保持到调用结束；内部缓冲和引用处理由 imago 管理。普通数据路径省去请求级用户态 payload 中转复制；压缩簇、对齐回退和内核数据搬运不属于零拷贝承诺。
+
+**已知限制（共享内存别名）：** imago 0.2.5 在内部把 guest `VolatileSlice` 转换为普通 Rust slice（`io_buffers.rs` 的 `from_raw_parts(_mut)`，零填充路径的 `fill`）。这些页属于 guest 共享内存，其他 vCPU 可能同时访问，按 Rust 别名模型属于未定义行为。为保留零拷贝，目前有意接受这一限制，等待 imago 上游修复；自定义 `BlockStorage` 后端不应仿照这种做法。
 
 完整请求的长度溢出及容量范围在任何 I/O 前校验，忽略空段，按宿主 `IOV_MAX` 分批（查询失败使用 16）；读取目标重叠时先完成当前批次，再按原顺序推进磁盘偏移。读取失败可能已修改部分目标，设备仍报告 IOERR。只读检查、空请求和刷新语义保持不变。
 
@@ -163,6 +167,46 @@ fn flush_backend(file: &std::fs::File) -> Result<(), StorageError> {
 `StorageError`、`NetError`、`MemoryError`、`PlatformError` 的 `Backend` 接受 `Box<dyn std::error::Error + Send + Sync + 'static>`；这些约束只作用于错误，后端对象仍无需 `Send` / `Sync`。外部项目可选用 `thiserror 2` 定义自己的错误。
 
 错误变体保留容量、地址、请求长度、状态码等字段，I/O 上下文保留操作、路径及原始 `source`。可以匹配具体变体，使用标准 `Error::source()` 遍历原因，或用 `w_vmm::error::diagnostic(&error)` 输出完整诊断。控制线程回复和 `VmStatus::final_error` 仍为字符串；回复失败与重复 `stop()` 的清理失败分别返回 `ControlError::ReplyFailed`、`ControlError::CleanupFailed`，保留相同诊断。
+
+## 客户机错误处理（strict / lenient）
+
+`VmConfig::strict` 默认为 `true`，适合测试和 fuzz：任何客户机协议错误都会让 `run()` 返回错误。设为 `false`（demo 为 `--lenient`）时，客户机错误只影响出错的设备：
+
+```rust,ignore
+let config = VmConfig { strict: false, ..VmConfig::default() };
+```
+
+| 情形 | strict（默认） | lenient |
+| --- | --- | --- |
+| 非法寄存器写入（清除状态位、队列未就绪时 DRIVER_OK、非法 QueueReady/QueueNum、DRIVER_OK 后重新配置或启用队列） | `DeviceError` 退出 | 忽略本次写入且不产生任何副作用，按 2 的幂次限流记录日志 |
+| 队列或描述符损坏（环溢出、越界、环路、间接描述符、不可信的块状态描述符、非法网络帧方向或长度、virtio-mem 请求缓冲不合法） | `DeviceError` 退出 | 仅该设备置 `DEVICE_NEEDS_RESET (0x40)` 并停止其数据面；已设置 DRIVER_OK 时发送配置变更中断（InterruptStatus bit 1）。该状态只能由设备复位（写状态 0）清除 |
+| 设备窗口内无法解码的访问（宽度非 1/2/4/8、virtio 寄存器非 32 位访问、UART 非单字节访问、配置空间越过窗口） | `RuntimeError::InvalidAccess` 退出 | 读返回对应宽度的全 1，写忽略 |
+| 访问起点不在任何已声明窗口内 | `RuntimeError::UnmappedIo` 退出 | 同左 |
+| 块请求格式错误或后端 I/O 失败（状态描述符可信） | 完成请求并返回 IOERR，未知操作返回 UNSUPP | 同左 |
+| 宿主错误：后端失败（含复位时的磁盘刷新）、后端违反接口约定（如网络帧长度越界）、HVF 调用失败 | 退出 | 同左 |
+| virtio-mem 映射失败 | 完整回滚成功时向客户机返回失败响应；回滚失败退出 | 同左 |
+
+两种模式共同的规则：
+
+- 状态写入先校验再提交。驱动选择的特性不受支持时，FEATURES_OK 写入会被清除（规范规定的拒绝方式）；同一次写入若还设置了 DRIVER_OK，整次写入被拒绝，状态保持不变。QueueReady=1 校验失败时恢复为未就绪。
+- DRIVER_OK 之后允许写 QueueReady=0 停用队列，但不支持再次启用（需要设备复位）。停用的队列不再接受通知、轮询和动态内存 pin 扫描，网络设备挂起的 TX 帧也不再重试，直到复位。
+- 动态内存事务逐个设备扫描待处理描述符：lenient 下出错的设备被隔离，其队列不再参与 pin；virtio-mem 自身被隔离时跳过本次请求处理并恢复 vCPU。
+- 设备状态变化后先更新中断电平，再完成 vCPU 的 I/O（包括 InterruptACK 和读取 UART IIR），vCPU 不会看到过期的中断线。
+
+### 迁移
+
+- `VmConfig` 新增公开字段 `strict`，默认 `true`。结构体字面量需要补上该字段或 `..VmConfig::default()`。默认值沿用 fail-stop，但 strict 比以前更严格，见下文“行为变化”。
+- 删除的错误变体：
+  - `DeviceError::BlockRequestTooLarge`：块设备不再限制单请求总长度（原上限 1 MiB），改为声明 `SEG_MAX=126`。匹配该变体的分支需要删除。
+  - `PlatformError::VmStoppedDuringMemoryTransaction`：由 `PauseOutcome::Stopping` 取代，见“平台接口迁移”。
+- `RuntimeError::InvalidIoWidth { width }` 和 `RuntimeError::InvalidMmioWidth { width }` 合并为 `RuntimeError::InvalidAccess { address, width, write }`。
+- 行为变化（strict 默认开启，因此默认配置即受影响）：
+  - virtio 寄存器区（窗口偏移 `0x100` 以下）的非 32 位读取：以前返回 0，VM 继续运行；现在 strict 下 `run()` 以 `InvalidAccess` 退出，lenient 下返回全 1。配置空间（偏移 `0x100` 起）的 1/2/4/8 字节读取不受影响。
+  - virtio 寄存器的非 32 位写入：以前报 `InvalidMmioWidth`；现在 strict 下报 `InvalidAccess`，lenient 下忽略。
+  - 宽度不是 1/2/4/8 的访问：以前不论地址一律报 `InvalidIoWidth`；现在起点在已声明窗口内时按 `InvalidAccess` 处理，否则报 `UnmappedIo`。
+  - 多字节或偏移 8 及以上的 UART 访问、越过 virtio 窗口末尾的访问：以前报 `UnmappedIo`；现在起点在窗口内即按 `InvalidAccess` 处理。
+- 设备树中 UART 的 `reg` 从 `0x1000` 改为 8 字节，与平台布局声明的窗口一致。
+- 允许在 DRIVER_OK 之后写 QueueReady=0；以前会报 `QueueConfigurationAfterDriverOk`。
 
 ## 多核与动态内存
 
@@ -223,9 +267,11 @@ println!("{:?}", control.status());
 
 `pause()` 等待全部 vCPU（含异常处理和 MMIO 回写）与设备处理暂停；`resume()` 等待解除暂停并恢复调度。重复暂停、恢复幂等。暂停期间不处理 guest MMIO、块设备、网络设备或动态内存映射；串口不读取输入，普通输入和 Ctrl-] 留在宿主缓冲区，恢复后才处理。暂停等待仅由控制通知唤醒，没有定时轮询；demo 的 SIGINT、SIGTERM、SIGHUP 和控制停止命令在暂停期间仍有效。内部动态映射使用的短暂暂停不改变对外生命周期。`VmControl::set_requested_mib` 在启动前和暂停期间均可设置，仍只确认宿主目标值，客户机在运行后异步扩缩容。
 
-`stop()` 等待 vCPU 停止、全部磁盘刷新和资源释放，重复调用返回保存的清理结果。它不是客户机正常关机，不包含内存转储或快照恢复。三个阻塞方法均不设超时；从 VMM 运行线程（包括设备回调）调用会立即报错，`status()` 随时可读。
+`stop()` 等待 vCPU 停止、全部磁盘刷新和资源释放，重复调用返回保存的清理结果。它只报告清理失败（磁盘刷新、撤销映射等）；客户机或 vCPU 故障即使与停止同时发生，也只通过 `run()` 返回值和 `final_error` 报告，不会让 `stop()` 失败。它不是客户机正常关机，不包含内存转储或快照恢复。三个阻塞方法均不设超时；从 VMM 运行线程（包括设备回调）调用会立即报错，`status()` 随时可读。
 
-生命周期为 `Created / Starting / Running / Paused / Stopping / Stopped`，状态包含可选的 `final_error`。尚未运行时暂停、恢复报错；启动前停止会取消 VM 并拒绝随后运行，启动中停止在初始化安全边界进入清理。停止优先取消未执行的暂停、恢复请求。启动失败、运行错误、客户机关机和丢弃未运行的 VM 均更新最终状态并通知等待者；暂停或恢复失败也会终止并清理。
+生命周期为 `Created / Starting / Running / Paused / Stopping / Stopped`，状态包含可选的 `final_error`。尚未运行时暂停、恢复报错；启动前停止会取消 VM 并拒绝随后运行，启动中停止在初始化安全边界进入清理。停止优先取消未执行的暂停、恢复请求。暂停与客户机关机或 vCPU 故障竞争时，`pause()` 返回 `ControlError::ReplyFailed("VM is stopping")` 并立即进入清理，正常关机仍以成功结束，真实故障不会被这条停止错误掩盖。启动失败、运行错误、客户机关机和丢弃未运行的 VM 均更新最终状态并通知等待者；暂停或恢复失败也会终止并清理。
+
+`run()` 与 `final_error` 的错误优先级：运行主错误（启动、设备、轮询等）> 平台 `stop` 返回的 vCPU 故障 > 清理错误。无论前面是否已有错误，停止 vCPU、刷新每块磁盘、撤销动态和基础映射都会全部尝试。
 
 ```sh
 # 无需配置 virtio-mem
@@ -288,9 +334,9 @@ cargo build -p w-vmm --lib --locked
 python3 scripts/smoke.py --binary dist/w-vmm
 ```
 
-单元测试覆盖串口双向字节、FIFO 容量、空输入、读写/刷新错误、控制字节直通和 trait 对象，以及设备树与多设备地址分配、公共 MMIO 协商/复位/双队列/中断、描述符校验、多盘状态隔离、磁盘 I/O 错误、网络分散缓冲收发、背压重试、短缓冲丢包和后端错误。
+单元测试覆盖串口双向字节、FIFO 容量、空输入、读写/刷新错误、控制字节直通和 trait 对象，以及设备树与多设备地址分配、公共 MMIO 协商/复位/双队列/中断、描述符校验、多盘状态隔离、磁盘 I/O 错误、网络分散缓冲收发、背压重试、短缓冲丢包和后端错误，以及 strict/lenient 错误分类、寄存器写入原子性、设备隔离与复位、停用队列（含挂起的网络 TX）被通知/轮询/pin 扫描跳过、宿主错误始终致命和“先更新中断再完成 I/O”的顺序。
 
-冒烟脚本仅创建临时测试盘，日志保存在 `test-results/`。执行真实 HVF 启动、shell 命令、多盘 serial 映射与独立持久化、ext4 挂载、192 KiB 随机数据写入与 SHA-256 校验、同步/卸载/关机/重启读回、只读镜像哈希不变、重复打开锁冲突、损坏文件、宿主文件大小限制导致的真实 EFBIG、重启退出和信号/快捷键后的终端恢复。关机后调用 `qemu-img check`。
+冒烟脚本仅创建临时测试盘，日志保存在 `test-results/`。执行真实 HVF 启动、shell 命令、多盘 serial 映射与独立持久化、ext4 挂载、192 KiB 随机数据写入与 SHA-256 校验、同步/卸载/关机/重启读回、只读镜像哈希不变、只读盘上 `max_segments` 为 126 且 4 MiB 读取（含把 `max_sectors_kb` 提到硬件上限后）正常完成、重复打开锁冲突、损坏文件、宿主文件大小限制导致的真实 EFBIG、重启退出和信号/快捷键后的终端恢复。关机后调用 `qemu-img check`。
 
 离线测试把可执行文件和数据盘放入仅含这两个文件的临时目录启动。未指定网络后端时不会创建宿主网络接口；运行时不会调用外部工具。`otool -L` 的链接项包括 Hypervisor.framework、vmnet.framework 和 macOS 系统库。验收宿主为 macOS 27.0 / Apple Silicon，尚未在 macOS 15 真机上回归。
 
@@ -385,15 +431,15 @@ sudo env "PATH=$PATH" python3 scripts/smoke-net.py \
 - `src/boot.rs`：校验 ARM64 Image、RAM/内核/initramfs/FDT 布局，linux-loader 加载及 vm-fdt 设备树。
 - `src/platform/mod.rs`：`VmRuntime` trait 与按构建目标的运行时选择（`Runtime` 别名、`run()` 分派）。
 - `src/platform/macos_arm64/mod.rs`：`VmRuntime` 的 macOS/arm64 实现——调用线程上的设备事件循环与串口中断接线；`#[cfg]` 门控，仅 Apple Silicon 编译。
-- `src/platform/macos_arm64/hvf.rs`：最小 FFI、VM 映射、原生 GIC 和绑定创建线程的 RAII vCPU。VM 内存由 vm-memory 持有，先销毁 vCPU 和映射，再释放 RAM。
-- `src/devices/mmio.rs`：共享 modern virtio-mmio、功能协商、队列配置、描述符校验、复位及中断确认。
-- `src/platform/macos_arm64/cpus.rs`：每核独立线程、PSCI 启停、全核暂停及统一退出。
+- `src/platform/macos_arm64/hvf.rs`：最小 FFI、VM 映射、原生 GIC 和绑定创建线程的 RAII vCPU。映射表持有每个已映射区域的 `Arc<GuestRegionMmap>`，撤销映射时校验 guest 地址、长度与分配身份，仅在 `hv_vm_unmap` 成功或 VM 销毁成功后释放；`hv_vm_destroy` 失败时有意泄漏仍映射的分配。
+- `src/devices/mmio.rs`：共享 modern virtio-mmio、功能协商、队列配置、描述符校验、复位及中断确认；寄存器写入先校验后提交，lenient 模式下隔离出错设备（DEVICE_NEEDS_RESET）。
+- `src/platform/macos_arm64/cpus.rs`：每核独立线程、PSCI 启停、全核暂停及统一退出。MMIO 写值按访问宽度截断；未停止时回复通道断开属于 vCPU 故障。
 - `src/devices/memory.rs`：公开 `VirtioMem`、可跨线程克隆的控制句柄与生命周期；virtio-mem 请求与按配置块大小事务映射、回滚、回收。
 - `demo/src/control.rs`：可选本地 Unix socket JSON 服务与客户端。
-- `src/devices/block.rs`：磁盘请求与配置，单个 128 项 split virtqueue，IN/OUT/FLUSH/GET_ID，单请求上限 1 MiB。
+- `src/devices/block.rs`：磁盘请求与配置，单个 128 项 split virtqueue，IN/OUT/FLUSH/GET_ID；声明 `SEG_MAX=126`（队列长度减去头部和状态描述符），不声明 `SIZE_MAX`，不限制单请求总长度。
 - `src/devices/net.rs`：网络请求与配置，RX/TX 各 128 项队列，完整帧收发与发送背压。
 - `src/net.rs`、`src/net/macos.rs`：`NetDevice` trait 与 macOS vmnet NAT 后端。
-- `src/storage.rs`：imago 原生同步 qcow2、同 inode 文件锁、范围校验、内部缓存 flush 与宿主 sync/fsync。
+- `src/storage.rs`：imago 原生同步 qcow2、同 inode 文件锁、范围校验、内部缓存 flush 与一次宿主 sync（imago 对同一 inode 执行 `sync_all`，macOS 上为 F_FULLFSYNC）。
 - `src/serial.rs`：`SerialIo` trait、Box 转发和 FIFO 输入轮询。
 - `demo/src/terminal.rs`：原始终端、非阻塞输入、Ctrl-] 与信号恢复，CLI 和网络示例共用。
 - `src/lib.rs`：`VmConfig` / `Vmm::new(config, blocks, net, memory, serial).run()`，委托 `platform::run`。
@@ -401,7 +447,7 @@ sudo env "PATH=$PATH" python3 scripts/smoke-net.py \
 
 设备 MMIO：GIC distributor `0x08000000`，16550 `0x09000000`（SPI 33），virtio 设备从 `0x0a000000` 开始，每个占 `0x1000`，中断从 SPI 34 递增。先按名称排列磁盘，再放置可选网卡和 virtio-mem，每个设备使用独立 MMIO 和中断。GIC redistributor 位于 `0x10000000`，RAM 位于 `0x40000000`。实际可用 SPI 范围、定时器 INTID 和 redistributor 空间大小查询 HVF；设备超出范围时启动报错。
 
-目前无图形、快照、CPU 热添加或其他宿主平台。设备事件循环空闲等待最多 2 ms，网络每轮每方向最多处理 64 个包，存储请求同步执行，未做吞吐/延迟优化。非法设备访问/队列结构会报错并退出；普通磁盘请求 I/O 错误返回 virtio IOERR 并记录原因。此实现尚未经过不可信客户机的安全审计。
+目前无图形、快照、CPU 热添加或其他宿主平台。设备事件循环空闲等待最多 2 ms，网络每轮每方向最多处理 64 个包，存储请求同步执行，未做吞吐/延迟优化。默认 strict 模式下，非法设备访问和损坏的队列结构会报错并退出；lenient 模式下的处理见“客户机错误处理”，宿主错误在两种模式下都会退出。磁盘请求的状态描述符可信（最后一个描述符为 1 字节、设备可写且位于 guest 内存内）时，格式错误的请求和 I/O 错误返回 virtio IOERR 并记录原因，未知操作返回 UNSUPP，两者都正常完成，与 strict 无关；状态描述符不可信时，strict 下退出，lenient 下隔离该块设备（置 `DEVICE_NEEDS_RESET`）。损坏的队列或描述符链（地址越界、非法标志、间接描述符、环路等）在到达请求校验之前就会被拒绝：strict 下退出，lenient 下隔离该设备。此实现尚未经过不可信客户机的安全审计。
 
 第三方来源与许可见 [THIRD_PARTY.md](THIRD_PARTY.md)。
 
@@ -421,6 +467,22 @@ cargo run -p w-vmm --example platform
 
 `prepare` 接收已映射的基础 RAM 和布局，由平台加载客户机、设置启动寄存器和中断控制器。`start` 启动执行，`poll_event` 返回 I/O、关机或轮询错误；无事件返回 `None`。I/O 的完成凭据由平台定义，库处理设备后调用 `complete_io`，平台回填寄存器并推进指令。平台与设备后端不要求 `Send` / `Sync`，线程约束由平台内部处理。
 
-`Mapper::map/unmap` 单次失败必须不留部分变更。映射借用分配，不能提前释放；`pause` 成功必须表示全部 vCPU 已静止。动态映射成功或回滚成功后恢复，回滚失败直接进入停止流程。`stop` 必须停止并回收所有 vCPU，支持部分启动和重复调用；VM 析构也必须支持重复清理。清理顺序为停止 vCPU、尝试刷新每块磁盘、撤销映射、销毁 VM，最后释放基础 RAM、动态 RAM 和回滚保留分配。
+`Mapper::map/unmap` 单次失败必须不留部分变更。`map` 接收 `Arc<GuestRegionMmap>`，成功后由平台 VM 持有该分配，直到 `unmap` 成功或 VM 销毁；库和调用方可以随时丢弃自己的引用。`unmap` 必须校验 guest 地址、长度及分配身份（`Arc::ptr_eq(&a.get_mmap(), &b.get_mmap())`，包装同一分配的另一个 `GuestRegionMmap` 视为同一映射），失败时继续持有分配；VM 销毁失败时宁可泄漏也不能释放仍被引用的内存。回滚未能撤销的映射同样由平台持有，库不再另行保留。
+
+`pause` 返回 `PauseOutcome::Paused` 表示全部 vCPU 已静止；VM 已因客户机关机或 vCPU 故障进入停止时返回 `PauseOutcome::Stopping`，此时库不会调用 `resume`：动态映射事务直接结束，宿主暂停请求以 "VM is stopping" 失败，运行随即进入清理。动态映射成功或回滚成功后恢复，回滚失败直接进入停止流程。`stop` 必须先停止并回收全部 vCPU（支持部分启动），再取出全部待处理事件，返回第一个尚未由 `poll_event` 报告的 vCPU 故障；重复调用返回 `Ok`。正常关机、运行错误、启动失败、宿主停止都经过同一次 `stop`。VM 析构也必须支持重复清理。清理顺序为停止 vCPU、尝试刷新每块磁盘、撤销映射、销毁 VM，最后释放基础 RAM 与动态 RAM。
+
+### 平台接口迁移
+
+自定义平台从上一版本升级时：
+
+| 旧接口 | 新接口 | 迁移要点 |
+| --- | --- | --- |
+| `fn map(&mut self, region: &GuestRegionMmap)` | `fn map(&mut self, region: Arc<GuestRegionMmap>)` | 在映射表中保存 `Arc`，`unmap` 成功后移除，VM 析构时释放；不要再依赖调用方保持分配存活 |
+| `fn unmap(&mut self, region: &GuestRegionMmap)` | 签名不变 | 增加地址、长度和分配身份校验；失败时保留表项 |
+| `fn pause(&mut self) -> Result<()>` | `fn pause(&mut self) -> Result<PauseOutcome>` | 原先“暂停时已停止”返回的错误改为 `Ok(PauseOutcome::Stopping)`；正常暂停返回 `Ok(PauseOutcome::Paused)` |
+| `fn stop(&mut self)` | `fn stop(&mut self) -> Result<()>` | 先回收全部 vCPU 再排空事件，返回第一个未报告的故障；重复调用返回 `Ok` |
+| `PlatformError::VmStoppedDuringMemoryTransaction` | 已删除 | 由 `PauseOutcome::Stopping` 取代 |
+
+内置 HVF 平台新增的 `PlatformError` 变体：`MmioReplyDisconnected`（未停止时 MMIO 回复通道断开）、`MappingOverlap`、`MappingNotFound`、`MappingMismatch`（映射表校验）。`VmControl::stop()` 只返回清理结果；执行故障（包括只在平台 `stop` 时才发现的 vCPU 故障）通过 `run()` 返回值和 `status().final_error` 报告。完整示例见 [`examples/platform.rs`](examples/platform.rs)。
 
 `memory::VirtioMem` 封装私有设备，库根的 `VirtioMem` / `MemoryStatus` / `MemoryLifecycle` 导出保持兼容。设备块大小由使用者配置，容量和区域起点按 `max(128 MiB, block_size)` 对齐，目标按设备块大小校验；平台不推断或配置 guest 热插拔块大小。多架构接口不保证任意 guest 内核的热插拔兼容性。

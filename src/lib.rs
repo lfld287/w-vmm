@@ -21,6 +21,12 @@ use storage::BlockStorage;
 pub struct VmConfig {
     pub memory_mib: u64,
     pub vcpu_count: u32,
+    /// Fail-stop on guest protocol errors (the default, for tests and fuzzing).
+    /// When false, an invalid register write is ignored, a corrupt queue or
+    /// untrusted descriptor isolates only its device with DEVICE_NEEDS_RESET,
+    /// and an undecodable access inside a device window reads all ones and
+    /// ignores writes. Host and backend failures are fatal in both modes.
+    pub strict: bool,
 }
 
 impl Default for VmConfig {
@@ -28,6 +34,7 @@ impl Default for VmConfig {
         Self {
             memory_mib: 512,
             vcpu_count: 1,
+            strict: true,
         }
     }
 }
@@ -139,7 +146,7 @@ mod tests {
         let vm = Vmm::new(
             VmConfig {
                 memory_mib: 0,
-                vcpu_count: 1,
+                ..VmConfig::default()
             },
             BTreeMap::<String, storage::Disk>::new(),
             None::<net::macos::Vmnet>,

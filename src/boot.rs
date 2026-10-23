@@ -8,6 +8,8 @@ type Result<T> = std::result::Result<T, BootError>;
 
 pub const RAM: u64 = 0x4000_0000;
 pub const UART: u64 = 0x0900_0000;
+/// The 16550 registers; the FDT and the platform layout declare the same window.
+pub const UART_SIZE: u64 = 8;
 pub const VIRTIO_BASE: u64 = 0x0a00_0000;
 pub const VIRTIO_STRIDE: u64 = 0x1000;
 pub const GIC_DIST: u64 = 0x0800_0000;
@@ -190,7 +192,7 @@ pub fn fdt(
     f.end_node(n)?;
     let n = f.begin_node("serial@9000000")?;
     f.property_string("compatible", "ns16550a")?;
-    f.property_array_u64("reg", &[UART, 0x1000])?;
+    f.property_array_u64("reg", &[UART, UART_SIZE])?;
     f.property_u32("clock-frequency", 1843200)?;
     f.property_u32("reg-io-width", 1)?;
     f.property_array_u32("interrupts", &[0, UART_IRQ - 32, 4])?;
@@ -231,6 +233,12 @@ mod tests {
         let dtb = fdt(&l, &virtio_regions(1).unwrap(), 0x20000, [30, 27], 1, false).unwrap();
         assert_eq!(&dtb[..4], &0xd00dfeedu32.to_be_bytes());
         assert!(dtb.windows(12).any(|w| w == b"virtio,mmio\0"));
+        // The UART window covers only its eight registers.
+        let reg: Vec<u8> = [UART, UART_SIZE]
+            .iter()
+            .flat_map(|v| v.to_be_bytes())
+            .collect();
+        assert!(dtb.windows(16).any(|w| w == reg));
     }
 
     #[test]

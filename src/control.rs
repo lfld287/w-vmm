@@ -9,6 +9,8 @@ use std::{
 
 type Result<T> = std::result::Result<T, ControlError>;
 
+const STOPPING: &str = "VM is stopping";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VmLifecycle {
     Created,
@@ -148,8 +150,10 @@ impl VmControl {
             .map_err(ControlError::ReplyFailed)
     }
 
-    /// Wait for workers, disk flushing and resource destruction. Repeated calls
-    /// return the saved cleanup result. Calling before run cancels this VM.
+    /// Wait for workers, disk flushing and resource destruction. Returns only the
+    /// cleanup result; guest and vCPU faults are reported by `run` and
+    /// `VmStatus::final_error`. Repeated calls return the saved cleanup result.
+    /// Calling before run cancels this VM.
     /// In that case memory stops immediately; devices remain owned by `Vmm`
     /// until it is consumed or dropped.
     pub fn stop(&self) -> Result<()> {
@@ -173,7 +177,7 @@ impl VmControl {
 
     fn cancel(s: &mut State) {
         for r in s.queue.drain(..) {
-            let _ = r.reply.send(Err("VM is stopping".into()));
+            let _ = r.reply.send(Err(STOPPING.into()));
         }
     }
 
@@ -216,6 +220,16 @@ impl VmControl {
                 .map(|_| ())
                 .map_err(|e| crate::error::diagnostic(e)),
         );
+    }
+
+    /// The VM began terminating while serving this request; reject it and every
+    /// queued request like a host stop would.
+    pub(crate) fn reject_stopping(&self, request: Request) {
+        let mut s = self.0.state.lock().unwrap();
+        s.status.lifecycle = VmLifecycle::Stopping;
+        s.queue.push_front(request);
+        Self::cancel(&mut s);
+        self.0.changed.notify_all();
     }
 
     pub(crate) fn wait(&self) {
@@ -339,7 +353,7 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(
-            matches!(pause.join().unwrap(), Err(ControlError::ReplyFailed(message)) if message == "VM is stopping")
+            matches!(pause.join().unwrap(), Err(ControlError::ReplyFailed(message)) if message == STOPPING)
         );
         assert!(stops.iter().all(|t| !t.is_finished()));
         assert!(c.next().is_none());

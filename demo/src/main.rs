@@ -71,6 +71,10 @@ enum Command {
         /// Attach a macOS vmnet NAT interface (requires root or approved entitlement).
         #[arg(long)]
         net: bool,
+        /// Survive guest protocol errors: ignore invalid register writes and
+        /// isolate a device with a corrupt queue until the guest resets it.
+        #[arg(long)]
+        lenient: bool,
     },
 }
 
@@ -114,6 +118,7 @@ fn run(command: Command) -> Result<()> {
         control_socket,
         read_only,
         net,
+        lenient,
     } = command
     else {
         unreachable!()
@@ -139,6 +144,7 @@ fn run(command: Command) -> Result<()> {
         VmConfig {
             memory_mib,
             vcpu_count: vcpus,
+            strict: !lenient,
         },
         disks,
         network,
@@ -180,7 +186,10 @@ mod tests {
 
     #[test]
     fn block_size_cli_requires_capacity_only_when_explicit() {
-        assert!(Cli::try_parse_from(["w-vmm", "run"]).is_ok());
+        let cli = Cli::try_parse_from(["w-vmm", "run"]).unwrap();
+        assert!(matches!(cli.command, Command::Run { lenient: false, .. }));
+        let cli = Cli::try_parse_from(["w-vmm", "run", "--lenient"]).unwrap();
+        assert!(matches!(cli.command, Command::Run { lenient: true, .. }));
         assert!(Cli::try_parse_from(["w-vmm", "run", "--virtio-mem-block-size-mib", "2"]).is_err());
         let cli = Cli::try_parse_from(["w-vmm", "run", "--virtio-mem-size-mib", "128"]).unwrap();
         assert!(matches!(

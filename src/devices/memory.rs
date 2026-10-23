@@ -2,9 +2,7 @@
 use super::mmio::{self, Queues, VirtioDevice};
 use crate::error::MemoryError;
 use std::{collections::BTreeMap, sync::Arc};
-use vm_memory::{
-    Address, Bytes, GuestAddress, GuestMemoryMmap, GuestMemoryRegion, GuestRegionMmap,
-};
+use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap, GuestRegionMmap};
 
 type Result<T> = std::result::Result<T, MemoryError>;
 
@@ -25,8 +23,6 @@ pub(crate) struct VirtioMem {
     plugged: u64,
     generation: u32,
     blocks: BTreeMap<u64, Arc<GuestRegionMmap>>,
-    // A failed rollback may leave mappings alive until the platform VM is destroyed.
-    retained: Vec<Arc<GuestRegionMmap>>,
 }
 
 impl VirtioMem {
@@ -44,6 +40,8 @@ impl VirtioMem {
 
     /// Called only with every vCPU quiescent and device processing suspended.
     /// false means failure with successful rollback; Err is fatal rollback failure.
+    /// The mapper owns mapped regions, including those a failed rollback leaves
+    /// mapped, so the device keeps only committed blocks.
     fn change<M: Mapper>(
         &mut self,
         addresses: &[u64],
@@ -72,19 +70,22 @@ impl VirtioMem {
         }
         for (done, region) in regions.iter().enumerate() {
             let result = if plug {
-                mapper.map(region)
+                mapper.map(region.clone())
             } else {
                 mapper.unmap(region)
             };
             if let Err(source) = result {
                 let mut rollback = None;
                 for r in regions[..done].iter().rev() {
-                    if let Err(error) = if plug { mapper.unmap(r) } else { mapper.map(r) } {
+                    if let Err(error) = if plug {
+                        mapper.unmap(r)
+                    } else {
+                        mapper.map(r.clone())
+                    } {
                         rollback.get_or_insert(error);
                     }
                 }
                 if let Some(rollback) = rollback {
-                    self.retained.extend(regions);
                     return Err(MemoryError::RollbackFailed {
                         source: Box::new(source),
                         rollback: Box::new(rollback),
@@ -134,7 +135,6 @@ impl VirtioMem {
             generation: 0,
             control: MemoryControl::new(region_size_mib, block_size_mib),
             blocks: BTreeMap::new(),
-            retained: Vec::new(),
         })
     }
 
@@ -186,21 +186,22 @@ impl VirtioMem {
         self.control.lock().lifecycle = MemoryLifecycle::Running;
     }
 
-    /// vCPUs must be joined first. Keep allocations until after VM destruction,
-    /// including those whose mapping state became uncertain during rollback.
-    pub(crate) fn stop<M: Mapper>(&self, mapper: &mut M) {
+    /// vCPUs must be joined first. Every block is unmapped and the first error is
+    /// returned; a failed unmap leaves the allocation owned by the mapper until
+    /// VM destruction.
+    pub(crate) fn stop<M: Mapper>(&self, mapper: &mut M) -> Result<()> {
         let mut status = self.control.lock();
         status.lifecycle = MemoryLifecycle::Stopped;
         status.driver_ready = false;
-        let mut regions = BTreeMap::new();
-        for region in self.blocks.values().chain(&self.retained) {
-            regions.insert(region.start_addr().raw_value(), region);
-        }
-        for region in regions.values() {
-            if let Err(e) = mapper.unmap(region) {
-                eprintln!("final hotplug unmap: {}", crate::error::diagnostic(&e));
+        let mut result = Ok(());
+        for region in self.blocks.values() {
+            if let Err(e) = mapper.unmap(region)
+                && result.is_ok()
+            {
+                result = Err(e);
             }
         }
+        result
     }
 
     pub(crate) fn sync_target(&mut self, ready: bool) -> bool {
@@ -421,25 +422,25 @@ mod tests {
     use super::*;
     const BLOCK: u64 = 2 << 20;
     use crate::devices::mmio::{Mmio, tests::initialize};
-    use std::collections::BTreeSet;
     use vm_memory::{GuestMemoryBackend, GuestMemoryRegion};
 
+    /// Follows the ownership contract: mapped regions live until unmapped or dropped.
     #[derive(Default)]
     struct Fake {
-        mapped: BTreeSet<u64>,
+        mapped: BTreeMap<u64, Arc<GuestRegionMmap>>,
         calls: usize,
         fail: Vec<usize>,
     }
 
     impl Mapper for Fake {
-        fn map(&mut self, r: &GuestRegionMmap) -> Result<()> {
+        fn map(&mut self, r: Arc<GuestRegionMmap>) -> Result<()> {
             self.calls += 1;
             if self.fail.contains(&self.calls) {
                 return Err(MemoryError::Backend(
                     std::io::Error::other("injected map failure").into(),
                 ));
             }
-            assert!(self.mapped.insert(r.start_addr().0));
+            assert!(self.mapped.insert(r.start_addr().0, r).is_none());
             Ok(())
         }
 
@@ -450,9 +451,18 @@ mod tests {
                     std::io::Error::other("injected unmap failure").into(),
                 ));
             }
-            assert!(self.mapped.remove(&r.start_addr().0));
+            let Some(mapped) = self.mapped.remove(&r.start_addr().0) else {
+                return Err(MemoryError::Backend(
+                    std::io::Error::other("not mapped").into(),
+                ));
+            };
+            assert_eq!(mapped.as_ptr(), r.as_ptr());
             Ok(())
         }
+    }
+
+    fn weak(r: &GuestRegionMmap) -> std::sync::Weak<vm_memory::MmapRegion> {
+        Arc::downgrade(&r.get_mmap())
     }
 
     #[test]
@@ -560,7 +570,7 @@ mod tests {
         assert_eq!(d.requested, HOTPLUG_BLOCK_SIZE);
         d.start();
         assert_eq!(c.status().lifecycle, MemoryLifecycle::Running);
-        d.stop(&mut Fake::default());
+        d.stop(&mut Fake::default()).unwrap();
         assert_eq!(c.status().lifecycle, MemoryLifecycle::Stopped);
         assert!(matches!(c.set_requested_mib(0), Err(MemoryError::Stopped)));
         let unused = VirtioMem::new(HOTPLUG_BLOCK_SIZE / crate::memory::MIB, 2).unwrap();
@@ -625,7 +635,7 @@ mod tests {
                     .0,
                     0
                 );
-                allocations.extend(d.blocks.values().map(Arc::downgrade));
+                allocations.extend(d.blocks.values().map(|r| weak(r)));
             }
             assert_eq!(d.count(), blocks);
             assert_eq!(mapper.mapped.len() as u64, blocks);
@@ -641,6 +651,7 @@ mod tests {
             let block = block_mib * crate::memory::MIB;
             let (mut d, mut view, mut mapper) = setup_with(block_mib);
             assert_eq!(d.block_size, block);
+            // The second map fails and unmapping the first during rollback fails.
             mapper.fail = vec![2, 3];
             let a = d.start;
             assert!(
@@ -650,17 +661,54 @@ mod tests {
             assert_eq!(d.count(), 0);
             assert_eq!(d.control().status().plugged_size_mib, 0);
             assert!(!view.check_range(GuestAddress(a), 1));
-            let allocations: Vec<_> = d.retained.iter().map(Arc::downgrade).collect();
-            // Simulate failed final unmaps, then destruction of the platform mapping state.
-            mapper.fail.extend([4, 5]);
-            d.stop(&mut mapper);
-            assert!(allocations.iter().all(|r| r.upgrade().is_some()));
-            drop(mapper);
-            drop(view);
-            assert!(allocations.iter().all(|r| r.upgrade().is_some()));
+            // Only the mapper references the still-mapped block.
+            let retained = weak(&mapper.mapped[&a]);
+            assert_eq!(mapper.mapped.len(), 1);
+            d.stop(&mut mapper).unwrap();
             drop(d);
-            assert!(allocations.iter().all(|r| r.upgrade().is_none()));
+            drop(view);
+            assert!(retained.upgrade().is_some());
+            drop(mapper);
+            assert!(retained.upgrade().is_none());
         }
+    }
+
+    #[test]
+    fn mapper_owns_regions_through_failed_unmaps() {
+        let (mut d, mut view, mut mapper) = setup_with(2);
+        let a = d.start;
+        assert_eq!(
+            d.request(&req(0, a, 2), &mut mapper, &mut view, &[])
+                .unwrap()
+                .0,
+            0
+        );
+        let blocks: Vec<_> = d.blocks.values().map(|r| weak(r)).collect();
+        // A successful unplug releases the allocation once the view drops it.
+        assert_eq!(
+            d.request(&req(1, a + BLOCK, 1), &mut mapper, &mut view, &[])
+                .unwrap()
+                .0,
+            0
+        );
+        assert!(blocks[1].upgrade().is_none());
+        // A failed unplug with successful rollback keeps the device mapping.
+        mapper.fail = vec![mapper.calls + 1];
+        assert_eq!(
+            d.request(&req(1, a, 1), &mut mapper, &mut view, &[])
+                .unwrap()
+                .0,
+            2
+        );
+        assert_eq!(d.count(), 1);
+        // A failed final unmap is reported and leaves the allocation owned by the mapper.
+        mapper.fail = vec![mapper.calls + 1];
+        assert!(d.stop(&mut mapper).is_err());
+        drop(d);
+        drop(view);
+        assert!(blocks[0].upgrade().is_some());
+        drop(mapper);
+        assert!(blocks[0].upgrade().is_none());
     }
 
     fn setup_with(block_mib: u64) -> (VirtioMem, GuestMemoryMmap, Fake) {
@@ -829,7 +877,10 @@ mod tests {
                 d.request(&req(1, a, 2), &mut mapper, &mut view, &[])
                     .is_err()
             );
-            assert_eq!(d.retained.len(), 2);
+            // The first block was unmapped and could not be remapped; the second
+            // stays mapped and owned by the mapper.
+            assert_eq!(d.count(), 2);
+            assert_eq!(mapper.mapped.keys().collect::<Vec<_>>(), [&(a + block)]);
         }
     }
 
@@ -846,7 +897,7 @@ mod tests {
             mmio.write(0x24, 1, &view).unwrap();
             mmio.write(0x20, 1, &view).unwrap();
             mmio.write(0x70, 11, &view).unwrap();
-            assert_eq!(mmio.read(0x70, 4) & 8, 0);
+            assert_eq!(mmio.read(0x70, 4).unwrap() & 8, 0);
             mmio.write(0x70, 0, &view).unwrap();
             initialize(&mut mmio, &view);
             mmio.device
@@ -855,8 +906,8 @@ mod tests {
                 .unwrap();
             assert!(mmio.device.sync_target(true));
             mmio.config_changed();
-            assert_eq!(mmio.read(0xfc, 4), 1);
-            assert_eq!(mmio.read(0x60, 4), 2);
+            assert_eq!(mmio.read(0xfc, 4).unwrap(), 1);
+            assert_eq!(mmio.read(0x60, 4).unwrap(), 2);
             assert!(mmio.device.control.status().driver_ready);
             use virtio_queue::desc::split::Descriptor;
             view.write_obj(Descriptor::new(0x8000, 24, 1, 1), GuestAddress(0x1000))
@@ -872,7 +923,7 @@ mod tests {
                 .unwrap();
             assert_eq!(view.read_obj::<u16>(GuestAddress(0x9000)).unwrap(), 0);
             assert_eq!(mmio.device.count(), 2);
-            assert_eq!(mmio.read(0x128, 8), 2 * block);
+            assert_eq!(mmio.read(0x128, 8).unwrap(), 2 * block);
             mmio.write(0x70, 0, &view).unwrap();
             assert_eq!(mmio.device.count(), 2);
             assert!(!mmio.device.control.status().driver_ready);

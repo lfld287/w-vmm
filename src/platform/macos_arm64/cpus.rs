@@ -1,6 +1,7 @@
 //! vCPU ownership, PSCI power state and cancellable quiescence.
 use super::hvf;
 use crate::error::PlatformError;
+use crate::platform::PauseOutcome;
 use std::{
     sync::{Arc, Condvar, Mutex, mpsc},
     thread::JoinHandle,
@@ -135,7 +136,9 @@ impl Shared {
         true
     }
 
-    pub fn pause(&self) -> Result<()> {
+    /// A stop that wins the race is not an error: vCPUs never resume, and
+    /// `Vm::stop` reports any fault that caused it.
+    pub fn pause(&self) -> PauseOutcome {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         s.paused = true;
         while s.running.iter().any(|r| *r) && !s.stop {
@@ -147,9 +150,13 @@ impl Shared {
                 .0;
         }
         if s.stop {
-            return Err(PlatformError::VmStoppedDuringMemoryTransaction);
+            return PauseOutcome::Stopping;
         }
-        Ok(())
+        PauseOutcome::Paused
+    }
+
+    fn stopping(&self) -> bool {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).stop
     }
 }
 
@@ -238,24 +245,30 @@ impl Cpus {
     }
 
     pub fn stopping(&self) -> bool {
-        self.shared
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .stop
+        self.shared.stopping()
     }
-}
 
-impl Drop for Cpus {
-    fn drop(&mut self) {
+    /// Stop and join every vCPU thread. A thread that panicked outside its own
+    /// fault reporting is itself a fault.
+    pub fn join(&mut self) -> Result<()> {
         self.shared.stop();
         while self.threads.iter().any(|t| !t.is_finished()) {
             self.shared.stop();
             std::thread::sleep(Duration::from_millis(2));
         }
+        let mut result = Ok(());
         for t in self.threads.drain(..) {
-            let _ = t.join();
+            if t.join().is_err() && result.is_ok() {
+                result = Err(PlatformError::VcpuThreadPanicked);
+            }
         }
+        result
+    }
+}
+
+impl Drop for Cpus {
+    fn drop(&mut self) {
+        let _ = self.join();
     }
 }
 
@@ -281,13 +294,12 @@ fn worker(
         }
         s.running[index] = true;
         drop(s);
-        let exit = cpu.run();
-        let s = shared.state.lock().unwrap_or_else(|e| e.into_inner());
-        if s.stop {
+        // A failed run is a real fault even when it races a stop; a cancelled
+        // or completed exit after stop is not handled.
+        let exit = cpu.run()?;
+        if shared.stopping() {
             return Ok(());
         }
-        drop(s);
-        let exit = exit?;
         match exit.reason {
             0 => continue,
             1 => {
@@ -335,28 +347,19 @@ fn worker(
                                 addr: e.physical_address,
                                 width,
                                 write,
-                                value: if write && reg != 31 { cpu.get(reg)? } else { 0 },
+                                value: if write && reg != 31 {
+                                    mask_write(cpu.get(reg)?, width)
+                                } else {
+                                    0
+                                },
                                 reply,
                             }))
                             .map_err(|_| PlatformError::EventChannelDisconnected)?;
                         // A queued access owns its reply channel; it remains pending
                         // across pause. No guest register work occurs while waiting.
                         shared.wait_io(index);
-                        let value = loop {
-                            match rx.recv_timeout(Duration::from_millis(10)) {
-                                Ok(value) => break value,
-                                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
-                                Err(_)
-                                    if shared
-                                        .state
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner())
-                                        .stop =>
-                                {
-                                    return Ok(());
-                                }
-                                Err(_) => {}
-                            }
+                        let Some(value) = wait_reply(shared, &rx, e.physical_address)? else {
+                            return Ok(());
                         };
                         if !shared.complete_io(index) {
                             return Ok(());
@@ -409,6 +412,26 @@ fn worker(
     }
 }
 
+/// Store only the accessed bytes of the source register.
+fn mask_write(register: u64, width: usize) -> u64 {
+    register & (u64::MAX >> (64 - width * 8))
+}
+
+/// Wait for the runtime's MMIO reply. `None` means the VM is stopping; a reply
+/// channel dropped while the VM keeps running is a fault, never a success.
+fn wait_reply(shared: &Shared, rx: &mpsc::Receiver<u64>, address: u64) -> Result<Option<u64>> {
+    loop {
+        match rx.recv_timeout(Duration::from_millis(10)) {
+            Ok(value) => return Ok(Some(value)),
+            Err(_) if shared.stopping() => return Ok(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(PlatformError::MmioReplyDisconnected { address });
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,14 +474,14 @@ mod tests {
             worker.changed.notify_all();
         });
         {
-            s.pause().unwrap();
+            assert_eq!(s.pause(), PauseOutcome::Paused);
             assert!(s.state.lock().unwrap_or_else(|e| e.into_inner()).paused);
         }
         s.resume();
         t.join().unwrap();
         assert!(!s.state.lock().unwrap_or_else(|e| e.into_inner()).paused);
         s.stop();
-        assert!(s.pause().is_err());
+        assert_eq!(s.pause(), PauseOutcome::Stopping);
     }
 
     #[test]
@@ -467,7 +490,7 @@ mod tests {
             let s = Arc::new(Shared::new(4));
             s.state.lock().unwrap().running[0] = true;
             s.wait_io(0);
-            s.pause().unwrap();
+            assert_eq!(s.pause(), PauseOutcome::Paused);
             let worker = s.clone();
             let (tx, rx) = mpsc::channel();
             let t = std::thread::spawn(move || {
@@ -482,6 +505,52 @@ mod tests {
             }
             assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), !stop);
             t.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn mmio_write_values_are_masked_to_access_width() {
+        let register = 0x8899_aabb_ccdd_eeffu64;
+        for (width, stored) in [(1, 0xff), (2, 0xeeff), (4, 0xccdd_eeff), (8, register)] {
+            assert_eq!(mask_write(register, width), stored);
+        }
+    }
+
+    #[test]
+    fn mmio_reply_disconnect_is_a_fault_unless_stopping() {
+        let s = Shared::new(1);
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send(42).unwrap();
+        assert_eq!(wait_reply(&s, &rx, 0x1000).unwrap(), Some(42));
+        drop(tx);
+        assert!(matches!(
+            wait_reply(&s, &rx, 0x1000),
+            Err(PlatformError::MmioReplyDisconnected { address: 0x1000 })
+        ));
+        s.stop();
+        assert_eq!(wait_reply(&s, &rx, 0x1000).unwrap(), None);
+        // A live but unanswered reply is released by stop rather than hanging.
+        let s = Arc::new(Shared::new(1));
+        let (_tx, rx) = mpsc::sync_channel::<u64>(1);
+        let stopper = s.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            stopper.stop();
+        });
+        assert_eq!(wait_reply(&s, &rx, 0).unwrap(), None);
+        t.join().unwrap();
+    }
+
+    #[test]
+    fn stop_racing_pause_reports_stopping_without_hanging() {
+        for _ in 0..32 {
+            let s = Arc::new(Shared::new(2));
+            s.state.lock().unwrap().running[1] = true;
+            let stopper = s.clone();
+            let t = std::thread::spawn(move || stopper.stop());
+            assert_eq!(s.pause(), PauseOutcome::Stopping);
+            t.join().unwrap();
+            assert_eq!(s.pause(), PauseOutcome::Stopping);
         }
     }
 

@@ -12,7 +12,7 @@ use std::{
 use vm_memory::VolatileSlice;
 use vm_memory::{GuestMemoryMmap, GuestRegionMmap};
 use w_vmm::Result;
-use w_vmm::error::{MemoryError, NetError, PlatformError, StorageError};
+use w_vmm::error::{ControlError, MemoryError, NetError, PlatformError, StorageError};
 use w_vmm::{
     memory::Mapper, net::NetDevice, platform::*, serial::SerialIo, storage::BlockStorage, *,
 };
@@ -31,19 +31,26 @@ impl State {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Fault {
     None,
     Prepare,
     Pause,
     Resume,
     Flush,
+    /// The guest powers off while a host pause waits: pause reports Stopping.
+    GuestShutdown,
+    /// A vCPU fault stops the VM while a host pause waits.
+    VcpuError,
+    /// A vCPU fault races a host stop; only `stop` observes it.
+    HostStopVcpuError,
 }
 
 struct Machine {
     state: Arc<State>,
     fault: Fault,
     control: VmControl,
+    stopped: bool,
     _local: Rc<()>,
 }
 
@@ -94,13 +101,14 @@ impl Platform for Machine {
             state: self.state.clone(),
             fault: self.fault,
             control: self.control.clone(),
+            stopped: false,
             _local: self._local.clone(),
         })
     }
 }
 
 impl Mapper for Machine {
-    fn map(&mut self, _: &GuestRegionMmap) -> std::result::Result<(), MemoryError> {
+    fn map(&mut self, _: Arc<GuestRegionMmap>) -> std::result::Result<(), MemoryError> {
         Ok(())
     }
 
@@ -160,14 +168,15 @@ impl VirtualMachine for Machine {
         Ok(())
     }
 
-    fn pause(&mut self) -> std::result::Result<(), PlatformError> {
+    fn pause(&mut self) -> std::result::Result<PauseOutcome, PlatformError> {
         self.state.log("pause");
-        if self.fault == Fault::Pause {
-            return Err(PlatformError::Backend(
+        match self.fault {
+            Fault::Pause => Err(PlatformError::Backend(
                 io::Error::other("pause failed").into(),
-            ));
+            )),
+            Fault::GuestShutdown | Fault::VcpuError => Ok(PauseOutcome::Stopping),
+            _ => Ok(PauseOutcome::Paused),
         }
-        Ok(())
     }
 
     fn resume(&mut self) -> std::result::Result<(), PlatformError> {
@@ -180,13 +189,23 @@ impl VirtualMachine for Machine {
         Ok(())
     }
 
-    fn stop(&mut self) {
+    fn stop(&mut self) -> std::result::Result<(), PlatformError> {
         self.state.log("stop");
+        // A pending fault is reported by the first stop only.
+        let first = !std::mem::replace(&mut self.stopped, true);
+        if first && matches!(self.fault, Fault::VcpuError | Fault::HostStopVcpuError) {
+            return Err(PlatformError::Backend(
+                io::Error::other("vcpu fault").into(),
+            ));
+        }
+        Ok(())
     }
 }
 
 impl Drop for Machine {
     fn drop(&mut self) {
+        // Real platforms stop again on drop; the fault must not resurface.
+        assert!(self.stop().is_ok());
         self.state.log("destroy");
     }
 }
@@ -274,6 +293,7 @@ fn new_vm(state: Arc<State>, fault: Fault, memory: Option<VirtioMem>) -> Vmm<Dis
         VmConfig {
             memory_mib: 1,
             vcpu_count: 4,
+            ..VmConfig::default()
         },
         BTreeMap::from([("disk".into(), Disk(state.clone(), fault))]),
         None::<NoNet>,
@@ -287,6 +307,8 @@ fn run(vm: Vmm<Disk, NoNet, Serial>, state: Arc<State>, fault: Fault) -> Result<
         state,
         fault,
         control: vm.control(),
+        // The platform instance never runs; only created VMs report faults.
+        stopped: true,
         _local: Rc::new(()),
     };
     vm.run_with_platform(platform)
@@ -374,6 +396,63 @@ fn pause_resume_memory_and_stop_are_synchronous() {
 }
 
 #[test]
+fn stopping_pause_and_vcpu_faults_keep_true_error() {
+    for fault in [
+        Fault::GuestShutdown,
+        Fault::VcpuError,
+        Fault::HostStopVcpuError,
+    ] {
+        let state = Arc::new(State::default());
+        let vm = new_vm(state.clone(), fault, Some(VirtioMem::new(128, 2).unwrap()));
+        let c = vm.control();
+        let other = state.clone();
+        let t = std::thread::spawn(move || {
+            wait(|| other.output.load(Ordering::SeqCst) > 10);
+            let paused = c.pause();
+            if fault == Fault::HostStopVcpuError {
+                paused.unwrap();
+            } else {
+                // The VM is ending on its own; the waiter is released, not hung.
+                assert!(
+                    matches!(&paused, Err(ControlError::ReplyFailed(m)) if m == "VM is stopping"),
+                    "{paused:?}"
+                );
+                assert!(c.pause().is_err());
+            }
+            // stop reports cleanup only, so a vCPU fault never fails it.
+            c.stop().unwrap();
+            c.stop().unwrap();
+            c
+        });
+        let result = run(vm, state.clone(), fault);
+        let c = t.join().unwrap();
+        let faulted = fault != Fault::GuestShutdown;
+        match &result {
+            Ok(()) => assert!(!faulted),
+            Err(Error::Platform(PlatformError::Backend(e))) => {
+                assert!(faulted);
+                assert_eq!(e.to_string(), "vcpu fault");
+            }
+            Err(e) => panic!("{fault:?}: unexpected {e}"),
+        }
+        assert_eq!(c.status().lifecycle, VmLifecycle::Stopped);
+        assert_eq!(
+            c.status().final_error.as_deref(),
+            faulted.then_some("vcpu fault")
+        );
+        c.stop().unwrap();
+        let log = state.log.lock().unwrap();
+        let pos = |s| log.iter().position(|v| *v == s).unwrap();
+        // A stopping VM never resumes, and cleanup still runs completely.
+        assert!(!log.contains(&"resume"));
+        assert!(pos("pause") < pos("stop"));
+        assert!(pos("stop") < pos("flush"));
+        assert!(pos("flush") < pos("destroy"));
+        assert!(pos("destroy") < pos("disk-drop"));
+    }
+}
+
+#[test]
 fn startup_failure_and_cancelled_run() {
     for block in [1, 2, 4, 256] {
         for cancel in [false, true] {
@@ -450,6 +529,7 @@ fn stop_during_startup_waits_for_cleanup() {
             state: state.clone(),
             fault: Fault::None,
             control: c,
+            stopped: true,
             _local: Rc::new(()),
         },
         entered,

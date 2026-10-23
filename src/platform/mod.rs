@@ -165,14 +165,26 @@ pub enum Event<C> {
     Shutdown,
 }
 
+/// Successful result of [`VirtualMachine::pause`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PauseOutcome {
+    /// Every vCPU is quiescent until `resume`.
+    Paused,
+    /// The VM is already terminating (guest shutdown or a vCPU fault) and will
+    /// never resume. The runtime stops without calling `resume`; any fault is
+    /// returned by `stop`.
+    Stopping,
+}
+
 /// VM operations run on the caller's thread; no Send/Sync bound is required.
 /// `prepare` loads the guest and initializes CPUs/interrupts without running them.
 /// `pause` must quiesce every vCPU, including exception handling and I/O
-/// completion writeback, before returning success. Pending events must survive
+/// completion writeback, before returning `Paused`. Pending events must survive
 /// pause; an I/O waiter must not prevent quiescence. `resume` releases the barrier.
-/// `stop` must always
-/// join every worker, including after partial startup, and be idempotent. Drop
-/// must also stop workers and destroy all mappings without releasing borrowed RAM.
+/// `stop` must stop and join every worker, including after partial startup,
+/// before collecting their results, then return the first vCPU fault not
+/// already returned by `poll_event`. Repeated calls succeed. Drop must also
+/// stop workers and destroy all mappings; mapped regions stay owned by the VM.
 pub trait VirtualMachine: Mapper {
     type Completion;
 
@@ -186,11 +198,11 @@ pub trait VirtualMachine: Mapper {
 
     fn set_irq(&mut self, irq: u32, level: bool) -> Result<()>;
 
-    fn pause(&mut self) -> Result<()>;
+    fn pause(&mut self) -> Result<PauseOutcome>;
 
     fn resume(&mut self) -> Result<()>;
 
-    fn stop(&mut self);
+    fn stop(&mut self) -> Result<()>;
 }
 
 pub(crate) fn run<

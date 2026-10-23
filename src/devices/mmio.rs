@@ -9,6 +9,10 @@ type Result<T> = std::result::Result<T, DeviceError>;
 
 pub(crate) const MAX_QUEUE: u16 = 128;
 
+const DRIVER_OK: u32 = 4;
+const FEATURES_OK: u32 = 8;
+const NEEDS_RESET: u32 = 0x40;
+
 pub(crate) trait VirtioDevice {
     fn required_features(&self) -> u64 {
         0
@@ -112,8 +116,12 @@ impl Queues {
         Ok(pins)
     }
 
+    /// A disabled queue has nothing available; it cannot restart before reset.
     pub(crate) fn available(&self, index: usize, mem: &GuestMemoryMmap) -> Result<u16> {
         let q = &self.rings[index];
+        if !q.ready() {
+            return Ok(0);
+        }
         if !q.is_valid(mem) {
             return Err(DeviceError::InvalidVirtqueue);
         }
@@ -194,6 +202,8 @@ pub(crate) struct Mmio<D: VirtioDevice> {
     queue_sel: u32,
     pub(crate) features: u64,
     pub(crate) status: u32,
+    strict: bool,
+    rejected: u64,
 }
 
 impl<D: VirtioDevice> Mmio<D> {
@@ -214,6 +224,42 @@ impl<D: VirtioDevice> Mmio<D> {
             queue_sel: 0,
             features,
             status: 0,
+            strict: true,
+            rejected: 0,
+        }
+    }
+
+    /// Lenient transports contain guest errors to this device instead of
+    /// returning them; see [`Self::contain`].
+    pub(crate) fn with_strict(mut self, strict: bool) -> Self {
+        self.strict = strict;
+        self
+    }
+
+    pub(crate) fn needs_reset(&self) -> bool {
+        self.status & NEEDS_RESET != 0
+    }
+
+    /// Pass through results and fatal errors. In lenient mode a guest error
+    /// instead sets DEVICE_NEEDS_RESET, which stops this device's dataplane
+    /// until the driver resets it; `None` reports that isolation.
+    pub(crate) fn contain<T>(&mut self, result: Result<T>) -> Result<Option<T>> {
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(e) if !self.strict && e.is_guest() => {
+                self.status |= NEEDS_RESET;
+                // virtio 1.2 section 2.1.2: notify only once DRIVER_OK is set.
+                if self.status & DRIVER_OK != 0 {
+                    self.config_changed();
+                }
+                eprintln!(
+                    "virtio device {}: guest error, device needs reset: {}",
+                    self.device.device_id(),
+                    crate::error::diagnostic(&e)
+                );
+                Ok(None)
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -235,25 +281,31 @@ impl<D: VirtioDevice> Mmio<D> {
 
     pub(crate) fn poll(&mut self, mem: &GuestMemoryMmap) -> Result<()> {
         if self.active() {
-            self.device.poll(&mut self.queues, mem)?;
+            let result = self.device.poll(&mut self.queues, mem);
+            self.contain(result)?;
         }
         Ok(())
     }
 
-    pub(crate) fn read(&self, offset: u64, width: usize) -> u64 {
+    /// `None` means the access decodes to no register or configuration field:
+    /// registers are 32 bit, configuration fields 8 to 64 bit.
+    pub(crate) fn read(&self, offset: u64, width: usize) -> Option<u64> {
         if !matches!(width, 1 | 2 | 4 | 8) {
-            return 0;
+            return None;
         }
-        if (0x100..0x1000).contains(&offset) && offset + width as u64 <= 0x1000 {
+        if (0x100..0x1000).contains(&offset) {
+            if offset + width as u64 > 0x1000 {
+                return None;
+            }
             let mut data = [0; 8];
             self.device
                 .read_config((offset - 0x100) as usize, &mut data[..width]);
-            return u64::from_le_bytes(data);
+            return Some(u64::from_le_bytes(data));
         }
         if width != 4 {
-            return 0;
+            return None;
         }
-        match offset {
+        Some(match offset {
             0 => 0x74726976,
             4 => 2,
             8 => self.device.device_id() as u64,
@@ -271,15 +323,45 @@ impl<D: VirtioDevice> Mmio<D> {
             0x70 => self.status as u64,
             0xfc => self.device.generation() as u64,
             _ => 0,
+        })
+    }
+
+    /// A 32-bit register write. A rejected write leaves every register
+    /// unchanged; lenient mode ignores it and counts it instead of returning it.
+    pub(crate) fn write(&mut self, offset: u64, value: u32, mem: &GuestMemoryMmap) -> Result<()> {
+        if offset == 0x50 {
+            let queue = value as usize;
+            // Notifications for absent or disabled queues are ignored.
+            if self.active() && self.queues.rings.get(queue).is_some_and(QueueT::ready) {
+                let result = self.device.notify(queue, &mut self.queues, mem);
+                self.contain(result)?;
+            }
+            return Ok(());
+        }
+        match self.configure(offset, value, mem) {
+            Err(e) if !self.strict && e.is_guest() => {
+                self.rejected += 1;
+                if self.rejected.is_power_of_two() {
+                    eprintln!(
+                        "virtio device {}: ignored register write {offset:#x}={value:#x} ({} so far): {}",
+                        self.device.device_id(),
+                        self.rejected,
+                        crate::error::diagnostic(&e)
+                    );
+                }
+                Ok(())
+            }
+            result => result,
         }
     }
 
-    pub(crate) fn write(&mut self, offset: u64, value: u32, mem: &GuestMemoryMmap) -> Result<()> {
+    /// Every error is returned before any state changes.
+    fn configure(&mut self, offset: u64, value: u32, mem: &GuestMemoryMmap) -> Result<()> {
         match offset {
             0x14 => self.feature_sel = value,
             0x24 => self.driver_sel = value,
             0x30 => self.queue_sel = value,
-            0x20 if self.status & 8 == 0 && self.driver_sel < 2 => {
+            0x20 if self.status & FEATURES_OK == 0 && self.driver_sel < 2 => {
                 let shift = self.driver_sel * 32;
                 self.queues.negotiated =
                     (self.queues.negotiated & !(0xffff_ffff << shift)) | ((value as u64) << shift);
@@ -301,32 +383,33 @@ impl<D: VirtioDevice> Mmio<D> {
                 if value & self.status != self.status {
                     return Err(DeviceError::StatusBitsCleared);
                 }
-                self.status = value;
-                if value & 8 != 0
+                let mut status = value;
+                // Leaving FEATURES_OK clear rejects the negotiated subset.
+                if status & FEATURES_OK != 0
                     && (self.queues.negotiated & !self.features != 0
                         || self.queues.negotiated & (1 << VIRTIO_F_VERSION_1) == 0
                         || self.queues.negotiated & self.device.required_features()
                             != self.device.required_features())
                 {
-                    self.status &= !8;
+                    status &= !FEATURES_OK;
                 }
-                if value & 4 != 0
-                    && !(self.status & 0xb == 0xb
-                        && self.queues.rings.iter().all(|q| q.is_valid(mem)))
+                if status & DRIVER_OK != 0
+                    && self.status & DRIVER_OK == 0
+                    && !(status & 0xb == 0xb && self.queues.rings.iter().all(|q| q.is_valid(mem)))
                 {
                     return Err(DeviceError::DriverNotReady);
                 };
+                self.status = status;
             }
             0x64 => self.queues.interrupt &= !value,
-            0x50 if self.active() && (value as usize) < self.queues.rings.len() => {
-                self.device.notify(value as usize, &mut self.queues, mem)?;
-            }
             0x38 | 0x44 | 0x80 | 0x84 | 0x90 | 0x94 | 0xa0 | 0xa4 => {
                 if let Some(q) = self.queues.rings.get_mut(self.queue_sel as usize) {
-                    if self.status & 4 != 0 {
+                    // A driver may disable a queue after DRIVER_OK but not restart it.
+                    let disable = offset == 0x44 && value == 0;
+                    if self.status & DRIVER_OK != 0 && !disable {
                         return Err(DeviceError::QueueConfigurationAfterDriverOk);
                     }
-                    if !(!q.ready() || (offset == 0x44 && value == 0)) {
+                    if q.ready() && !disable {
                         return Err(DeviceError::QueueConfigurationWhileReady);
                     }
                     match offset {
@@ -345,6 +428,7 @@ impl<D: VirtioDevice> Mmio<D> {
                             }
                             q.set_ready(value == 1);
                             if value == 1 && !q.is_valid(mem) {
+                                q.set_ready(false);
                                 return Err(DeviceError::InvalidQueueMemory);
                             };
                         }
@@ -405,7 +489,10 @@ pub(crate) mod tests {
 
     struct Fake {
         notifications: usize,
+        polls: usize,
         resets: usize,
+        /// Returned by notify and poll.
+        error: Option<fn() -> DeviceError>,
     }
 
     impl VirtioDevice for Fake {
@@ -427,7 +514,12 @@ pub(crate) mod tests {
 
         fn notify(&mut self, _: usize, _: &mut Queues, _: &GuestMemoryMmap) -> Result<()> {
             self.notifications += 1;
-            Ok(())
+            self.error.map_or(Ok(()), |e| Err(e()))
+        }
+
+        fn poll(&mut self, _: &mut Queues, _: &GuestMemoryMmap) -> Result<()> {
+            self.polls += 1;
+            self.error.map_or(Ok(()), |e| Err(e()))
         }
 
         fn reset(&mut self) -> Result<()> {
@@ -440,7 +532,9 @@ pub(crate) mod tests {
         (
             Mmio::new(Fake {
                 notifications: 0,
+                polls: 0,
                 resets: 0,
+                error: None,
             }),
             GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap(),
         )
@@ -449,12 +543,17 @@ pub(crate) mod tests {
     #[test]
     fn registers_negotiation_and_reset() {
         let (mut d, mem) = setup();
-        assert_eq!(d.read(0, 4), 0x74726976);
-        assert_eq!(d.read(8, 4), 42);
-        assert_eq!(d.read(0x100, 4), 0x563412);
-        assert_eq!(d.read(0x101, 2), 0x5634);
-        assert_eq!(d.read(u64::MAX, 8), 0);
-        assert_eq!(d.read(0x100, 0), 0);
+        assert_eq!(d.read(0, 4), Some(0x74726976));
+        assert_eq!(d.read(8, 4), Some(42));
+        assert_eq!(d.read(0x100, 4), Some(0x563412));
+        assert_eq!(d.read(0x101, 2), Some(0x5634));
+        assert_eq!(d.read(0x200, 8), Some(0));
+        // Registers are 32 bit and configuration must not cross the window.
+        assert_eq!(d.read(u64::MAX, 8), None);
+        assert_eq!(d.read(0x100, 0), None);
+        assert_eq!(d.read(0x100, 3), None);
+        assert_eq!(d.read(0x70, 2), None);
+        assert_eq!(d.read(0xffc, 8), None);
         d.write(0x50, 0, &mem).unwrap();
         assert_eq!(d.device.notifications, 0);
         initialize(&mut d, &mem);
@@ -463,8 +562,8 @@ pub(crate) mod tests {
         d.write(0x50, 2, &mem).unwrap();
         assert_eq!(d.device.notifications, 1);
         d.write(0x30, u32::MAX, &mem).unwrap();
-        assert_eq!(d.read(0x34, 4), 0);
-        assert_eq!(d.read(0x44, 4), 0);
+        assert_eq!(d.read(0x34, 4), Some(0));
+        assert_eq!(d.read(0x44, 4), Some(0));
         d.write(0x30, 0, &mem).unwrap();
         assert!(d.write(0x38, 4, &mem).is_err());
         assert!(d.write(0x70, 3, &mem).is_err());
@@ -500,6 +599,128 @@ pub(crate) mod tests {
         d.status = 11;
         d.queues.rings[1].set_ready(false);
         assert!(d.write(0x70, 15, &mem).is_err());
+    }
+
+    /// Snapshot of every guest-visible transport register.
+    fn registers(d: &Mmio<Fake>) -> Vec<Option<u64>> {
+        (0..0x100).step_by(4).map(|o| d.read(o, 4)).collect()
+    }
+
+    #[test]
+    fn rejected_writes_change_nothing_and_lenient_ignores_them() {
+        for strict in [true, false] {
+            let (d, mem) = setup();
+            let mut d = d.with_strict(strict);
+            // Unsupported features with DRIVER_OK: FEATURES_OK must stay clear.
+            d.write(0x70, 3, &mem).unwrap();
+            d.write(0x24, 1, &mem).unwrap();
+            d.write(0x20, 3, &mem).unwrap();
+            // (setup writes, rejected offset, rejected value)
+            type Case = (&'static [(u64, u32)], u64, u32);
+            let cases: [Case; 6] = [
+                (&[], 0x70, 15),
+                (&[], 0x70, 1),
+                // QueueReady with invalid memory restores the disabled queue.
+                (&[(0x80, 0xffff_f000)], 0x44, 1),
+                (&[], 0x44, 2),
+                (&[], 0x38, 3),
+                (&[], 0x38, 129),
+            ];
+            for (setup, offset, value) in cases {
+                for &(o, v) in setup {
+                    d.write(o, v, &mem).unwrap();
+                }
+                let before = registers(&d);
+                let negotiated = d.queues.negotiated;
+                let result = d.write(offset, value, &mem);
+                assert_eq!(result.is_err(), strict, "{offset:#x}={value}");
+                assert_eq!(registers(&d), before, "{offset:#x}={value}");
+                assert_eq!(d.queues.negotiated, negotiated);
+                assert_eq!(d.status, 3);
+                assert!(!d.queues.rings[0].ready());
+            }
+            assert_eq!(d.rejected, if strict { 0 } else { 6 });
+            // A plain FEATURES_OK write is still accepted with the bit cleared.
+            d.write(0x70, 11, &mem).unwrap();
+            assert_eq!(d.status, 3);
+        }
+    }
+
+    #[test]
+    fn queues_disable_after_driver_ok_without_restart() {
+        let (mut d, mem) = setup();
+        initialize(&mut d, &mem);
+        d.write(0x30, 0, &mem).unwrap();
+        d.write(0x44, 0, &mem).unwrap();
+        assert_eq!(d.read(0x44, 4), Some(0));
+        assert!(matches!(
+            d.write(0x44, 1, &mem),
+            Err(DeviceError::QueueConfigurationAfterDriverOk)
+        ));
+        assert!(d.write(0x38, 8, &mem).is_err());
+        // A later status write does not revalidate the disabled queue.
+        d.write(0x70, 15 | 0x80, &mem).unwrap();
+        d.status = 15;
+        d.write(0x50, 0, &mem).unwrap();
+        assert_eq!(d.device.notifications, 0);
+        d.write(0x50, 1, &mem).unwrap();
+        assert_eq!(d.device.notifications, 1);
+        // Disabled queues have nothing available and nothing pinned, even if corrupt.
+        mem.write_obj(9u16, GuestAddress(0x2002)).unwrap();
+        assert_eq!(d.queues.available(0, &mem).unwrap(), 0);
+        assert_eq!(
+            d.queues.pinned(&mem).unwrap(),
+            [(0x4000, 128), (0x5000, 22), (0x6000, 70)]
+        );
+        assert!(d.queues.pop(0, &mem).unwrap().is_none());
+    }
+
+    #[test]
+    fn lenient_guest_errors_isolate_and_host_errors_stay_fatal() {
+        let guest: fn() -> DeviceError = || DeviceError::CyclicDescriptorChain;
+        let host: fn() -> DeviceError =
+            || crate::error::StorageError::Backend(std::io::Error::other("host").into()).into();
+        let (d, mem) = setup();
+        let mut d = d.with_strict(false);
+        initialize(&mut d, &mem);
+        d.device.error = Some(guest);
+        d.write(0x50, 0, &mem).unwrap();
+        assert_eq!(d.read(0x70, 4), Some(0x4f));
+        assert_eq!(d.read(0x60, 4), Some(2));
+        // The stopped dataplane sees neither notifications nor polls.
+        d.write(0x50, 0, &mem).unwrap();
+        d.poll(&mem).unwrap();
+        assert_eq!((d.device.notifications, d.device.polls), (1, 0));
+        // Status writes must keep DEVICE_NEEDS_RESET; only reset clears it.
+        d.write(0x70, 15, &mem).unwrap();
+        assert_eq!(d.status, 0x4f);
+        d.write(0x70, 0x4f | 0x80, &mem).unwrap();
+        d.write(0x70, 0, &mem).unwrap();
+        assert_eq!((d.status, d.read(0x60, 4)), (0, Some(0)));
+        initialize(&mut d, &mem);
+        d.poll(&mem).unwrap();
+        assert!(d.needs_reset());
+        // Isolation before DRIVER_OK raises no configuration change.
+        d.write(0x70, 0, &mem).unwrap();
+        d.write(0x70, 1, &mem).unwrap();
+        assert!(d.contain::<()>(Err(guest())).unwrap().is_none());
+        assert_eq!((d.status, d.read(0x60, 4)), (0x41, Some(0)));
+        // Host failures are fatal in lenient mode too.
+        d.write(0x70, 0, &mem).unwrap();
+        initialize(&mut d, &mem);
+        d.device.error = Some(host);
+        assert!(matches!(
+            d.write(0x50, 0, &mem),
+            Err(DeviceError::Storage(_))
+        ));
+        assert!(d.poll(&mem).is_err());
+        assert!(!d.needs_reset());
+        // Strict mode returns guest errors without isolating.
+        let (mut d, mem) = setup();
+        initialize(&mut d, &mem);
+        d.device.error = Some(guest);
+        assert!(d.write(0x50, 0, &mem).is_err());
+        assert_eq!(d.status, 15);
     }
 
     #[test]
