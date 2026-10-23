@@ -14,7 +14,7 @@ thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 w-vmm = { path = ".." }
 libc = "0.2"
-signal-hook = "0.3"
+signal-hook = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
